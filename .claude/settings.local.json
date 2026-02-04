@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest:*)",
+      "Bash(python:*)",
+      "Bash(pip install:*)",
+      "Bash(tree:*)",
+      "Bash(find:*)",
+      "Read(//c/Users/FT/Documents/FT/Market/**)",
+      "Bash(sort:*)",
+      "Bash(Get-ChildItem -Path \"c:\\\\Users\\\\FT\\\\Documents\\\\FT\\\\Market\" -Recurse -Directory -Filter \"__pycache__\")",
+      "Bash(Remove-Item -Recurse -Force)"
+    ]
+  }
+}

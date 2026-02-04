@@ -1,0 +1,287 @@
+"""
+Phase 2: Manipulation Detection (Fake Breakout / Stop Hunt)
+Identifies false breakouts that sweep liquidity and reverse.
+"""
+from dataclasses import dataclass
+from typing import Optional
+import pandas as pd
+import numpy as np
+
+from config import STRATEGY
+from .consolidation import ConsolidationResult
+from .indicators import calculate_atr
+
+
+@dataclass
+class ManipulationResult:
+    """Result of manipulation (fake breakout) detection."""
+    valid: bool
+    direction: str = ""  # "UP" (fakeout above) or "DOWN" (fakeout below)
+    extreme_price: float = 0.0  # Highest/lowest point of the fakeout
+    break_distance: float = 0.0  # How far price broke beyond range
+    return_candle_idx: int = 0  # Index of candle that returned to range
+    atr: float = 0.0
+    # Liquidity sweep confirmation
+    swept_liquidity: bool = False  # Whether manipulation swept prior swing
+    swept_level: float = 0.0       # The swing level that was swept
+    swept_swing_idx: int = 0       # Index of the swept swing point
+    
+    @property
+    def is_bullish_setup(self) -> bool:
+        """Fakeout DOWN = bullish setup (expecting upward distribution)."""
+        return self.direction == "DOWN"
+    
+    @property
+    def is_bearish_setup(self) -> bool:
+        """Fakeout UP = bearish setup (expecting downward distribution)."""
+        return self.direction == "UP"
+
+
+def detect_manipulation(
+    df: pd.DataFrame,
+    consolidation: ConsolidationResult,
+    break_atr_mult: float = None,
+    max_return_candles: int = None,
+) -> ManipulationResult:
+    """
+    Detect if a valid manipulation (fake breakout) occurred after consolidation.
+    
+    Manipulation criteria:
+    1. Price breaks beyond range by >= break_atr_mult * ATR(14)
+    2. Price returns back into range within max_return_candles
+    
+    Args:
+        df: DataFrame with OHLC data (starting from after consolidation)
+        consolidation: The consolidation zone to check breakout from
+        break_atr_mult: Minimum break distance as ATR multiple (default from config)
+        max_return_candles: Max candles to return inside (default from config)
+    
+    Returns:
+        ManipulationResult with detection results
+    """
+    # Use config defaults
+    break_atr_mult = break_atr_mult or STRATEGY["manipulation_break_atr_mult"]
+    max_return_candles = max_return_candles or STRATEGY["manipulation_return_candles"]
+    
+    if not consolidation.valid:
+        return ManipulationResult(valid=False)
+    
+    # Need candles after consolidation
+    start_idx = consolidation.end_idx + 1
+    if start_idx >= len(df):
+        return ManipulationResult(valid=False)
+    
+    # Look at candles after consolidation (within reasonable window)
+    search_window = min(max_return_candles + 5, len(df) - start_idx)
+    if search_window < 2:
+        return ManipulationResult(valid=False)
+    
+    post_consol = df.iloc[start_idx:start_idx + search_window]
+    
+    # Get ATR
+    atr = consolidation.atr
+    min_break_distance = break_atr_mult * atr
+    
+    range_high = consolidation.range_high
+    range_low = consolidation.range_low
+    
+    # Check for upward fakeout (break above, then return)
+    upward_result = _check_upward_fakeout(
+        post_consol, range_high, range_low, min_break_distance, max_return_candles, atr, start_idx
+    )
+    if upward_result.valid:
+        return upward_result
+    
+    # Check for downward fakeout (break below, then return)
+    downward_result = _check_downward_fakeout(
+        post_consol, range_high, range_low, min_break_distance, max_return_candles, atr, start_idx
+    )
+    if downward_result.valid:
+        return downward_result
+    
+    return ManipulationResult(valid=False, atr=atr)
+
+
+def _check_upward_fakeout(
+    candles: pd.DataFrame,
+    range_high: float,
+    range_low: float,
+    min_break_distance: float,
+    max_return_candles: int,
+    atr: float,
+    start_idx: int,
+) -> ManipulationResult:
+    """Check for upward fake breakout (break above then return)."""
+    
+    extreme_high = 0.0
+    break_candle_idx = -1
+    
+    for i, (idx, candle) in enumerate(candles.iterrows()):
+        # Check if this candle breaks above
+        if candle["high"] > range_high + min_break_distance:
+            if candle["high"] > extreme_high:
+                extreme_high = candle["high"]
+                if break_candle_idx == -1:
+                    break_candle_idx = i
+        
+        # If we found a break, check if price returns
+        if break_candle_idx >= 0:
+            candles_since_break = i - break_candle_idx
+            
+            # Check if close is back inside range
+            if candle["close"] <= range_high and candle["close"] >= range_low:
+                if candles_since_break <= max_return_candles:
+                    return ManipulationResult(
+                        valid=True,
+                        direction="UP",
+                        extreme_price=extreme_high,
+                        break_distance=extreme_high - range_high,
+                        return_candle_idx=start_idx + i,
+                        atr=atr,
+                    )
+            
+            # Too many candles without returning
+            if candles_since_break > max_return_candles:
+                break
+    
+    return ManipulationResult(valid=False, atr=atr)
+
+
+def _check_downward_fakeout(
+    candles: pd.DataFrame,
+    range_high: float,
+    range_low: float,
+    min_break_distance: float,
+    max_return_candles: int,
+    atr: float,
+    start_idx: int,
+) -> ManipulationResult:
+    """Check for downward fake breakout (break below then return)."""
+    
+    extreme_low = float("inf")
+    break_candle_idx = -1
+    
+    for i, (idx, candle) in enumerate(candles.iterrows()):
+        # Check if this candle breaks below
+        if candle["low"] < range_low - min_break_distance:
+            if candle["low"] < extreme_low:
+                extreme_low = candle["low"]
+                if break_candle_idx == -1:
+                    break_candle_idx = i
+        
+        # If we found a break, check if price returns
+        if break_candle_idx >= 0:
+            candles_since_break = i - break_candle_idx
+            
+            # Check if close is back inside range
+            if candle["close"] >= range_low and candle["close"] <= range_high:
+                if candles_since_break <= max_return_candles:
+                    return ManipulationResult(
+                        valid=True,
+                        direction="DOWN",
+                        extreme_price=extreme_low,
+                        break_distance=range_low - extreme_low,
+                        return_candle_idx=start_idx + i,
+                        atr=atr,
+                    )
+            
+            # Too many candles without returning
+            if candles_since_break > max_return_candles:
+                break
+    
+    return ManipulationResult(valid=False, atr=atr)
+
+
+def scan_for_manipulation(
+    df: pd.DataFrame,
+    consolidation: ConsolidationResult,
+    max_candles_to_scan: int = 20,
+) -> ManipulationResult:
+    """
+    Scan forward from consolidation to find manipulation.
+    
+    This is useful when scanning historical data where the manipulation
+    might have occurred some candles after consolidation ended.
+    
+    Args:
+        df: Full DataFrame
+        consolidation: The consolidation result
+        max_candles_to_scan: Maximum candles to scan forward
+    
+    Returns:
+        ManipulationResult if found
+    """
+    if not consolidation.valid:
+        return ManipulationResult(valid=False)
+    
+    end_idx = min(consolidation.end_idx + max_candles_to_scan, len(df))
+    scan_df = df.iloc[:end_idx]
+    
+    return detect_manipulation(scan_df, consolidation)
+
+
+def confirm_liquidity_sweep(
+    df: pd.DataFrame,
+    manip: ManipulationResult,
+    lookback: int = None,
+) -> ManipulationResult:
+    """
+    Confirm that manipulation swept a prior swing high/low (liquidity).
+
+    For DOWN manipulation: Should have swept a prior swing low
+    For UP manipulation: Should have swept a prior swing high
+
+    This confirms the fakeout actually grabbed stops at an obvious level,
+    which is a key characteristic of true smart money manipulation.
+
+    Args:
+        df: DataFrame with OHLC data
+        manip: ManipulationResult to validate
+        lookback: How far back to search for swing points (default from config)
+
+    Returns:
+        Updated ManipulationResult with liquidity sweep info
+    """
+    from .market_structure import find_recent_swing_high, find_recent_swing_low
+
+    if not manip.valid:
+        return manip
+
+    lookback = lookback or STRATEGY.get("liquidity_sweep_lookback", 50)
+
+    # Search for swings BEFORE the manipulation started
+    # The manipulation return_candle_idx marks when price came back
+    # Subtract manipulation_return_candles to estimate when break started
+    return_candles = STRATEGY.get("manipulation_return_candles", 8)
+    search_end_idx = max(0, manip.return_candle_idx - return_candles)
+
+    if manip.direction == "DOWN":
+        # Manipulation swept down - should have taken out a prior swing low
+        swing = find_recent_swing_low(
+            df,
+            current_idx=search_end_idx,
+            lookback=lookback,
+            swing_strength=3
+        )
+
+        if swing and swing.valid and manip.extreme_price < swing.price:
+            # Manipulation went below the swing low = swept liquidity
+            manip.swept_liquidity = True
+            manip.swept_level = swing.price
+            manip.swept_swing_idx = swing.candle_idx
+    else:
+        # Manipulation swept up - should have taken out a prior swing high
+        swing = find_recent_swing_high(
+            df,
+            current_idx=search_end_idx,
+            lookback=lookback,
+            swing_strength=3
+        )
+
+        if swing and swing.valid and manip.extreme_price > swing.price:
+            # Manipulation went above the swing high = swept liquidity
+            manip.swept_liquidity = True
+            manip.swept_level = swing.price
+            manip.swept_swing_idx = swing.candle_idx
+
+    return manip

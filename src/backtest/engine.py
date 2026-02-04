@@ -1,0 +1,1296 @@
+"""
+Backtesting Engine
+Main loop for simulating AMD strategy on historical data.
+Supports SMC confluence features: FVG, Order Blocks, Break of Structure.
+Includes realistic execution model, session/news filters, HTF bias, and more.
+"""
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import List, Optional, Dict, Any, Set, Tuple
+import pandas as pd
+import numpy as np
+import logging
+import uuid
+
+from config import STRATEGY, BACKTEST, VALIDATION, EXECUTION, TIME_CONFIG
+from src.strategy.indicators import add_indicators, calculate_atr
+from src.strategy.consolidation import detect_consolidation, ConsolidationResult
+from src.strategy.manipulation import detect_manipulation, ManipulationResult, confirm_liquidity_sweep
+from src.strategy.distribution import detect_distribution, DistributionResult
+from src.strategy.entry import (
+    check_entry, check_immediate_entry, EntrySignal,
+    check_entry_at_candle, ENTRY_MODE_RETEST_ONLY
+)
+from src.strategy.risk import calculate_risk, calculate_exit_r_multiple, calculate_pnl, calculate_pnl_with_costs, RiskParams
+from src.strategy.fvg import FVG, find_fvg_at_retest_level, find_fvgs_in_range
+from src.strategy.order_blocks import OrderBlock, find_ob_at_retest_level, find_order_blocks_in_range
+from src.strategy.market_structure import StructureBreak, find_bos_after_manipulation
+from src.data.db import Database, Trade
+
+# New filter imports
+from src.strategy.time_filters import TimeFilterEngine, localize_dataframe_timestamps
+from src.strategy.news_filter import NewsFilterEngine
+from src.strategy.key_levels import KeyLevelsEngine
+from src.strategy.htf_bias import HTFBiasEngine
+from src.strategy.volume_filters import VolumeFilterEngine
+from src.strategy.fundamentals import FundamentalsEngine
+from src.backtest.execution import ExecutionEngine, FillResult, ExitDecision
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class TradeRecord:
+    """Record of a simulated trade."""
+    entry_time: datetime
+    exit_time: datetime = None
+    direction: str = ""
+    entry_price: float = 0.0
+    exit_price: float = 0.0
+    sl_price: float = 0.0
+    tp_price: float = 0.0
+    position_size: float = 0.0
+    r_multiple: float = 0.0
+    pnl_pips: float = 0.0
+    pnl_usd: float = 0.0
+    exit_reason: str = ""  # "SL", "TP", "TIMEOUT", "ROLLOVER"
+
+    # AMD context
+    consolidation_high: float = 0.0
+    consolidation_low: float = 0.0
+    manipulation_extreme: float = 0.0
+    manipulation_direction: str = ""
+
+    # SMC Confluence data
+    entry_mode: str = ""           # Entry mode used
+    fvg_confluence: bool = False   # Had FVG at entry
+    ob_confluence: bool = False    # Had Order Block at entry
+    bos_confirmed: bool = False    # Break of Structure confirmed
+    confluence_score: int = 0      # Number of confluence factors
+
+    # Execution costs (new)
+    spread_cost: float = 0.0
+    slippage_cost: float = 0.0
+    commission_cost: float = 0.0
+    total_costs: float = 0.0
+    gross_pnl: float = 0.0
+    net_pnl: float = 0.0
+
+    # Fill info (new)
+    desired_entry_price: float = 0.0
+    actual_fill_price: float = 0.0
+    fill_model: str = ""  # LIMIT_AT_RETEST, CLOSE, etc.
+
+    # Filter info (new)
+    htf_bias_primary: str = ""
+    htf_bias_secondary: str = ""
+    key_level_score: int = 0
+
+    # Partial TP tracking
+    partial_tp_taken: bool = False      # Whether partial TP was hit
+    partial_tp_price: float = 0.0       # Price of partial TP (1R)
+    partial_close_pct: float = 0.0      # Percentage closed at partial
+    partial_pnl: float = 0.0            # PnL from partial close
+    remaining_size: float = 0.0         # Size remaining after partial
+    original_sl: float = 0.0            # Original SL before BE move
+    sl_moved_to_be: bool = False        # Whether SL was moved to breakeven
+
+    # Metadata
+    backtest_id: str = ""
+
+
+@dataclass
+class AMDPattern:
+    """Tracks a complete AMD pattern."""
+    consolidation: ConsolidationResult
+    manipulation: ManipulationResult = None
+    distribution: DistributionResult = None
+    entry: EntrySignal = None
+    completed: bool = False
+    traded: bool = False
+
+
+@dataclass
+class BacktestState:
+    """Current state of the backtester."""
+    in_position: bool = False
+    current_trade: TradeRecord = None
+    position_entry_idx: int = 0
+
+    # Track active patterns being formed
+    active_patterns: List[AMDPattern] = field(default_factory=list)
+
+    # Pattern deduplication - track seen patterns by their key features
+    seen_patterns: Set[Tuple] = field(default_factory=set)
+
+
+class BacktestEngine:
+    """
+    Engine for backtesting AMD strategy on historical data.
+
+    Properly detects AMD patterns by:
+    1. Finding consolidation zones that have ENDED (not current)
+    2. Detecting manipulation after consolidation ends
+    3. Confirming distribution after manipulation
+    4. Entering on retest
+
+    Includes realistic execution model, filters, and risk management.
+    """
+
+    def __init__(
+        self,
+        initial_capital: float = None,
+        max_risk_pct: float = None,
+        min_rr: float = None,
+        max_trade_duration: int = 100,
+        # Execution options
+        fill_model: str = None,
+        intrabar_assumption: str = None,
+        spread_points: float = None,
+        slippage_model: str = None,
+        commission_per_lot: float = None,
+        # Filter toggles
+        enable_session_filter: bool = None,
+        enable_news_filter: bool = None,
+        enable_htf_bias: bool = None,
+        enable_key_levels: bool = None,
+        enable_volume_filter: bool = None,
+        enable_fundamentals: bool = None,
+    ):
+        self.initial_capital = initial_capital or BACKTEST["initial_capital"]
+        self.max_risk_pct = max_risk_pct or STRATEGY["max_risk_pct"]
+        self.min_rr = min_rr or STRATEGY["min_rr"]
+        self.max_trade_duration = max_trade_duration
+
+        self.backtest_id = str(uuid.uuid4())[:8]
+        self.trades: List[TradeRecord] = []
+        self.equity_curve: List[float] = []
+        self.mtm_equity_curve: List[float] = []  # Mark-to-market equity
+        self.state = BacktestState()
+        self.current_balance = self.initial_capital
+
+        # Initialize execution engine
+        self.execution = ExecutionEngine(
+            fill_model=fill_model,
+            intrabar_assumption=intrabar_assumption,
+            spread_points=spread_points,
+            slippage_model=slippage_model,
+            commission_per_lot=commission_per_lot,
+        )
+
+        # Initialize filter engines
+        self.time_filter = TimeFilterEngine(
+            enabled=enable_session_filter if enable_session_filter is not None else True
+        )
+        self.news_filter = NewsFilterEngine(
+            enabled=enable_news_filter if enable_news_filter is not None else True
+        )
+        self.htf_bias = HTFBiasEngine(
+            enabled=enable_htf_bias if enable_htf_bias is not None else True
+        )
+        self.key_levels = KeyLevelsEngine(
+            enabled=enable_key_levels if enable_key_levels is not None else True
+        )
+        self.volume_filter = VolumeFilterEngine(
+            enabled=enable_volume_filter if enable_volume_filter is not None else True
+        )
+        self.fundamentals = FundamentalsEngine(
+            enabled=enable_fundamentals if enable_fundamentals is not None else False
+        )
+
+        # Rejection tracking for funnel analysis
+        self.rejection_stats = {
+            "consolidations_found": 0,
+            "no_manipulation": 0,
+            "no_distribution": 0,
+            "no_bos": 0,
+            "no_liquidity_sweep": 0,
+            "no_entry_retest": 0,
+            "short_filtered": 0,
+            "risk_invalid": 0,
+            "entries_executed": 0,
+            # New filter rejection counters
+            "filtered_session": 0,
+            "filtered_news": 0,
+            "filtered_htf_bias": 0,
+            "filtered_key_levels": 0,
+            "filtered_volume": 0,
+            "filtered_fundamentals": 0,
+            "filtered_daily_limit": 0,
+            "filtered_cooldown": 0,
+            "filtered_rollover": 0,
+            "pattern_duplicates": 0,
+            "fill_not_triggered": 0,
+        }
+
+        # Confluence tracking
+        self.confluence_stats = {
+            "entries_with_fvg": 0,
+            "entries_with_ob": 0,
+            "entries_with_bos": 0,
+            "avg_confluence_score": 0.0,
+        }
+
+        # Cost tracking
+        self.cost_stats = {
+            "total_spread_cost": 0.0,
+            "total_slippage_cost": 0.0,
+            "total_commission_cost": 0.0,
+            "total_costs": 0.0,
+            "gross_pnl": 0.0,
+            "net_pnl": 0.0,
+        }
+
+        # Minimum lookback needed
+        self.lookback = STRATEGY["consolidation_lookback"]
+        self.atr_period = STRATEGY["atr_period"]
+        self.min_lookback = self.lookback + self.atr_period + 20
+
+    def run(self, df: pd.DataFrame, verbose: bool = False) -> Dict[str, Any]:
+        """Run backtest on historical data."""
+        if len(df) < self.min_lookback:
+            logger.error(f"Not enough data. Need at least {self.min_lookback} candles.")
+            return {"error": "Insufficient data"}
+
+        # Add indicators
+        df = add_indicators(df.copy(), atr_period=self.atr_period)
+        df = df.reset_index(drop=True)
+
+        # Localize timestamps for session filtering
+        df = localize_dataframe_timestamps(df)
+
+        # Add HTF bias columns
+        df = self.htf_bias.add_htf_bias(df)
+
+        # Add key level columns
+        df = self.key_levels.add_key_levels(df)
+
+        # Add news blackout column
+        df = self.news_filter.add_blackout_column(df)
+
+        # Add fundamentals if enabled
+        df = self.fundamentals.add_fundamentals(df)
+
+        # Reset state
+        self.trades = []
+        self.equity_curve = [self.initial_capital]
+        self.mtm_equity_curve = [self.initial_capital]
+        self.state = BacktestState()
+        self.current_balance = self.initial_capital
+
+        # Reset time filter session states
+        self.time_filter.reset_daily_state()
+
+        # Reset rejection stats
+        self.rejection_stats = {
+            "consolidations_found": 0,
+            "no_manipulation": 0,
+            "no_distribution": 0,
+            "no_bos": 0,
+            "no_liquidity_sweep": 0,
+            "no_entry_retest": 0,
+            "short_filtered": 0,
+            "risk_invalid": 0,
+            "entries_executed": 0,
+            "filtered_session": 0,
+            "filtered_news": 0,
+            "filtered_htf_bias": 0,
+            "filtered_key_levels": 0,
+            "filtered_volume": 0,
+            "filtered_fundamentals": 0,
+            "filtered_daily_limit": 0,
+            "filtered_cooldown": 0,
+            "filtered_rollover": 0,
+            "pattern_duplicates": 0,
+            "fill_not_triggered": 0,
+        }
+
+        # Reset confluence stats
+        self.confluence_stats = {
+            "entries_with_fvg": 0,
+            "entries_with_ob": 0,
+            "entries_with_bos": 0,
+            "avg_confluence_score": 0.0,
+        }
+
+        # Reset cost stats
+        self.cost_stats = {
+            "total_spread_cost": 0.0,
+            "total_slippage_cost": 0.0,
+            "total_commission_cost": 0.0,
+            "total_costs": 0.0,
+            "gross_pnl": 0.0,
+            "net_pnl": 0.0,
+        }
+
+        logger.info(f"Starting backtest on {len(df)} candles")
+        logger.info(f"Date range: {df['timestamp'].iloc[0]} to {df['timestamp'].iloc[-1]}")
+
+        # Main loop - process each bar
+        total_bars = len(df) - self.min_lookback
+        progress_interval = max(1000, total_bars // 20)  # Log every 5% or every 1000 bars
+        
+        for i in range(self.min_lookback, len(df)):
+            current_candle = df.iloc[i]
+            ts = current_candle.get("timestamp")
+
+            # Progress logging
+            if (i - self.min_lookback) % progress_interval == 0:
+                progress_pct = ((i - self.min_lookback) / total_bars) * 100
+                logger.info(f"Processing bar {i}/{len(df)} ({progress_pct:.1f}%) - Trades: {len(self.trades)}")
+
+            # Check open position first
+            if self.state.in_position:
+                self._check_exit(df, i, current_candle, verbose)
+
+            # Look for new setups if not in position
+            if not self.state.in_position:
+                self._scan_for_patterns(df, i, verbose)
+
+            # Update equity curves
+            self.equity_curve.append(self.current_balance)
+
+            # Calculate MTM equity
+            mtm_equity = self._calculate_mtm_equity(df, i)
+            self.mtm_equity_curve.append(mtm_equity)
+
+        # Close any open position at end
+        if self.state.in_position:
+            self._force_close(df.iloc[-1], "END_OF_DATA")
+
+        logger.info(f"Backtest complete. Total trades: {len(self.trades)}")
+
+        return self._generate_results()
+
+    def _calculate_mtm_equity(self, df: pd.DataFrame, current_idx: int) -> float:
+        """Calculate mark-to-market equity including unrealized P&L."""
+        mtm = self.current_balance
+
+        if self.state.in_position and self.state.current_trade:
+            trade = self.state.current_trade
+            current_price = df.iloc[current_idx]["close"]
+
+            if trade.direction == "LONG":
+                unrealized = (current_price - trade.entry_price) * trade.position_size * 100
+            else:
+                unrealized = (trade.entry_price - current_price) * trade.position_size * 100
+
+            mtm += unrealized
+
+        return mtm
+
+    def _get_pattern_key(
+        self,
+        consol: ConsolidationResult,
+        manip: ManipulationResult,
+    ) -> Tuple:
+        """Create unique key for pattern deduplication."""
+        return (
+            consol.start_idx,
+            consol.end_idx,
+            round(consol.range_high, 2),
+            round(consol.range_low, 2),
+            manip.direction,
+            manip.return_candle_idx,
+        )
+
+    def _check_filters(
+        self,
+        df: pd.DataFrame,
+        current_idx: int,
+        entry: EntrySignal,
+        row: pd.Series,
+        consolidation_start_idx: int = None,
+        consolidation_end_idx: int = None,
+        distribution_idx: int = None,
+    ) -> Tuple[bool, str]:
+        """
+        Check all filters for entry permission.
+
+        Returns:
+            Tuple of (can_enter, rejection_reason)
+        """
+        ts = row.get("timestamp")
+        atr = row.get("atr", 0.0)
+
+        # 1. Session/Time filter (kill zone, Asian session, daily limits)
+        can_enter, reason = self.time_filter.can_enter_trade(ts, self.initial_capital)
+        if not can_enter:
+            if "killzone" in reason or "asian" in reason:
+                self.rejection_stats["filtered_session"] += 1
+            elif "daily_limit" in reason:
+                self.rejection_stats["filtered_daily_limit"] += 1
+            elif "cooldown" in reason:
+                self.rejection_stats["filtered_cooldown"] += 1
+            elif "rollover" in reason:
+                self.rejection_stats["filtered_rollover"] += 1
+            return False, reason
+
+        # 2. News filter
+        can_enter, reason = self.news_filter.can_enter_trade(ts)
+        if not can_enter:
+            self.rejection_stats["filtered_news"] += 1
+            return False, reason
+
+        # 3. HTF Bias alignment
+        can_enter, bias_result, reason = self.htf_bias.can_enter_trade(
+            entry.direction, df, current_idx
+        )
+        if not can_enter:
+            self.rejection_stats["filtered_htf_bias"] += 1
+            return False, reason
+
+        # 4. Key levels (if mode is REQUIRE)
+        can_enter, kl_score, reason = self.key_levels.can_enter_trade(
+            entry.entry_price, row, atr
+        )
+        if not can_enter:
+            self.rejection_stats["filtered_key_levels"] += 1
+            return False, reason
+
+        # 5. Volume confirmation
+        if (consolidation_start_idx is not None and consolidation_end_idx is not None 
+            and distribution_idx is not None):
+            can_enter, volume_analysis, reason = self.volume_filter.can_enter_trade(
+                df, distribution_idx, consolidation_start_idx, consolidation_end_idx
+            )
+            if not can_enter:
+                self.rejection_stats["filtered_volume"] += 1
+                return False, reason
+
+        # 6. Fundamentals filter
+        # FundamentalsEngine.can_enter_trade expects (direction, df, idx)
+        can_enter, fund_result, reason = self.fundamentals.can_enter_trade(
+            entry.direction, df, current_idx
+        )
+        if not can_enter:
+            self.rejection_stats["filtered_fundamentals"] += 1
+            return False, reason
+
+        return True, ""
+
+    def _scan_for_patterns(self, df: pd.DataFrame, current_idx: int, verbose: bool):
+        """
+        Scan for complete AMD patterns looking backwards.
+
+        Strategy:
+        1. Look for consolidation that ended 5-30 bars ago
+        2. Check if manipulation occurred after it
+        3. Check if distribution confirmed
+        4. Check if current price offers retest entry
+        """
+        lookback = self.lookback
+        atr = df['atr'].iloc[current_idx]
+        row = df.iloc[current_idx]
+
+        if pd.isna(atr) or atr == 0:
+            return
+
+        # Scan backwards for consolidation zones
+        # Check consolidations that ended 5 to 50 bars ago
+        for consol_end_offset in range(10, min(60, current_idx - lookback)):
+            consol_end_idx = current_idx - consol_end_offset
+            consol_start_idx = consol_end_idx - lookback
+
+            if consol_start_idx < self.atr_period:
+                continue
+
+            # Get consolidation window
+            consol_window = df.iloc[consol_start_idx:consol_end_idx + 1]
+
+            # Check if this was a valid consolidation
+            if not self._is_consolidation(consol_window, atr):
+                continue
+
+            self.rejection_stats["consolidations_found"] += 1
+
+            range_high = consol_window['high'].max()
+            range_low = consol_window['low'].min()
+
+            # Create consolidation result
+            consol = ConsolidationResult(
+                valid=True,
+                range_high=range_high,
+                range_low=range_low,
+                range_size=range_high - range_low,
+                atr=atr,
+                start_idx=consol_start_idx,
+                end_idx=consol_end_idx,
+            )
+
+            # Now check for manipulation AFTER consolidation
+            manip = self._check_manipulation_after(df, consol, current_idx)
+            if not manip.valid:
+                self.rejection_stats["no_manipulation"] += 1
+                continue
+
+            # Confirm liquidity sweep if required
+            if STRATEGY.get("require_liquidity_sweep", False):
+                manip = confirm_liquidity_sweep(df, manip)
+                if not manip.swept_liquidity:
+                    self.rejection_stats["no_liquidity_sweep"] += 1
+                    continue
+
+            # Pattern deduplication - skip if we've seen this exact pattern
+            pattern_key = self._get_pattern_key(consol, manip)
+            if pattern_key in self.state.seen_patterns:
+                self.rejection_stats["pattern_duplicates"] += 1
+                continue
+
+            # Check for distribution AFTER manipulation
+            dist = self._check_distribution_after(df, consol, manip, current_idx)
+            if not dist.valid:
+                self.rejection_stats["no_distribution"] += 1
+                continue
+
+            # Detect Break of Structure (optional)
+            bos = None
+            if STRATEGY.get("bos_required", False) or STRATEGY.get("entry_mode", "") != ENTRY_MODE_RETEST_ONLY:
+                expected_bos_dir = "BULLISH" if manip.direction == "DOWN" else "BEARISH"
+                bos = find_bos_after_manipulation(
+                    df, manip.return_candle_idx, expected_bos_dir,
+                    search_window=20, swing_lookback=STRATEGY.get("bos_swing_lookback", 5)
+                )
+
+                if STRATEGY.get("bos_required", False) and (bos is None or not bos.valid):
+                    self.rejection_stats["no_bos"] += 1
+                    continue
+
+            # Detect FVG and Order Blocks for confluence
+            # Skip expensive searches if using RETEST_ONLY mode
+            fvg_at_level = None
+            ob_at_level = None
+            entry_mode = STRATEGY.get("entry_mode", ENTRY_MODE_RETEST_ONLY)
+
+            if dist.direction == "UP":
+                retest_level = consol.range_high
+                fvg_direction = "BULLISH"
+                ob_direction = "BULLISH"
+            else:
+                retest_level = consol.range_low
+                fvg_direction = "BEARISH"
+                ob_direction = "BEARISH"
+
+            # Only search for FVG/OB if entry mode requires them
+            if entry_mode != ENTRY_MODE_RETEST_ONLY:
+                # Find FVG near retest level
+                fvg_at_level = find_fvg_at_retest_level(
+                    df, retest_level,
+                    search_start_idx=consol.start_idx,
+                    search_end_idx=min(dist.break_candle_idx + 10, current_idx),
+                    direction=fvg_direction,
+                    atr=atr,
+                    tolerance_mult=STRATEGY.get("retest_tolerance_atr_mult", 0.4)
+                )
+
+                # Find Order Block near retest level
+                ob_at_level = find_ob_at_retest_level(
+                    df, retest_level,
+                    search_start_idx=consol.start_idx,
+                    search_end_idx=min(dist.break_candle_idx + 10, current_idx),
+                    direction=ob_direction,
+                    atr=atr,
+                    tolerance_mult=STRATEGY.get("retest_tolerance_atr_mult", 0.4)
+                )
+
+            # Check for entry at current bar with confluence
+            entry = self._check_entry_now_with_confluence(
+                df, consol, manip, dist, current_idx,
+                bos, fvg_at_level, ob_at_level
+            )
+            if not entry.valid:
+                self.rejection_stats["no_entry_retest"] += 1
+                continue
+
+            # Check directional filter (skip shorts if disabled)
+            if entry.direction == "SHORT" and not STRATEGY.get("allow_short_trades", True):
+                self.rejection_stats["short_filtered"] += 1
+                continue
+
+            # Check all filters
+            can_enter, filter_reason = self._check_filters(
+                df, current_idx, entry, row, 
+                consol.start_idx, consol.end_idx, dist.break_candle_idx
+            )
+            if not can_enter:
+                if verbose:
+                    logger.debug(f"Entry filtered: {filter_reason}")
+                continue
+
+            # Calculate risk with contract-size based math
+            risk = calculate_risk(entry, self.current_balance, self.min_rr, self.max_risk_pct)
+            if not risk.valid:
+                self.rejection_stats["risk_invalid"] += 1
+                if verbose and risk.rejection_reason:
+                    logger.debug(f"Risk rejected: {risk.rejection_reason}")
+                continue
+
+            # Simulate execution fill
+            fill_result = self.execution.simulate_entry_fill(
+                entry=entry,
+                candle=row,
+                atr=atr,
+            )
+
+            if not fill_result.filled:
+                self.rejection_stats["fill_not_triggered"] += 1
+                if verbose:
+                    logger.debug(f"Fill not triggered: {fill_result.fill_reason}")
+                continue
+
+            # Mark pattern as seen
+            self.state.seen_patterns.add(pattern_key)
+
+            # Track confluence stats
+            if entry.fvg_confluence:
+                self.confluence_stats["entries_with_fvg"] += 1
+            if entry.ob_confluence:
+                self.confluence_stats["entries_with_ob"] += 1
+            if entry.bos_confirmed:
+                self.confluence_stats["entries_with_bos"] += 1
+
+            # Execute entry with filled price
+            self.rejection_stats["entries_executed"] += 1
+            self._execute_entry(entry, risk, fill_result, row, current_idx, df, verbose)
+
+            # Record trade for session tracking
+            ts = row.get("timestamp")
+            self.time_filter.record_trade(ts)
+
+            return  # Only one entry per bar
+
+    def _is_consolidation(self, window: pd.DataFrame, atr: float) -> bool:
+        """Check if window forms a valid consolidation."""
+        range_high = window['high'].max()
+        range_low = window['low'].min()
+        range_size = range_high - range_low
+
+        # Range must be tight
+        max_range = STRATEGY["consolidation_range_atr_mult"] * atr
+        if range_size > max_range:
+            return False
+
+        # Check closes inside range
+        closes = window['close']
+        closes_inside = ((closes >= range_low) & (closes <= range_high)).sum()
+        close_pct = closes_inside / len(window)
+
+        if close_pct < STRATEGY["consolidation_close_pct"]:
+            return False
+
+        return True
+
+    def _check_manipulation_after(
+        self,
+        df: pd.DataFrame,
+        consol: ConsolidationResult,
+        current_idx: int,
+    ) -> ManipulationResult:
+        """Check for manipulation that occurred after consolidation."""
+
+        range_high = consol.range_high
+        range_low = consol.range_low
+        atr = consol.atr
+        min_break = STRATEGY["manipulation_break_atr_mult"] * atr
+        max_return_candles = STRATEGY["manipulation_return_candles"]
+
+        # Search window: from consolidation end to current
+        search_start = consol.end_idx + 1
+        search_end = min(current_idx, search_start + 30)  # Limit search
+
+        if search_start >= search_end:
+            return ManipulationResult(valid=False)
+
+        # Check for upward fakeout
+        upward = self._find_fakeout(
+            df, search_start, search_end,
+            range_high, range_low, min_break, max_return_candles,
+            direction="UP", atr=atr
+        )
+        if upward.valid:
+            return upward
+
+        # Check for downward fakeout
+        downward = self._find_fakeout(
+            df, search_start, search_end,
+            range_high, range_low, min_break, max_return_candles,
+            direction="DOWN", atr=atr
+        )
+        return downward
+
+    def _find_fakeout(
+        self,
+        df: pd.DataFrame,
+        start_idx: int,
+        end_idx: int,
+        range_high: float,
+        range_low: float,
+        min_break: float,
+        max_return_candles: int,
+        direction: str,
+        atr: float,
+    ) -> ManipulationResult:
+        """Find a fakeout pattern in the given range."""
+
+        break_idx = -1
+        extreme = 0.0 if direction == "UP" else float("inf")
+
+        for i in range(start_idx, end_idx):
+            candle = df.iloc[i]
+
+            if direction == "UP":
+                # Check for break above
+                if candle["high"] > range_high + min_break:
+                    if break_idx == -1:
+                        break_idx = i
+                    extreme = max(extreme, candle["high"])
+
+                # Check for return inside
+                if break_idx >= 0:
+                    if candle["close"] <= range_high and candle["close"] >= range_low:
+                        if i - break_idx <= max_return_candles:
+                            return ManipulationResult(
+                                valid=True,
+                                direction="UP",
+                                extreme_price=extreme,
+                                break_distance=extreme - range_high,
+                                return_candle_idx=i,
+                                atr=atr,
+                            )
+                    if i - break_idx > max_return_candles:
+                        break_idx = -1  # Reset, look for new fakeout
+                        extreme = 0.0
+            else:
+                # Check for break below
+                if candle["low"] < range_low - min_break:
+                    if break_idx == -1:
+                        break_idx = i
+                    extreme = min(extreme, candle["low"])
+
+                # Check for return inside
+                if break_idx >= 0:
+                    if candle["close"] >= range_low and candle["close"] <= range_high:
+                        if i - break_idx <= max_return_candles:
+                            return ManipulationResult(
+                                valid=True,
+                                direction="DOWN",
+                                extreme_price=extreme,
+                                break_distance=range_low - extreme,
+                                return_candle_idx=i,
+                                atr=atr,
+                            )
+                    if i - break_idx > max_return_candles:
+                        break_idx = -1
+                        extreme = float("inf")
+
+        return ManipulationResult(valid=False)
+
+    def _check_distribution_after(
+        self,
+        df: pd.DataFrame,
+        consol: ConsolidationResult,
+        manip: ManipulationResult,
+        current_idx: int,
+    ) -> DistributionResult:
+        """Check for distribution after manipulation."""
+
+        atr = manip.atr
+        min_break = STRATEGY["distribution_break_atr_mult"] * atr
+        body_mult = STRATEGY["distribution_body_mult"]
+
+        range_high = consol.range_high
+        range_low = consol.range_low
+
+        # Expected direction is opposite of fakeout
+        expected_dir = "UP" if manip.direction == "DOWN" else "DOWN"
+
+        # Average body size from consolidation
+        consol_window = df.iloc[consol.start_idx:consol.end_idx + 1]
+        avg_body = abs(consol_window['close'] - consol_window['open']).mean()
+        if avg_body == 0:
+            avg_body = atr * 0.1
+
+        # Search after manipulation return
+        search_start = manip.return_candle_idx + 1
+        search_end = min(current_idx, search_start + 20)
+
+        for i in range(search_start, search_end):
+            candle = df.iloc[i]
+            body = abs(candle["close"] - candle["open"])
+            body_ratio = body / avg_body if avg_body > 0 else 0
+
+            if expected_dir == "UP":
+                break_distance = candle["close"] - range_high
+                if break_distance >= min_break and body_ratio >= body_mult:
+                    return DistributionResult(
+                        valid=True,
+                        direction="UP",
+                        break_price=candle["close"],
+                        break_distance=break_distance,
+                        body_expansion=body_ratio,
+                        break_candle_idx=i,
+                        atr=atr,
+                    )
+            else:
+                break_distance = range_low - candle["close"]
+                if break_distance >= min_break and body_ratio >= body_mult:
+                    return DistributionResult(
+                        valid=True,
+                        direction="DOWN",
+                        break_price=candle["close"],
+                        break_distance=break_distance,
+                        body_expansion=body_ratio,
+                        break_candle_idx=i,
+                        atr=atr,
+                    )
+
+        return DistributionResult(valid=False)
+
+    def _check_entry_now(
+        self,
+        df: pd.DataFrame,
+        consol: ConsolidationResult,
+        manip: ManipulationResult,
+        dist: DistributionResult,
+        current_idx: int,
+    ) -> EntrySignal:
+        """Check if current bar provides valid entry."""
+
+        candle = df.iloc[current_idx]
+        atr = dist.atr
+        tolerance = STRATEGY["retest_tolerance_atr_mult"] * atr
+        wick_ratio = STRATEGY["rejection_wick_ratio"]
+
+        if dist.direction == "UP":
+            # Long setup - retest of range_high from above
+            retest_level = consol.range_high
+            direction = "LONG"
+
+            # Check if low retests the level
+            if candle["low"] <= retest_level + tolerance and candle["low"] >= retest_level - tolerance:
+                # Check for rejection (bullish)
+                body = abs(candle["close"] - candle["open"])
+                lower_wick = min(candle["open"], candle["close"]) - candle["low"]
+
+                if body == 0 or lower_wick >= body * wick_ratio:
+                    return EntrySignal(
+                        valid=True,
+                        direction=direction,
+                        entry_price=candle["close"],
+                        entry_candle_idx=current_idx,
+                        entry_timestamp=candle.get("timestamp"),
+                        rejection_confirmed=True,
+                        retest_level=retest_level,
+                        consolidation_high=consol.range_high,
+                        consolidation_low=consol.range_low,
+                        manipulation_extreme=manip.extreme_price,
+                        manipulation_direction=manip.direction,
+                    )
+        else:
+            # Short setup - retest of range_low from below
+            retest_level = consol.range_low
+            direction = "SHORT"
+
+            # Check if high retests the level
+            if candle["high"] >= retest_level - tolerance and candle["high"] <= retest_level + tolerance:
+                # Check for rejection (bearish)
+                body = abs(candle["close"] - candle["open"])
+                upper_wick = candle["high"] - max(candle["open"], candle["close"])
+
+                if body == 0 or upper_wick >= body * wick_ratio:
+                    return EntrySignal(
+                        valid=True,
+                        direction=direction,
+                        entry_price=candle["close"],
+                        entry_candle_idx=current_idx,
+                        entry_timestamp=candle.get("timestamp"),
+                        rejection_confirmed=True,
+                        retest_level=retest_level,
+                        consolidation_high=consol.range_high,
+                        consolidation_low=consol.range_low,
+                        manipulation_extreme=manip.extreme_price,
+                        manipulation_direction=manip.direction,
+                    )
+
+        return EntrySignal(valid=False)
+
+    def _check_entry_now_with_confluence(
+        self,
+        df: pd.DataFrame,
+        consol: ConsolidationResult,
+        manip: ManipulationResult,
+        dist: DistributionResult,
+        current_idx: int,
+        bos: StructureBreak = None,
+        fvg_at_level: FVG = None,
+        ob_at_level: OrderBlock = None,
+    ) -> EntrySignal:
+        """Check if current bar provides valid entry with SMC confluence."""
+
+        entry_mode = STRATEGY.get("entry_mode", ENTRY_MODE_RETEST_ONLY)
+
+        # Use the new confluence-aware entry check
+        entry = check_entry_at_candle(
+            df=df,
+            current_idx=current_idx,
+            consolidation=consol,
+            manipulation=manip,
+            distribution=dist,
+            structure_break=bos,
+            fvg_at_level=fvg_at_level,
+            ob_at_level=ob_at_level,
+            entry_mode=entry_mode,
+        )
+
+        return entry
+
+    def _execute_entry(
+        self,
+        entry: EntrySignal,
+        risk: RiskParams,
+        fill: FillResult,
+        current_candle: pd.Series,
+        current_idx: int,
+        df: pd.DataFrame,
+        verbose: bool,
+    ):
+        """Execute trade entry with execution costs."""
+
+        # Get HTF bias info for record
+        htf_primary = current_candle.get("htf_bias_primary", "")
+        htf_secondary = current_candle.get("htf_bias_secondary", "")
+
+        # Get key level score
+        atr = current_candle.get("atr", 0.0)
+        kl_score = self.key_levels.calculate_score(fill.fill_price, current_candle, atr)
+
+        trade = TradeRecord(
+            entry_time=current_candle.get("timestamp", datetime.now()),
+            direction=entry.direction,
+            entry_price=fill.fill_price,  # Use actual fill price
+            sl_price=risk.stop_loss,
+            tp_price=risk.take_profit,
+            position_size=risk.position_size,
+            consolidation_high=entry.consolidation_high,
+            consolidation_low=entry.consolidation_low,
+            manipulation_extreme=entry.manipulation_extreme,
+            manipulation_direction=entry.manipulation_direction,
+            entry_mode=getattr(entry, 'entry_mode', ''),
+            fvg_confluence=getattr(entry, 'fvg_confluence', False),
+            ob_confluence=getattr(entry, 'ob_confluence', False),
+            bos_confirmed=getattr(entry, 'bos_confirmed', False),
+            confluence_score=getattr(entry, 'confluence_score', 0),
+            # Execution costs
+            spread_cost=fill.costs.spread_cost,
+            slippage_cost=fill.costs.slippage_cost,
+            commission_cost=fill.costs.commission_cost,
+            total_costs=fill.costs.total_cost,
+            # Fill info
+            desired_entry_price=entry.desired_entry_price,
+            actual_fill_price=fill.fill_price,
+            fill_model=fill.fill_model,
+            # Filter info
+            htf_bias_primary=htf_primary,
+            htf_bias_secondary=htf_secondary,
+            key_level_score=kl_score.total_score,
+            backtest_id=self.backtest_id,
+        )
+
+        self.state.in_position = True
+        self.state.current_trade = trade
+        self.state.position_entry_idx = current_idx
+
+        if verbose:
+            logger.info(
+                f"ENTRY: {entry.direction} @ {fill.fill_price:.2f} | "
+                f"SL: {risk.stop_loss:.2f} | TP: {risk.take_profit:.2f} | "
+                f"Size: {risk.position_size:.2f} | "
+                f"Costs: ${fill.costs.total_cost:.2f}"
+            )
+
+    def _check_exit(self, df: pd.DataFrame, current_idx: int, candle: pd.Series, verbose: bool):
+        """Check if current position should be exited (supports partial TP)."""
+        from config import RISK_MODEL
+
+        trade = self.state.current_trade
+        ts = candle.get("timestamp")
+        atr = candle.get("atr", 0.0)
+
+        # Check timeout
+        bars_in_trade = current_idx - self.state.position_entry_idx
+        if bars_in_trade >= self.max_trade_duration:
+            self._exit_position(candle["close"], "TIMEOUT", candle, verbose)
+            return
+
+        # Check rollover exit
+        if self.time_filter.should_close_for_rollover(ts):
+            self._exit_position(candle["close"], "ROLLOVER", candle, verbose)
+            return
+
+        # Use execution engine for exit decision (with partial TP support)
+        if RISK_MODEL.get("partial_tp_enabled", False):
+            exit_decision = self.execution.check_exit_with_partial(
+                trade=trade,
+                candle=candle,
+                atr=atr,
+            )
+        else:
+            exit_decision = self.execution.check_exit(
+                trade=trade,
+                candle=candle,
+                atr=atr,
+            )
+
+        # Handle partial close
+        if exit_decision.is_partial:
+            self._handle_partial_close(exit_decision, candle, verbose)
+            return
+
+        if exit_decision.should_exit:
+            self._exit_position(exit_decision.exit_price, exit_decision.exit_reason, candle, verbose)
+            return
+
+    def _handle_partial_close(self, exit_decision: ExitDecision, candle: pd.Series, verbose: bool):
+        """Handle partial TP close and SL move to breakeven."""
+        from config import RISK_MODEL
+
+        trade = self.state.current_trade
+        contract_size = RISK_MODEL.get("contract_size", 100)
+
+        # Store original SL if not already stored
+        if trade.original_sl == 0:
+            trade.original_sl = trade.sl_price
+
+        # Calculate partial PnL
+        partial_size = trade.position_size * exit_decision.partial_close_pct
+        if trade.direction == "LONG":
+            partial_pnl = (exit_decision.exit_price - trade.entry_price) * partial_size * contract_size
+        else:
+            partial_pnl = (trade.entry_price - exit_decision.exit_price) * partial_size * contract_size
+
+        # Update trade record
+        trade.partial_tp_taken = True
+        trade.partial_tp_price = exit_decision.exit_price
+        trade.partial_close_pct = exit_decision.partial_close_pct
+        trade.partial_pnl = partial_pnl
+        trade.remaining_size = trade.position_size * (1 - exit_decision.partial_close_pct)
+
+        # Move SL to breakeven if configured
+        if exit_decision.new_sl_price > 0:
+            trade.sl_price = exit_decision.new_sl_price
+            trade.sl_moved_to_be = True
+
+        # Credit partial PnL to balance
+        self.current_balance += partial_pnl
+
+        if verbose:
+            logger.info(
+                f"PARTIAL TP: {trade.direction} closed {exit_decision.partial_close_pct*100:.0f}% "
+                f"@ {exit_decision.exit_price:.2f} | PnL: ${partial_pnl:.2f} | "
+                f"New SL: {trade.sl_price:.2f} (BE)"
+            )
+
+    def _exit_position(self, exit_price: float, reason: str, candle: pd.Series, verbose: bool):
+        """Exit current position with cost calculation (accounts for partial TP)."""
+        trade = self.state.current_trade
+        atr = candle.get("atr", 0.0)
+
+        trade.exit_price = exit_price
+        trade.exit_time = candle.get("timestamp", datetime.now())
+        trade.exit_reason = reason
+
+        # Use original SL for R-multiple calculation if SL was moved to BE
+        sl_for_r = trade.original_sl if trade.original_sl > 0 else trade.sl_price
+
+        # Calculate P&L with costs using contract-size math
+        trade.r_multiple = calculate_exit_r_multiple(
+            trade.entry_price, exit_price, sl_for_r, trade.direction
+        )
+
+        # Use remaining size if partial TP was taken
+        position_size_for_exit = trade.remaining_size if trade.partial_tp_taken else trade.position_size
+
+        # Calculate gross and net P&L (with costs)
+        gross_pnl, net_pnl, total_costs = calculate_pnl_with_costs(
+            entry_price=trade.entry_price,
+            exit_price=exit_price,
+            position_size=position_size_for_exit,
+            direction=trade.direction,
+            commission=trade.commission_cost * (1 - trade.partial_close_pct) if trade.partial_tp_taken else trade.commission_cost,
+            spread_cost=trade.spread_cost * (1 - trade.partial_close_pct) if trade.partial_tp_taken else trade.spread_cost,
+            slippage_cost=trade.slippage_cost * (1 - trade.partial_close_pct) if trade.partial_tp_taken else trade.slippage_cost,
+            swap_cost=0.0,  # Swap costs handled separately if needed
+        )
+
+        # Add partial PnL to gross/net if partial was taken
+        if trade.partial_tp_taken:
+            gross_pnl += trade.partial_pnl
+            net_pnl += trade.partial_pnl
+
+        trade.gross_pnl = gross_pnl
+        trade.net_pnl = net_pnl
+        trade.pnl_usd = net_pnl  # For backwards compatibility
+        trade.total_costs = total_costs  # Update total costs from calculation
+
+        # Update balance with NET P&L (partial already credited, so only add remainder)
+        if trade.partial_tp_taken:
+            self.current_balance += (net_pnl - trade.partial_pnl)  # Only add the exit portion
+        else:
+            self.current_balance += net_pnl
+
+        # Update cost stats
+        self.cost_stats["total_spread_cost"] += trade.spread_cost
+        self.cost_stats["total_slippage_cost"] += trade.slippage_cost
+        self.cost_stats["total_commission_cost"] += trade.commission_cost
+        self.cost_stats["total_costs"] += trade.total_costs
+        self.cost_stats["gross_pnl"] += gross_pnl
+        self.cost_stats["net_pnl"] += net_pnl
+
+        # Record exit PnL for session tracking
+        ts = candle.get("timestamp")
+        self.time_filter.record_trade_exit(ts, net_pnl)
+
+        # Save trade
+        self.trades.append(trade)
+
+        # Reset state
+        self.state.in_position = False
+        self.state.current_trade = None
+
+        if verbose:
+            result = "WIN" if net_pnl > 0 else "LOSS"
+            logger.info(
+                f"EXIT ({result}): {trade.direction} @ {exit_price:.2f} | "
+                f"Reason: {reason} | R: {trade.r_multiple:.2f} | "
+                f"Gross: ${gross_pnl:.2f} | Net: ${net_pnl:.2f}"
+            )
+
+    def _force_close(self, candle: pd.Series, reason: str):
+        """Force close position at end of data."""
+        if self.state.in_position:
+            self._exit_position(candle["close"], reason, candle, verbose=True)
+
+    def _generate_results(self) -> Dict[str, Any]:
+        """Generate backtest results summary."""
+        if not self.trades:
+            return {
+                "backtest_id": self.backtest_id,
+                "total_trades": 0,
+                "error": "No trades generated",
+                "funnel_stats": self.rejection_stats,
+            }
+
+        # Convert to DataFrame for analysis
+        trades_df = pd.DataFrame([vars(t) for t in self.trades])
+
+        # Basic stats
+        total_trades = len(self.trades)
+        wins = len(trades_df[trades_df["net_pnl"] > 0])
+        losses = len(trades_df[trades_df["net_pnl"] <= 0])
+        win_rate = wins / total_trades if total_trades > 0 else 0
+
+        # R-multiple stats
+        avg_r = trades_df["r_multiple"].mean()
+        avg_win_r = trades_df[trades_df["r_multiple"] > 0]["r_multiple"].mean() if wins > 0 else 0
+        avg_loss_r = trades_df[trades_df["r_multiple"] <= 0]["r_multiple"].mean() if losses > 0 else 0
+
+        # Expectancy
+        expectancy = avg_r
+
+        # P&L - use net_pnl (after costs)
+        total_net_pnl = trades_df["net_pnl"].sum()
+        total_gross_pnl = trades_df["gross_pnl"].sum()
+        gross_profit = trades_df[trades_df["net_pnl"] > 0]["net_pnl"].sum()
+        gross_loss = abs(trades_df[trades_df["net_pnl"] <= 0]["net_pnl"].sum())
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+
+        # Drawdown - use MTM equity curve
+        equity = pd.Series(self.mtm_equity_curve)
+        rolling_max = equity.cummax()
+        drawdown = (rolling_max - equity) / rolling_max
+        max_drawdown = drawdown.max()
+
+        # By exit reason
+        exit_reason_counts = trades_df["exit_reason"].value_counts().to_dict()
+        sl_exits = exit_reason_counts.get("SL", 0)
+        tp_exits = exit_reason_counts.get("TP", 0)
+        rollover_exits = exit_reason_counts.get("ROLLOVER", 0)
+        timeout_exits = exit_reason_counts.get("TIMEOUT", 0)
+
+        # Calculate average confluence score
+        if total_trades > 0:
+            if "confluence_score" in trades_df.columns:
+                self.confluence_stats["avg_confluence_score"] = round(
+                    trades_df["confluence_score"].mean(), 2
+                )
+
+        return {
+            "backtest_id": self.backtest_id,
+            "initial_capital": self.initial_capital,
+            "final_capital": self.current_balance,
+            "total_trades": total_trades,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": round(win_rate * 100, 2),
+            "avg_r_multiple": round(avg_r, 3),
+            "avg_win_r": round(avg_win_r, 3),
+            "avg_loss_r": round(avg_loss_r, 3),
+            "expectancy_r": round(expectancy, 3),
+            # P&L breakdown
+            "gross_pnl_usd": round(total_gross_pnl, 2),
+            "net_pnl_usd": round(total_net_pnl, 2),
+            "total_pnl_usd": round(total_net_pnl, 2),  # For compatibility
+            "gross_profit": round(gross_profit, 2),
+            "gross_loss": round(gross_loss, 2),
+            "profit_factor": round(profit_factor, 3),
+            "max_drawdown_pct": round(max_drawdown * 100, 2),
+            # Exit breakdown
+            "sl_exits": sl_exits,
+            "tp_exits": tp_exits,
+            "rollover_exits": rollover_exits,
+            "timeout_exits": timeout_exits,
+            # Curves
+            "equity_curve": self.equity_curve,
+            "mtm_equity_curve": self.mtm_equity_curve,
+            "trades": trades_df.to_dict("records"),
+            # Validation
+            "validation": {
+                "meets_min_trades": total_trades >= VALIDATION["min_trades"],
+                "meets_expectancy": expectancy >= VALIDATION["min_expectancy_r"],
+                "meets_drawdown": max_drawdown <= VALIDATION["max_drawdown_pct"],
+            },
+            # Stats
+            "funnel_stats": self.rejection_stats,
+            "confluence_stats": self.confluence_stats,
+            "cost_stats": self.cost_stats,
+        }
+
+    def save_trades_to_db(self, db: Database):
+        """Save all trades to database."""
+        if not self.trades:
+            return
+
+        db_trades = []
+        for t in self.trades:
+            db_trade = Trade(
+                entry_time=t.entry_time,
+                exit_time=t.exit_time,
+                direction=t.direction,
+                entry_price=t.entry_price,
+                exit_price=t.exit_price,
+                sl_price=t.sl_price,
+                tp_price=t.tp_price,
+                position_size=t.position_size,
+                r_multiple=t.r_multiple,
+                pnl_pips=t.pnl_pips,
+                pnl_usd=t.net_pnl,  # Use net P&L
+                consolidation_high=t.consolidation_high,
+                consolidation_low=t.consolidation_low,
+                manipulation_extreme=t.manipulation_extreme,
+                manipulation_direction=t.manipulation_direction,
+                backtest_id=t.backtest_id,
+            )
+            db_trades.append(db_trade)
+
+        db.insert_trades(db_trades)
+        logger.info(f"Saved {len(db_trades)} trades to database")
