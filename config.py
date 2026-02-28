@@ -106,10 +106,10 @@ EXECUTION = {
 SESSION_FILTER = {
     "enabled": True,
 
-    # Kill Zone - expanded to cover all major sessions
+    # Kill Zone - focus on London/NY sessions
     # Times are in session_timezone (UTC by default)
-    "kill_zone_start": "00:00",  # Allow trading all day
-    "kill_zone_end": "23:59",    # Allow trading all day
+    "kill_zone_start": "07:00",  # London open
+    "kill_zone_end": "17:00",    # NY session end
 
     # Asian Session avoidance - DISABLED to allow Asian session trading
     # Note: Session spans midnight (23:00 -> 08:00)
@@ -121,13 +121,13 @@ SESSION_FILTER = {
     # Allow pattern DETECTION during Asian (useful for setups that complete in London)
     "allow_consolidation_in_asian": True,
     # If True, REQUIRE consolidation to form during Asian session
-    "require_consolidation_in_asian": False,
+    "require_consolidation_in_asian": False,  # Relaxed - allow any time
 
     # Daily trade limits
-    "max_trades_per_day": 2,  # Max 2 trades per day (configurable, allow 1)
+    "max_trades_per_day": 5,  # Allow 2 trades per day
 
     # Daily loss limit - stop new entries if daily drawdown exceeds this
-    "daily_loss_limit_pct": 0.02,  # 2% daily loss limit
+    "daily_loss_limit_pct": 0.01,  # 1% daily loss limit
 
     # Cooldown after trade (reduce overtrading in chop)
     "cooldown_minutes_after_trade": 15,
@@ -144,12 +144,12 @@ SESSION_FILTER = {
     # Require consolidation to form during Asian session (23:00-08:00 UTC)
     "require_consolidation_in_asian": False,
     # Require distribution to occur during London/NY (08:00-16:00 UTC)
-    "require_distribution_in_london_ny": False,
+    "require_distribution_in_london_ny": False,  # Off - allow trades any session
 
     # Specific Kill Zones for higher-quality entries
     "london_open_kz": ("08:00", "10:00"),
     "ny_open_kz": ("13:00", "15:00"),
-    "only_trade_in_kz": False,  # If True, only enter during specific kill zones
+    "only_trade_in_kz": False,  # Trade full London/NY session (more opportunities)
 }
 
 # =============================================================================
@@ -157,7 +157,7 @@ SESSION_FILTER = {
 # =============================================================================
 # Disabled by default; enable and provide news CSV to use
 NEWS_FILTER = {
-    "enabled": False,
+    "enabled": True,  # Avoid high-impact event volatility
     "csv_path": "Market/data/news_events.csv",
 
     # Blackout window around news events
@@ -189,7 +189,7 @@ KEY_LEVELS = {
     # Mode:
     # - "SCORE": Add confluence score points for key level proximity
     # - "REQUIRE": Block entries that don't meet min score
-    "mode": "SCORE",
+    "mode": "SCORE",  # REQUIRE was too strict - back to SCORE
 
     # Minimum key level score required (only used if mode = "REQUIRE")
     "min_keylevel_score_required": 1,
@@ -220,7 +220,7 @@ HTF_BIAS = {
 
     # Alignment requirements
     "require_primary_alignment": True,   # Entry must align with H4 trend
-    "require_secondary_alignment": False,  # D1 alignment optional
+    "require_secondary_alignment": False,  # D1 optional - was too strict
 
     # What to do when bias is NEUTRAL
     # - "BLOCK": No entries when neutral
@@ -283,15 +283,15 @@ RISK_MODEL = {
     # XAUUSD: 1 lot = 100 oz, so $1 price move = $100 per lot
     "contract_size": 100.0,
 
-    # Risk per trade
-    "risk_pct_per_trade_default": 0.01,  # 1% default (Gold strategy spec)
-    "risk_pct_per_trade_max": 0.02,      # 2% max allowed
+    # Risk per trade (lower = smaller drawdowns, smoother monthly curve)
+    "risk_pct_per_trade_default": 0.008,  # 0.8% per trade
+    "risk_pct_per_trade_max": 0.02,       # 2% max allowed
 
     # Stop loss placement
     # Minimum stop distance as ATR multiple (avoid too-tight stops)
-    "min_stop_atr_mult": 0.8,
+    "min_stop_atr_mult": 1.0,      # Was 0.8 - wider minimum
     # Buffer beyond manipulation extreme
-    "stop_buffer_atr_mult": 0.40,  # Widened from 0.25 to reduce stop-outs
+    "stop_buffer_atr_mult": 0.75,  # Was 0.50 - more room to reduce stop-outs
 
     # Leverage/notional guard
     # notional = entry_price * contract_size * lots
@@ -306,9 +306,9 @@ RISK_MODEL = {
     # ==========================================================================
     # Partial Take Profit Settings (SMC Improvement)
     # ==========================================================================
-    # Take partial profit at 1R, move SL to breakeven, let rest run
-    "partial_tp_enabled": True,          # Enable partial TP system
-    "partial_tp_at_1r": 0.5,              # Close 50% of position at 1R
+    # Disabled to eliminate 0R cluster from partial TP + BE stop
+    "partial_tp_enabled": False,         # Was True - simplified exit
+    "partial_tp_at_1r": 0.5,              # Close 50% of position at 1R (unused when disabled)
     "move_sl_to_be_after_partial": True,  # Move SL to breakeven after partial
     "final_tp_rr": 3.0,                   # Let remaining position run to 3R
 }
@@ -322,30 +322,30 @@ STRATEGY = {
     "symbol": "XAUUSD",
     "timeframe": "M5",
 
-    # Phase 1: Consolidation Detection (LOOSENED for more trades)
-    "consolidation_lookback": 12,           # Was 15 - smaller consolidations
-    "consolidation_range_atr_mult": 4.50,   # Was 3.50 - allow wider ranges
-    "consolidation_close_pct": 0.45,        # Was 0.50 - less strict
+    # Phase 1: Consolidation - loosened so patterns are found
+    "consolidation_lookback": 12,
+    "consolidation_range_atr_mult": 4.50,   # Wider range allowed
+    "consolidation_close_pct": 0.45,         # More bars can close outside
 
-    # Phase 2: Manipulation (Fake Breakout) (LOOSENED)
-    "manipulation_break_atr_mult": 0.15,    # Was 0.20 - easier to trigger
-    "manipulation_return_candles": 12,      # Was 8 - more time to complete
+    # Phase 2: Manipulation - more time to return
+    "manipulation_break_atr_mult": 0.12,     # Easier to trigger
+    "manipulation_return_candles": 12,      # More time to complete
 
-    # Phase 3: Distribution (Real Breakout)
-    "distribution_break_atr_mult": 0.10,    # Keep at 0.10 for quality
-    "distribution_body_mult": 1.00,         # Keep at 1.00 for quality
+    # Phase 3: Distribution - easier breakout
+    "distribution_break_atr_mult": 0.12,    # Smaller break counts
+    "distribution_body_mult": 1.00,         # Any body size
 
     # Phase 4: Entry (LOOSENED)
     "rejection_wick_ratio": 0.10,           # Was 0.20 - easier rejection confirm
-    "retest_tolerance_atr_mult": 0.50,      # Tightened from 0.80 for better R-multiple
+    "retest_tolerance_atr_mult": 0.35,      # Tighter entries for better R-multiple
 
     # Phase 5: Risk Management (uses RISK_MODEL now, kept for compatibility)
-    "min_rr": 1.8,                          # Lowered from 2.5 for higher TP hit rate
-    "max_risk_pct": 0.01,                   # Updated to 1% (Gold spec default)
+    "min_rr": 2.0,                          # Balanced R:R - not too strict
+    "max_risk_pct": 0.01,                   # 1% per trade
     "spread_buffer_pips": 10,               # Legacy; use RISK_MODEL stop_buffer_atr_mult
 
-    # Directional Filter (shorts hurt expectancy significantly)
-    "allow_short_trades": True,             # Enable shorts to increase trade count
+    # Directional Filter - both directions with quality filters
+    "allow_short_trades": True,             # Both longs and shorts enabled
 
     # ATR Settings
     "atr_period": 14,
@@ -355,7 +355,7 @@ STRATEGY = {
     # ==========================================================================
 
     # Entry Mode: "RETEST_ONLY", "RETEST_WITH_FVG", "ORDER_BLOCK", "PEAK_LOW"
-    "entry_mode": "PEAK_LOW",               # Most permissive entry mode
+    "entry_mode": "RETEST_ONLY",            # No FVG required - more trades
 
     # Fair Value Gap (FVG) Settings
     "fvg_min_size_atr_mult": 0.10,          # Min FVG size as ATR multiple
@@ -366,8 +366,8 @@ STRATEGY = {
     "ob_displacement_mult": 1.5,            # Required move after OB (body multiple)
 
     # Break of Structure (BOS) Settings
-    "bos_swing_lookback": 5,                # Candles for swing point detection
-    "bos_required": True,                   # Require BOS before entry (filters weak setups)
+    "bos_swing_lookback": 5,
+    "bos_required": False,                  # Off - get trades; use as confluence only
 
     # ==========================================================================
     # SMC Improvements - Quality Filters and Refinements
@@ -388,16 +388,36 @@ STRATEGY = {
     # Order Block Body Only - Use candle body instead of full range
     "ob_use_body_only": True,               # True = body (open/close), False = range (high/low)
 
-    # Liquidity Sweep Confirmation - Validate manipulation swept prior swing
-    "require_liquidity_sweep": True,       # Require manipulation to sweep prior swing high/low
-    "liquidity_sweep_lookback": 50,         # Candles to look back for swing points
+    # Liquidity Sweep Confirmation
+    "require_liquidity_sweep": False,       # Off - use as confluence only
+    "liquidity_sweep_lookback": 50,
+
+    # Volume spike during manipulation (stop hunt creates volume)
+    # False = use as confluence bonus, not hard requirement
+    "require_manipulation_volume_spike": False,
+    "manipulation_volume_spike_ratio": 1.5,
+
+    # Equal highs/lows (liquidity pools) within consolidation
+    "detect_equal_levels": True,
+    "equal_level_tolerance_atr_mult": 0.05,
+    "equal_level_min_touches": 2,
+    "prefer_equal_level_sweep": True,      # Prefer setups that sweep equal highs/lows
 
     # Breaker Blocks - Broken OBs become breakers for opposite direction
-    "use_breaker_blocks": False,            # Enable breaker block confluence
+    "use_breaker_blocks": True,             # Was False - enable breaker block confluence
 
-    # Premium/Discount Zones - Only long in discount, short in premium
-    "require_discount_for_long": False,     # Only long below 50% of range
-    "require_premium_for_short": False,     # Only short above 50% of range
+    # Minimum confluence score required for entry (BOS + FVG + OB + equal levels + volume + breaker)
+    # 1 = BOS alone is fine - more trades
+    "min_confluence_score": 1,
+
+    # Premium/Discount Zones - off so entries can fire
+    "require_discount_for_long": False,
+    "require_premium_for_short": False,
+
+    # Trailing stop (optional - start disabled, test separately)
+    "trailing_stop_enabled": False,
+    "trailing_stop_activation_r": 2.0,      # Activate after 2R profit
+    "trailing_stop_atr_mult": 1.0,          # Trail by 1x ATR
 }
 
 # =============================================================================

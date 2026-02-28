@@ -22,7 +22,12 @@ class ConsolidationResult:
     close_inside_pct: float = 0.0
     start_idx: int = 0
     end_idx: int = 0
-    
+    # Equal highs/lows (liquidity pools) within consolidation
+    has_equal_highs: bool = False
+    has_equal_lows: bool = False
+    equal_high_level: float = 0.0
+    equal_low_level: float = 0.0
+
     @property
     def range_mid(self) -> float:
         """Middle of the consolidation range."""
@@ -158,3 +163,62 @@ def find_consolidation_zones(
             last_zone_end = result.end_idx
     
     return zones
+
+
+def detect_equal_levels(
+    df: pd.DataFrame,
+    consolidation: ConsolidationResult,
+    tolerance_atr_mult: float = None,
+    min_touches: int = None,
+) -> ConsolidationResult:
+    """
+    Detect equal highs/lows within consolidation (liquidity pools).
+
+    Equal highs/lows are where multiple candles touch the same level,
+    indicating obvious stop placement by retail traders.
+
+    Args:
+        df: Full DataFrame with OHLC data
+        consolidation: The consolidation result to enrich
+        tolerance_atr_mult: How close highs/lows must be to count as equal (default from config)
+        min_touches: Minimum touches to confirm equal level (default from config)
+
+    Returns:
+        ConsolidationResult with equal level fields set
+    """
+    if not consolidation.valid:
+        return consolidation
+
+    tolerance_atr_mult = tolerance_atr_mult or STRATEGY.get("equal_level_tolerance_atr_mult", 0.05)
+    min_touches = min_touches or STRATEGY.get("equal_level_min_touches", 2)
+
+    if not STRATEGY.get("detect_equal_levels", True):
+        return consolidation
+
+    start = consolidation.start_idx
+    end = consolidation.end_idx + 1
+    if start >= len(df) or end > len(df):
+        return consolidation
+
+    window = df.iloc[start:end]
+    tolerance = tolerance_atr_mult * consolidation.atr
+
+    # Check for equal highs (multiple touches of same high level)
+    highs = window["high"].values
+    for level in highs:
+        touches = sum(1 for h in highs if abs(h - level) <= tolerance)
+        if touches >= min_touches:
+            consolidation.has_equal_highs = True
+            consolidation.equal_high_level = float(level)
+            break
+
+    # Check for equal lows
+    lows = window["low"].values
+    for level in lows:
+        touches = sum(1 for l in lows if abs(l - level) <= tolerance)
+        if touches >= min_touches:
+            consolidation.has_equal_lows = True
+            consolidation.equal_low_level = float(level)
+            break
+
+    return consolidation

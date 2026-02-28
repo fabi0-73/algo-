@@ -11,7 +11,7 @@ import matplotlib.dates as mdates
 from datetime import datetime
 import os
 
-from src.backtest.metrics import BacktestMetrics, calculate_metrics, generate_funnel_report
+from src.backtest.metrics import BacktestMetrics, calculate_metrics, generate_funnel_report, generate_amd_conformity_report
 
 
 def plot_equity_curve(
@@ -535,6 +535,7 @@ def generate_report(
     mtm_equity_curve = results.get("mtm_equity_curve", [])
     cost_stats = results.get("cost_stats", {})
     funnel_stats = results.get("funnel_stats", {})
+    amd_conformity = results.get("amd_conformity", {})
 
     # Generate charts
     if equity_curve:
@@ -591,10 +592,19 @@ def generate_report(
     # Add funnel report
     if funnel_stats:
         report_text += generate_funnel_report(funnel_stats)
+    if amd_conformity:
+        report_text += generate_amd_conformity_report(amd_conformity)
 
     report_path = os.path.join(report_dir, "report.txt")
     with open(report_path, "w") as f:
         f.write(report_text)
+
+    # Save AMD conformity summary
+    if amd_conformity:
+        amd_path = os.path.join(report_dir, "amd_conformity.json")
+        with open(amd_path, "w") as f:
+            import json
+            json.dump(amd_conformity, f, indent=2)
 
     print(f"Report generated: {report_dir}")
     return report_dir

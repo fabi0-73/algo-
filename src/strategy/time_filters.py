@@ -397,9 +397,22 @@ class TimeFilterEngine:
         if not self.enabled:
             return True, ""
 
-        # Check kill zone
-        if not self.is_in_kill_zone(ts):
-            return False, "outside_killzone"
+        # Check kill zone (optional)
+        if SESSION_FILTER.get("use_kill_zone", True):
+            if not self.is_in_kill_zone(ts):
+                return False, "outside_killzone"
+
+            # If enabled, only allow entries during London open or NY open kill zones
+            if SESSION_FILTER.get("only_trade_in_kz", False):
+                in_specific_kz, _ = self.is_in_specific_kill_zone(ts)
+                if not in_specific_kz:
+                    return False, "outside_specific_killzone"
+
+        # If enabled, only allow entries during London open or NY open kill zones
+        if SESSION_FILTER.get("only_trade_in_kz", False):
+            in_specific_kz, _ = self.is_in_specific_kill_zone(ts)
+            if not in_specific_kz:
+                return False, "outside_specific_killzone"
 
         # Check Asian session
         if self.avoid_asian and self.is_in_asian_session(ts):

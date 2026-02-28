@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import argparse
 from datetime import datetime
 import logging
+import json
 import pandas as pd
 
 from src.data.db import Database
@@ -24,6 +25,7 @@ from src.visualization.charts import (
     plot_r_distribution,
     plot_monthly_performance,
 )
+from src.backtest.metrics import generate_amd_conformity_report
 
 logging.basicConfig(
     level=logging.INFO,
@@ -74,6 +76,19 @@ def analyze_backtest(
     # Print report
     report = generate_report(metrics)
     print("\n" + report)
+
+    # AMD conformity report (from saved report dir if available)
+    amd_report = ""
+    report_dir = os.path.join("reports", f"backtest_{backtest_id}")
+    amd_path = os.path.join(report_dir, "amd_conformity.json")
+    if os.path.exists(amd_path):
+        with open(amd_path, "r") as f:
+            amd_conformity = json.load(f)
+        amd_report = generate_amd_conformity_report(amd_conformity)
+        if amd_report:
+            print("\n" + amd_report)
+    else:
+        logger.info("AMD conformity report not found at %s", amd_path)
     
     # Monthly analysis
     monthly = calculate_monthly_returns(trades)
@@ -132,6 +147,8 @@ def analyze_backtest(
             f.write(report)
             f.write("\n\nMONTHLY BREAKDOWN:\n")
             f.write(monthly.to_string())
+            if amd_report:
+                f.write("\n" + amd_report)
         logger.info(f"Report saved to {report_path}")
 
 

@@ -265,6 +265,71 @@ def calculate_trailing_stop(
         return min(new_sl, current_sl)  # Only move down
 
 
+def get_effective_stop_with_trailing(
+    entry_price: float,
+    current_sl: float,
+    current_extreme_price: float,
+    stop_distance: float,
+    atr: float,
+    direction: str,
+    trailing_enabled: bool = None,
+    activation_r: float = None,
+    trail_atr_mult: float = None,
+) -> Tuple[float, bool]:
+    """
+    Return effective stop loss, applying trailing stop if enabled and activation R is reached.
+
+    Trailing stop activates when unrealized profit reaches activation_r (e.g. 2R).
+    After activation, SL trails by trail_atr_mult * ATR behind the extreme price.
+
+    Args:
+        entry_price: Entry price
+        current_sl: Current stop loss level
+        current_extreme_price: Best price in favor (high for LONG, low for SHORT)
+        stop_distance: Initial stop distance (for R calculation)
+        atr: ATR value
+        direction: "LONG" or "SHORT"
+        trailing_enabled: Use STRATEGY if None
+        activation_r: R multiple to activate trailing (use STRATEGY if None)
+        trail_atr_mult: ATR multiple for trail distance (use STRATEGY if None)
+
+    Returns:
+        Tuple of (effective_sl, is_trailing_active)
+    """
+    trailing_enabled = trailing_enabled if trailing_enabled is not None else STRATEGY.get("trailing_stop_enabled", False)
+    if not trailing_enabled or stop_distance <= 0 or atr <= 0:
+        return current_sl, False
+
+    activation_r = activation_r or STRATEGY.get("trailing_stop_activation_r", 2.0)
+    trail_atr_mult = trail_atr_mult or STRATEGY.get("trailing_stop_atr_mult", 1.0)
+
+    # Current unrealized R multiple
+    if direction == "LONG":
+        profit_distance = current_extreme_price - entry_price
+    else:
+        profit_distance = entry_price - current_extreme_price
+    current_r = profit_distance / stop_distance if stop_distance > 0 else 0.0
+
+    if current_r < activation_r:
+        return current_sl, False
+
+    # Trailing active: trail behind extreme price
+    new_sl = calculate_trailing_stop(
+        current_price=current_extreme_price,
+        entry_price=entry_price,
+        current_sl=current_sl,
+        direction=direction,
+        trail_atr=atr,
+        trail_multiplier=trail_atr_mult,
+    )
+    # For LONG: use max(new_sl, current_sl); for SHORT: use min(new_sl, current_sl)
+    if direction == "LONG":
+        effective_sl = max(new_sl, current_sl)
+    else:
+        effective_sl = min(new_sl, current_sl)
+    return effective_sl, True
+
+
 def calculate_exit_r_multiple(
     entry_price: float,
     exit_price: float,

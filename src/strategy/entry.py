@@ -14,7 +14,14 @@ from .manipulation import ManipulationResult
 from .distribution import DistributionResult
 from .indicators import is_rejection_candle, calculate_body_size
 from .fvg import FVG, find_fvg_at_retest_level, is_price_leaving_fvg, find_fvgs_in_range
-from .order_blocks import OrderBlock, find_ob_at_retest_level, is_price_at_order_block, find_order_blocks_in_range
+from .order_blocks import (
+    OrderBlock,
+    BreakerBlock,
+    find_ob_at_retest_level,
+    find_breaker_at_retest_level,
+    is_price_at_order_block,
+    find_order_blocks_in_range,
+)
 from .market_structure import StructureBreak, find_bos_after_manipulation
 
 
@@ -67,6 +74,23 @@ def is_in_premium_zone(price: float, range_high: float, range_low: float) -> boo
         return False
     midpoint = (range_high + range_low) / 2
     return price > midpoint
+
+
+def _equal_level_swept(consolidation: ConsolidationResult, manip: ManipulationResult) -> bool:
+    """True if manipulation swept an equal high or equal low (liquidity pool)."""
+    if manip.direction == "UP":
+        return bool(
+            consolidation.has_equal_highs
+            and consolidation.equal_high_level > 0
+            and manip.extreme_price >= consolidation.equal_high_level - 1e-9
+        )
+    if manip.direction == "DOWN":
+        return bool(
+            consolidation.has_equal_lows
+            and consolidation.equal_low_level > 0
+            and manip.extreme_price <= consolidation.equal_low_level + 1e-9
+        )
+    return False
 
 
 def check_premium_discount_filter(
@@ -122,8 +146,11 @@ class EntrySignal:
     entry_mode: str = ""           # Which entry mode triggered
     fvg_confluence: bool = False   # FVG at entry
     ob_confluence: bool = False    # Order Block at entry
+    breaker_confluence: bool = False  # Breaker Block at entry
     bos_confirmed: bool = False    # Break of Structure confirmed
-    confluence_score: int = 0      # Number of confluence factors (0-3)
+    equal_level_swept: bool = False  # Manipulation swept equal highs/lows
+    volume_confirmed: bool = False   # Volume spike during manipulation
+    confluence_score: int = 0      # Number of confluence factors (0-6)
 
     # Limit fill parameters
     desired_entry_price: float = 0.0  # Limit order price for fill simulation
@@ -214,6 +241,9 @@ def check_entry(
                 # Check for rejection
                 if is_rejection_candle(candle, expected_rejection, rejection_wick_ratio):
                     # Valid entry signal
+                    entry_execution = STRATEGY.get("entry_execution", "LIMIT").upper()
+                    desired_price = candle["close"] if entry_execution == "MARKET" else retest_level
+                    desired_type = "MARKET" if entry_execution == "MARKET" else "LIMIT"
                     return EntrySignal(
                         valid=True,
                         direction=direction,
@@ -226,6 +256,9 @@ def check_entry(
                         consolidation_low=consolidation.range_low,
                         manipulation_extreme=manipulation.extreme_price,
                         manipulation_direction=manipulation.direction,
+                        desired_entry_price=desired_price,
+                        desired_entry_type=desired_type,
+                        desired_entry_model=STRATEGY.get("entry_mode", ENTRY_MODE_RETEST_ONLY),
                     )
         else:
             # Check if high retests range_low (from below)
@@ -236,6 +269,9 @@ def check_entry(
                 # Check for rejection
                 if is_rejection_candle(candle, expected_rejection, rejection_wick_ratio):
                     # Valid entry signal
+                    entry_execution = STRATEGY.get("entry_execution", "LIMIT").upper()
+                    desired_price = candle["close"] if entry_execution == "MARKET" else retest_level
+                    desired_type = "MARKET" if entry_execution == "MARKET" else "LIMIT"
                     return EntrySignal(
                         valid=True,
                         direction=direction,
@@ -248,6 +284,9 @@ def check_entry(
                         consolidation_low=consolidation.range_low,
                         manipulation_extreme=manipulation.extreme_price,
                         manipulation_direction=manipulation.direction,
+                        desired_entry_price=desired_price,
+                        desired_entry_type=desired_type,
+                        desired_entry_model=STRATEGY.get("entry_mode", ENTRY_MODE_RETEST_ONLY),
                     )
     
     return EntrySignal(valid=False)
@@ -287,6 +326,9 @@ def check_immediate_entry(
         
         # Check if the distribution candle retested range_high
         if candle["low"] <= retest_level:
+            entry_execution = STRATEGY.get("entry_execution", "LIMIT").upper()
+            desired_price = candle["close"] if entry_execution == "MARKET" else retest_level
+            desired_type = "MARKET" if entry_execution == "MARKET" else "LIMIT"
             return EntrySignal(
                 valid=True,
                 direction=direction,
@@ -299,6 +341,9 @@ def check_immediate_entry(
                 consolidation_low=consolidation.range_low,
                 manipulation_extreme=manipulation.extreme_price,
                 manipulation_direction=manipulation.direction,
+                desired_entry_price=desired_price,
+                desired_entry_type=desired_type,
+                desired_entry_model=STRATEGY.get("entry_mode", ENTRY_MODE_RETEST_ONLY),
             )
     else:
         direction = "SHORT"
@@ -306,6 +351,9 @@ def check_immediate_entry(
         
         # Check if the distribution candle retested range_low
         if candle["high"] >= retest_level:
+            entry_execution = STRATEGY.get("entry_execution", "LIMIT").upper()
+            desired_price = candle["close"] if entry_execution == "MARKET" else retest_level
+            desired_type = "MARKET" if entry_execution == "MARKET" else "LIMIT"
             return EntrySignal(
                 valid=True,
                 direction=direction,
@@ -318,6 +366,9 @@ def check_immediate_entry(
                 consolidation_low=consolidation.range_low,
                 manipulation_extreme=manipulation.extreme_price,
                 manipulation_direction=manipulation.direction,
+                desired_entry_price=desired_price,
+                desired_entry_type=desired_type,
+                desired_entry_model=STRATEGY.get("entry_mode", ENTRY_MODE_RETEST_ONLY),
             )
     
     return EntrySignal(valid=False)
@@ -356,6 +407,7 @@ def check_entry_with_confluence(
         EntrySignal with confluence data
     """
     entry_mode = entry_mode or STRATEGY.get("entry_mode", ENTRY_MODE_RETEST_ONLY)
+    entry_execution = STRATEGY.get("entry_execution", "LIMIT").upper()
     retest_tolerance_atr_mult = retest_tolerance_atr_mult or STRATEGY["retest_tolerance_atr_mult"]
     rejection_wick_ratio = rejection_wick_ratio or STRATEGY["rejection_wick_ratio"]
     
@@ -407,7 +459,11 @@ def check_entry_with_confluence(
     bos_confirmed = structure_break is not None and structure_break.valid
     if STRATEGY.get("bos_required", False) and not bos_confirmed:
         return EntrySignal(valid=False)
-    
+
+    # Confluence from consolidation/manipulation (equal levels swept, volume spike)
+    equal_level_swept = _equal_level_swept(consolidation, manipulation)
+    volume_confirmed = getattr(manipulation, "volume_confirmed", False)
+
     # Start looking after distribution breakout
     start_idx = distribution.break_candle_idx + 1
     if start_idx >= len(df):
@@ -452,31 +508,48 @@ def check_entry_with_confluence(
         entry_triggered = False
         fvg_confluence = False
         ob_confluence = False
-        
+
         if entry_mode == ENTRY_MODE_RETEST_WITH_FVG:
             # Check if price is leaving an FVG at retest level
             if fvg_at_level and is_price_leaving_fvg(candle, fvg_at_level):
                 entry_triggered = True
                 fvg_confluence = True
-        
+            elif ob_at_level and is_price_at_order_block(candle, ob_at_level, rejection_required=True):
+                entry_triggered = True
+                ob_confluence = True
+            elif STRATEGY.get("allow_rejection_fallback", False):
+                # Optional fallback: retest + rejection without FVG/OB
+                if is_rejection_candle(candle, expected_rejection, rejection_wick_ratio):
+                    entry_triggered = True
+
         elif entry_mode == ENTRY_MODE_ORDER_BLOCK:
             # Check if price is at Order Block with rejection
             if ob_at_level and is_price_at_order_block(candle, ob_at_level, rejection_required=True):
                 entry_triggered = True
                 ob_confluence = True
-        
+
         elif entry_mode == ENTRY_MODE_RETEST_ONLY:
             # Original behavior: retest + rejection
             if is_rejection_candle(candle, expected_rejection, rejection_wick_ratio):
                 entry_triggered = True
-        
+
         # For PEAK_LOW mode, we continue scanning and enter at the peak
         elif entry_mode == ENTRY_MODE_PEAK_LOW:
             # Will be handled after the loop
             pass
-        
+
         if entry_triggered:
-            # Calculate confluence score
+            # Breaker block at retest level (when enabled)
+            breaker_at_level = None
+            if STRATEGY.get("use_breaker_blocks", False):
+                ob_dir = "BULLISH" if direction == "LONG" else "BEARISH"
+                breaker_at_level = find_breaker_at_retest_level(
+                    df, retest_level, search_start, search_end,
+                    candle_idx, ob_dir, atr, tolerance_mult=0.5
+                )
+            breaker_confluence = breaker_at_level is not None and breaker_at_level.valid
+
+            # Calculate confluence score (BOS + FVG + OB + equal levels + volume + breaker)
             confluence_score = 0
             if bos_confirmed:
                 confluence_score += 1
@@ -486,7 +559,19 @@ def check_entry_with_confluence(
             if ob_at_level:
                 ob_confluence = True
                 confluence_score += 1
-            
+            if equal_level_swept:
+                confluence_score += 1
+            if volume_confirmed:
+                confluence_score += 1
+            if breaker_confluence:
+                confluence_score += 1
+
+            min_confluence = STRATEGY.get("min_confluence_score", 0)
+            if min_confluence > 0 and confluence_score < min_confluence:
+                continue  # Skip this entry, try next candle
+
+            desired_price = candle["close"] if entry_execution == "MARKET" else retest_level
+            desired_type = "MARKET" if entry_execution == "MARKET" else "LIMIT"
             return EntrySignal(
                 valid=True,
                 direction=direction,
@@ -502,14 +587,30 @@ def check_entry_with_confluence(
                 entry_mode=entry_mode,
                 fvg_confluence=fvg_confluence,
                 ob_confluence=ob_confluence,
+                breaker_confluence=breaker_confluence,
                 bos_confirmed=bos_confirmed,
+                equal_level_swept=equal_level_swept,
+                volume_confirmed=volume_confirmed,
                 confluence_score=confluence_score,
+                desired_entry_price=desired_price,
+                desired_entry_type=desired_type,
+                desired_entry_model=entry_mode,
             )
     
     # Handle PEAK_LOW mode - enter at the extreme of the retest
     if entry_mode == ENTRY_MODE_PEAK_LOW and peak_idx is not None:
         peak_candle = df.iloc[peak_idx]
-        
+
+        # Breaker block at retest level (when enabled)
+        breaker_at_level = None
+        if STRATEGY.get("use_breaker_blocks", False):
+            ob_dir = "BULLISH" if direction == "LONG" else "BEARISH"
+            breaker_at_level = find_breaker_at_retest_level(
+                df, retest_level, search_start, search_end,
+                peak_idx, ob_dir, atr, tolerance_mult=0.5
+            )
+        breaker_confluence = breaker_at_level is not None and breaker_at_level.valid
+
         # Calculate confluence
         confluence_score = 0
         fvg_confluence = fvg_at_level is not None
@@ -520,7 +621,19 @@ def check_entry_with_confluence(
             confluence_score += 1
         if ob_confluence:
             confluence_score += 1
-        
+        if equal_level_swept:
+            confluence_score += 1
+        if volume_confirmed:
+            confluence_score += 1
+        if breaker_confluence:
+            confluence_score += 1
+
+        min_confluence = STRATEGY.get("min_confluence_score", 0)
+        if min_confluence > 0 and confluence_score < min_confluence:
+            return EntrySignal(valid=False)
+
+        desired_price = peak_candle["close"] if entry_execution == "MARKET" else retest_level
+        desired_type = "MARKET" if entry_execution == "MARKET" else "LIMIT"
         return EntrySignal(
             valid=True,
             direction=direction,
@@ -536,10 +649,16 @@ def check_entry_with_confluence(
             entry_mode=entry_mode,
             fvg_confluence=fvg_confluence,
             ob_confluence=ob_confluence,
+            breaker_confluence=breaker_confluence,
             bos_confirmed=bos_confirmed,
+            equal_level_swept=equal_level_swept,
+            volume_confirmed=volume_confirmed,
             confluence_score=confluence_score,
+            desired_entry_price=desired_price,
+            desired_entry_type=desired_type,
+            desired_entry_model=entry_mode,
         )
-    
+
     return EntrySignal(valid=False)
 
 
@@ -617,15 +736,14 @@ def check_entry_at_candle(
     if entry_mode == ENTRY_MODE_RETEST_WITH_FVG:
         if fvg_at_level and is_price_leaving_fvg(candle, fvg_at_level):
             entry_triggered = True
-        elif is_rejection_candle(candle, expected_rejection, rejection_wick_ratio):
-            # Fallback to rejection if no FVG trigger
+        elif ob_at_level and is_price_at_order_block(candle, ob_at_level, rejection_required=True):
             entry_triggered = True
-    
+        elif STRATEGY.get("allow_rejection_fallback", False):
+            if is_rejection_candle(candle, expected_rejection, rejection_wick_ratio):
+                entry_triggered = True
+
     elif entry_mode == ENTRY_MODE_ORDER_BLOCK:
         if ob_at_level and is_price_at_order_block(candle, ob_at_level, rejection_required=True):
-            entry_triggered = True
-        elif is_rejection_candle(candle, expected_rejection, rejection_wick_ratio):
-            # Fallback to rejection if no OB trigger
             entry_triggered = True
     
     elif entry_mode == ENTRY_MODE_RETEST_ONLY:
@@ -639,7 +757,20 @@ def check_entry_at_candle(
     if not entry_triggered:
         return EntrySignal(valid=False)
     
-    # Calculate confluence score
+    # Breaker block at retest level (when enabled)
+    breaker_at_level = None
+    if STRATEGY.get("use_breaker_blocks", False):
+        ob_dir = "BULLISH" if direction == "LONG" else "BEARISH"
+        search_end = min(distribution.break_candle_idx + 30, len(df))
+        breaker_at_level = find_breaker_at_retest_level(
+            df, retest_level, consolidation.start_idx, search_end,
+            current_idx, ob_dir, atr, tolerance_mult=0.5
+        )
+    breaker_confluence = breaker_at_level is not None and breaker_at_level.valid
+    equal_level_swept = _equal_level_swept(consolidation, manipulation)
+    volume_confirmed = getattr(manipulation, "volume_confirmed", False)
+
+    # Calculate confluence score (BOS + FVG + OB + equal levels + volume + breaker)
     confluence_score = 0
     if bos_confirmed:
         confluence_score += 1
@@ -647,11 +778,21 @@ def check_entry_at_candle(
         confluence_score += 1
     if ob_confluence:
         confluence_score += 1
-    
-    # Determine desired entry price based on fill model
-    # For LIMIT_AT_RETEST: use retest_level
-    # For CLOSE: use candle close
-    desired_price = retest_level  # Default to retest level for limit orders
+    if equal_level_swept:
+        confluence_score += 1
+    if volume_confirmed:
+        confluence_score += 1
+    if breaker_confluence:
+        confluence_score += 1
+
+    min_confluence = STRATEGY.get("min_confluence_score", 0)
+    if min_confluence > 0 and confluence_score < min_confluence:
+        return EntrySignal(valid=False)
+
+    # Determine desired entry price based on execution preference
+    entry_execution = STRATEGY.get("entry_execution", "LIMIT").upper()
+    desired_price = candle["close"] if entry_execution == "MARKET" else retest_level
+    desired_type = "MARKET" if entry_execution == "MARKET" else "LIMIT"
 
     return EntrySignal(
         valid=True,
@@ -668,10 +809,13 @@ def check_entry_at_candle(
         entry_mode=entry_mode,
         fvg_confluence=fvg_confluence,
         ob_confluence=ob_confluence,
+        breaker_confluence=breaker_confluence,
         bos_confirmed=bos_confirmed,
+        equal_level_swept=equal_level_swept,
+        volume_confirmed=volume_confirmed,
         confluence_score=confluence_score,
         desired_entry_price=desired_price,
-        desired_entry_type="LIMIT",
+        desired_entry_type=desired_type,
         desired_entry_model=entry_mode,
         atr=atr,
     )

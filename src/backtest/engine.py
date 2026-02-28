@@ -12,16 +12,29 @@ import numpy as np
 import logging
 import uuid
 
-from config import STRATEGY, BACKTEST, VALIDATION, EXECUTION, TIME_CONFIG
+from config import STRATEGY, BACKTEST, VALIDATION, EXECUTION, TIME_CONFIG, SESSION_FILTER
 from src.strategy.indicators import add_indicators, calculate_atr
-from src.strategy.consolidation import detect_consolidation, ConsolidationResult
-from src.strategy.manipulation import detect_manipulation, ManipulationResult, confirm_liquidity_sweep
-from src.strategy.distribution import detect_distribution, DistributionResult
+from src.strategy.consolidation import detect_consolidation, ConsolidationResult, detect_equal_levels
+from src.strategy.manipulation import (
+    detect_manipulation,
+    ManipulationResult,
+    confirm_liquidity_sweep,
+    confirm_volume_spike,
+)
+from src.strategy.distribution import detect_distribution, DistributionResult, validate_distribution_strength
 from src.strategy.entry import (
     check_entry, check_immediate_entry, EntrySignal,
-    check_entry_at_candle, ENTRY_MODE_RETEST_ONLY
+    check_entry_at_candle, check_premium_discount_filter,
+    ENTRY_MODE_RETEST_ONLY,
 )
-from src.strategy.risk import calculate_risk, calculate_exit_r_multiple, calculate_pnl, calculate_pnl_with_costs, RiskParams
+from src.strategy.risk import (
+    calculate_risk,
+    calculate_exit_r_multiple,
+    calculate_pnl,
+    calculate_pnl_with_costs,
+    get_effective_stop_with_trailing,
+    RiskParams,
+)
 from src.strategy.fvg import FVG, find_fvg_at_retest_level, find_fvgs_in_range
 from src.strategy.order_blocks import OrderBlock, find_ob_at_retest_level, find_order_blocks_in_range
 from src.strategy.market_structure import StructureBreak, find_bos_after_manipulation
@@ -94,6 +107,9 @@ class TradeRecord:
     remaining_size: float = 0.0         # Size remaining after partial
     original_sl: float = 0.0            # Original SL before BE move
     sl_moved_to_be: bool = False        # Whether SL was moved to breakeven
+
+    # Trailing stop tracking
+    best_price_in_favor: float = 0.0  # Best high (LONG) or best low (SHORT) since entry
 
     # Metadata
     backtest_id: str = ""
@@ -203,9 +219,12 @@ class BacktestEngine:
             "consolidations_found": 0,
             "no_manipulation": 0,
             "no_distribution": 0,
+            "no_distribution_follow_through": 0,
             "no_bos": 0,
             "no_liquidity_sweep": 0,
+            "no_volume_spike": 0,
             "no_entry_retest": 0,
+            "entry_too_late": 0,
             "short_filtered": 0,
             "risk_invalid": 0,
             "entries_executed": 0,
@@ -219,6 +238,9 @@ class BacktestEngine:
             "filtered_daily_limit": 0,
             "filtered_cooldown": 0,
             "filtered_rollover": 0,
+            "filtered_premium_discount": 0,
+            "filtered_consolidation_not_asian": 0,
+            "filtered_distribution_not_london_ny": 0,
             "pattern_duplicates": 0,
             "fill_not_triggered": 0,
         }
@@ -241,6 +263,16 @@ class BacktestEngine:
             "net_pnl": 0.0,
         }
 
+        # AMD conformity tracking
+        self.amd_stats = {
+            "consolidations_found": 0,
+            "manipulations_found": 0,
+            "distributions_found": 0,
+            "distributions_with_bos_confluence": 0,
+            "manip_to_dist_bars_total": 0,
+            "manip_to_dist_count": 0,
+        }
+
         # Minimum lookback needed
         self.lookback = STRATEGY["consolidation_lookback"]
         self.atr_period = STRATEGY["atr_period"]
@@ -253,7 +285,10 @@ class BacktestEngine:
             return {"error": "Insufficient data"}
 
         # Add indicators
-        df = add_indicators(df.copy(), atr_period=self.atr_period)
+        df = add_indicators(
+            df.copy(),
+            atr_period=self.atr_period,
+        )
         df = df.reset_index(drop=True)
 
         # Localize timestamps for session filtering
@@ -286,9 +321,12 @@ class BacktestEngine:
             "consolidations_found": 0,
             "no_manipulation": 0,
             "no_distribution": 0,
+            "no_distribution_follow_through": 0,
             "no_bos": 0,
             "no_liquidity_sweep": 0,
+            "no_volume_spike": 0,
             "no_entry_retest": 0,
+            "entry_too_late": 0,
             "short_filtered": 0,
             "risk_invalid": 0,
             "entries_executed": 0,
@@ -301,6 +339,9 @@ class BacktestEngine:
             "filtered_daily_limit": 0,
             "filtered_cooldown": 0,
             "filtered_rollover": 0,
+            "filtered_premium_discount": 0,
+            "filtered_consolidation_not_asian": 0,
+            "filtered_distribution_not_london_ny": 0,
             "pattern_duplicates": 0,
             "fill_not_triggered": 0,
         }
@@ -323,18 +364,28 @@ class BacktestEngine:
             "net_pnl": 0.0,
         }
 
+        # Reset AMD conformity stats
+        self.amd_stats = {
+            "consolidations_found": 0,
+            "manipulations_found": 0,
+            "distributions_found": 0,
+            "distributions_with_bos_confluence": 0,
+            "manip_to_dist_bars_total": 0,
+            "manip_to_dist_count": 0,
+        }
+
         logger.info(f"Starting backtest on {len(df)} candles")
         logger.info(f"Date range: {df['timestamp'].iloc[0]} to {df['timestamp'].iloc[-1]}")
 
         # Main loop - process each bar
         total_bars = len(df) - self.min_lookback
-        progress_interval = max(1000, total_bars // 20)  # Log every 5% or every 1000 bars
+        progress_interval = max(1000, total_bars // 50)  # Log every ~2%
         
         for i in range(self.min_lookback, len(df)):
             current_candle = df.iloc[i]
             ts = current_candle.get("timestamp")
 
-            # Progress logging
+            # Progress logging (so long runs don't appear stuck)
             if (i - self.min_lookback) % progress_interval == 0:
                 progress_pct = ((i - self.min_lookback) / total_bars) * 100
                 logger.info(f"Processing bar {i}/{len(df)} ({progress_pct:.1f}%) - Trades: {len(self.trades)}")
@@ -440,6 +491,19 @@ class BacktestEngine:
             self.rejection_stats["filtered_htf_bias"] += 1
             return False, reason
 
+        # 3.5 Premium/Discount zones (if require_discount_for_long / require_premium_for_short)
+        if STRATEGY.get("require_discount_for_long", False) or STRATEGY.get("require_premium_for_short", False):
+            entry_price = entry.desired_entry_price or entry.entry_price
+            range_high = entry.consolidation_high
+            range_low = entry.consolidation_low
+            if range_high > range_low:
+                passes, reason = check_premium_discount_filter(
+                    entry_price, range_high, range_low, entry.direction
+                )
+                if not passes:
+                    self.rejection_stats["filtered_premium_discount"] += 1
+                    return False, reason or "premium_discount"
+
         # 4. Key levels (if mode is REQUIRE)
         can_enter, kl_score, reason = self.key_levels.can_enter_trade(
             entry.entry_price, row, atr
@@ -486,26 +550,37 @@ class BacktestEngine:
         if pd.isna(atr) or atr == 0:
             return
 
-        # Scan backwards for consolidation zones
-        # Check consolidations that ended 5 to 50 bars ago
-        for consol_end_offset in range(10, min(60, current_idx - lookback)):
+        # Prefer numpy arrays for hot path (avoid repeated df.iloc in loop)
+        highs = df["high"].values
+        lows = df["low"].values
+        closes = df["close"].values
+
+        # Scan backwards for consolidation zones (step by 2 for speed)
+        # Check consolidations within configured window
+        min_offset = STRATEGY.get("pattern_min_bars_after_consolidation", 10)
+        max_offset_cfg = STRATEGY.get("pattern_max_bars_after_consolidation", 60)
+        max_offset = min(max_offset_cfg, current_idx - lookback)
+        for consol_end_offset in range(min_offset, max_offset, 2):
             consol_end_idx = current_idx - consol_end_offset
             consol_start_idx = consol_end_idx - lookback
 
             if consol_start_idx < self.atr_period:
                 continue
 
-            # Get consolidation window
-            consol_window = df.iloc[consol_start_idx:consol_end_idx + 1]
+            # Consolidation window (numpy slice - faster than df.iloc)
+            hw = highs[consol_start_idx : consol_end_idx + 1]
+            lw = lows[consol_start_idx : consol_end_idx + 1]
+            cw = closes[consol_start_idx : consol_end_idx + 1]
 
             # Check if this was a valid consolidation
-            if not self._is_consolidation(consol_window, atr):
+            if not self._is_consolidation_arrays(hw, lw, cw, atr):
                 continue
 
             self.rejection_stats["consolidations_found"] += 1
+            self.amd_stats["consolidations_found"] += 1
 
-            range_high = consol_window['high'].max()
-            range_low = consol_window['low'].min()
+            range_high = float(np.max(hw))
+            range_low = float(np.min(lw))
 
             # Create consolidation result
             consol = ConsolidationResult(
@@ -517,12 +592,16 @@ class BacktestEngine:
                 start_idx=consol_start_idx,
                 end_idx=consol_end_idx,
             )
+            # Enrich with equal highs/lows (liquidity pools) when enabled
+            if STRATEGY.get("detect_equal_levels", True):
+                consol = detect_equal_levels(df, consol)
 
             # Now check for manipulation AFTER consolidation
             manip = self._check_manipulation_after(df, consol, current_idx)
             if not manip.valid:
                 self.rejection_stats["no_manipulation"] += 1
                 continue
+            self.amd_stats["manipulations_found"] += 1
 
             # Confirm liquidity sweep if required
             if STRATEGY.get("require_liquidity_sweep", False):
@@ -530,6 +609,12 @@ class BacktestEngine:
                 if not manip.swept_liquidity:
                     self.rejection_stats["no_liquidity_sweep"] += 1
                     continue
+
+            # Confirm volume spike during manipulation if required
+            manip = confirm_volume_spike(df, manip)
+            if STRATEGY.get("require_manipulation_volume_spike", False) and not getattr(manip, "volume_confirmed", False):
+                self.rejection_stats["no_volume_spike"] += 1
+                continue
 
             # Pattern deduplication - skip if we've seen this exact pattern
             pattern_key = self._get_pattern_key(consol, manip)
@@ -542,6 +627,37 @@ class BacktestEngine:
             if not dist.valid:
                 self.rejection_stats["no_distribution"] += 1
                 continue
+            follow_through_candles = STRATEGY.get("distribution_follow_through_candles", 2)
+            if not validate_distribution_strength(df, dist, min_follow_through_candles=follow_through_candles):
+                self.rejection_stats["no_distribution_follow_through"] += 1
+                continue
+
+            self.amd_stats["distributions_found"] += 1
+            bars_to_distribution = dist.break_candle_idx - manip.return_candle_idx
+            if bars_to_distribution >= 0:
+                self.amd_stats["manip_to_dist_bars_total"] += bars_to_distribution
+                self.amd_stats["manip_to_dist_count"] += 1
+
+            # Session timing: Asian accumulation -> London/NY distribution
+            if SESSION_FILTER.get("require_consolidation_in_asian", False):
+                consol_start_ts = df.iloc[consol.start_idx].get("timestamp")
+                consol_end_ts = df.iloc[consol.end_idx].get("timestamp")
+                if not self.time_filter.consolidation_formed_in_asian(consol_start_ts, consol_end_ts):
+                    self.rejection_stats["filtered_consolidation_not_asian"] += 1
+                    continue
+            if SESSION_FILTER.get("require_distribution_in_london_ny", False):
+                dist_ts = df.iloc[dist.break_candle_idx].get("timestamp")
+                if not self.time_filter.distribution_in_london_ny(dist_ts):
+                    self.rejection_stats["filtered_distribution_not_london_ny"] += 1
+                    continue
+
+            # Skip stale retests (too many bars after distribution)
+            max_bars_after_dist = STRATEGY.get("max_bars_after_distribution")
+            if max_bars_after_dist is not None:
+                bars_since_dist = current_idx - dist.break_candle_idx
+                if bars_since_dist > max_bars_after_dist:
+                    self.rejection_stats["entry_too_late"] += 1
+                    continue
 
             # Detect Break of Structure (optional)
             bos = None
@@ -593,6 +709,38 @@ class BacktestEngine:
                     tolerance_mult=STRATEGY.get("retest_tolerance_atr_mult", 0.4)
                 )
 
+            # Track distributions with BOS + confluence (AMD conformity)
+            equal_level_swept = False
+            if manip.direction == "UP":
+                equal_level_swept = bool(
+                    consol.has_equal_highs
+                    and consol.equal_high_level > 0
+                    and manip.extreme_price >= consol.equal_high_level - 1e-9
+                )
+            elif manip.direction == "DOWN":
+                equal_level_swept = bool(
+                    consol.has_equal_lows
+                    and consol.equal_low_level > 0
+                    and manip.extreme_price <= consol.equal_low_level + 1e-9
+                )
+
+            volume_confirmed = getattr(manip, "volume_confirmed", False)
+            confluence_score = 0
+            if bos is not None and bos.valid:
+                confluence_score += 1
+            if fvg_at_level:
+                confluence_score += 1
+            if ob_at_level:
+                confluence_score += 1
+            if equal_level_swept:
+                confluence_score += 1
+            if volume_confirmed:
+                confluence_score += 1
+
+            min_confluence = STRATEGY.get("min_confluence_score", 0)
+            if (bos is not None and bos.valid) and confluence_score >= min_confluence:
+                self.amd_stats["distributions_with_bos_confluence"] += 1
+
             # Check for entry at current bar with confluence
             entry = self._check_entry_now_with_confluence(
                 df, consol, manip, dist, current_idx,
@@ -630,6 +778,7 @@ class BacktestEngine:
                 entry=entry,
                 candle=row,
                 atr=atr,
+                position_size=risk.position_size,
             )
 
             if not fill_result.filled:
@@ -674,6 +823,24 @@ class BacktestEngine:
         closes = window['close']
         closes_inside = ((closes >= range_low) & (closes <= range_high)).sum()
         close_pct = closes_inside / len(window)
+
+        if close_pct < STRATEGY["consolidation_close_pct"]:
+            return False
+
+        return True
+
+    def _is_consolidation_arrays(self, high_arr: np.ndarray, low_arr: np.ndarray, close_arr: np.ndarray, atr: float) -> bool:
+        """Check consolidation using numpy arrays (faster hot path)."""
+        range_high = float(np.max(high_arr))
+        range_low = float(np.min(low_arr))
+        range_size = range_high - range_low
+
+        max_range = STRATEGY["consolidation_range_atr_mult"] * atr
+        if range_size > max_range:
+            return False
+
+        closes_inside = np.sum((close_arr >= range_low) & (close_arr <= range_high))
+        close_pct = closes_inside / len(close_arr)
 
         if close_pct < STRATEGY["consolidation_close_pct"]:
             return False
@@ -730,24 +897,27 @@ class BacktestEngine:
         direction: str,
         atr: float,
     ) -> ManipulationResult:
-        """Find a fakeout pattern in the given range."""
+        """Find a fakeout pattern in the given range (uses arrays for speed)."""
+        h = df["high"].values
+        l_ = df["low"].values
+        c = df["close"].values
 
         break_idx = -1
         extreme = 0.0 if direction == "UP" else float("inf")
 
         for i in range(start_idx, end_idx):
-            candle = df.iloc[i]
+            hi = h[i]
+            lo = l_[i]
+            cl = c[i]
 
             if direction == "UP":
-                # Check for break above
-                if candle["high"] > range_high + min_break:
+                if hi > range_high + min_break:
                     if break_idx == -1:
                         break_idx = i
-                    extreme = max(extreme, candle["high"])
+                    extreme = max(extreme, hi)
 
-                # Check for return inside
                 if break_idx >= 0:
-                    if candle["close"] <= range_high and candle["close"] >= range_low:
+                    if cl <= range_high and cl >= range_low:
                         if i - break_idx <= max_return_candles:
                             return ManipulationResult(
                                 valid=True,
@@ -758,18 +928,16 @@ class BacktestEngine:
                                 atr=atr,
                             )
                     if i - break_idx > max_return_candles:
-                        break_idx = -1  # Reset, look for new fakeout
+                        break_idx = -1
                         extreme = 0.0
             else:
-                # Check for break below
-                if candle["low"] < range_low - min_break:
+                if lo < range_low - min_break:
                     if break_idx == -1:
                         break_idx = i
-                    extreme = min(extreme, candle["low"])
+                    extreme = min(extreme, lo)
 
-                # Check for return inside
                 if break_idx >= 0:
-                    if candle["close"] >= range_low and candle["close"] <= range_high:
+                    if cl >= range_low and cl <= range_high:
                         if i - break_idx <= max_return_candles:
                             return ManipulationResult(
                                 valid=True,
@@ -792,7 +960,9 @@ class BacktestEngine:
         manip: ManipulationResult,
         current_idx: int,
     ) -> DistributionResult:
-        """Check for distribution after manipulation."""
+        """Check for distribution after manipulation (uses arrays for speed)."""
+        o = df["open"].values
+        c = df["close"].values
 
         atr = manip.atr
         min_break = STRATEGY["distribution_break_atr_mult"] * atr
@@ -801,43 +971,41 @@ class BacktestEngine:
         range_high = consol.range_high
         range_low = consol.range_low
 
-        # Expected direction is opposite of fakeout
         expected_dir = "UP" if manip.direction == "DOWN" else "DOWN"
 
-        # Average body size from consolidation
-        consol_window = df.iloc[consol.start_idx:consol.end_idx + 1]
-        avg_body = abs(consol_window['close'] - consol_window['open']).mean()
+        # Average body size from consolidation (numpy slice)
+        s, e = consol.start_idx, consol.end_idx + 1
+        avg_body = float(np.mean(np.abs(c[s:e] - o[s:e])))
         if avg_body == 0:
             avg_body = atr * 0.1
 
-        # Search after manipulation return
         search_start = manip.return_candle_idx + 1
         search_end = min(current_idx, search_start + 20)
 
         for i in range(search_start, search_end):
-            candle = df.iloc[i]
-            body = abs(candle["close"] - candle["open"])
+            close_i = c[i]
+            body = abs(close_i - o[i])
             body_ratio = body / avg_body if avg_body > 0 else 0
 
             if expected_dir == "UP":
-                break_distance = candle["close"] - range_high
+                break_distance = close_i - range_high
                 if break_distance >= min_break and body_ratio >= body_mult:
                     return DistributionResult(
                         valid=True,
                         direction="UP",
-                        break_price=candle["close"],
+                        break_price=close_i,
                         break_distance=break_distance,
                         body_expansion=body_ratio,
                         break_candle_idx=i,
                         atr=atr,
                     )
             else:
-                break_distance = range_low - candle["close"]
+                break_distance = range_low - close_i
                 if break_distance >= min_break and body_ratio >= body_mult:
                     return DistributionResult(
                         valid=True,
                         direction="DOWN",
-                        break_price=candle["close"],
+                        break_price=close_i,
                         break_distance=break_distance,
                         body_expansion=body_ratio,
                         break_candle_idx=i,
@@ -964,12 +1132,16 @@ class BacktestEngine:
         atr = current_candle.get("atr", 0.0)
         kl_score = self.key_levels.calculate_score(fill.fill_price, current_candle, atr)
 
+        best_price = fill.fill_price  # Initialize for trailing stop
         trade = TradeRecord(
             entry_time=current_candle.get("timestamp", datetime.now()),
             direction=entry.direction,
             entry_price=fill.fill_price,  # Use actual fill price
             sl_price=risk.stop_loss,
             tp_price=risk.take_profit,
+            original_sl=risk.stop_loss,
+            sl_moved_to_be=False,
+            best_price_in_favor=best_price,
             position_size=risk.position_size,
             consolidation_high=entry.consolidation_high,
             consolidation_low=entry.consolidation_low,
@@ -1026,6 +1198,37 @@ class BacktestEngine:
         if self.time_filter.should_close_for_rollover(ts):
             self._exit_position(candle["close"], "ROLLOVER", candle, verbose)
             return
+
+        # Update best price in favor (for trailing stop)
+        if trade.direction == "LONG":
+            trade.best_price_in_favor = max(
+                getattr(trade, "best_price_in_favor", trade.entry_price),
+                candle["high"],
+            )
+        else:
+            trade.best_price_in_favor = min(
+                getattr(trade, "best_price_in_favor", trade.entry_price),
+                candle["low"],
+            )
+
+        # Apply trailing stop if enabled
+        if STRATEGY.get("trailing_stop_enabled", False) and atr and atr > 0:
+            stop_distance = (
+                trade.entry_price - trade.sl_price
+                if trade.direction == "LONG"
+                else trade.sl_price - trade.entry_price
+            )
+            if stop_distance > 0:
+                effective_sl, trailing_active = get_effective_stop_with_trailing(
+                    entry_price=trade.entry_price,
+                    current_sl=trade.sl_price,
+                    current_extreme_price=trade.best_price_in_favor,
+                    stop_distance=stop_distance,
+                    atr=atr,
+                    direction=trade.direction,
+                )
+                if trailing_active and effective_sl != trade.sl_price:
+                    trade.sl_price = effective_sl
 
         # Use execution engine for exit decision (with partial TP support)
         if RISK_MODEL.get("partial_tp_enabled", False):
@@ -1173,11 +1376,22 @@ class BacktestEngine:
     def _generate_results(self) -> Dict[str, Any]:
         """Generate backtest results summary."""
         if not self.trades:
+            amd_conformity = {
+                "consolidations_found": self.amd_stats.get("consolidations_found", 0),
+                "manipulations_found": self.amd_stats.get("manipulations_found", 0),
+                "distributions_found": self.amd_stats.get("distributions_found", 0),
+                "distributions_with_bos_confluence": self.amd_stats.get("distributions_with_bos_confluence", 0),
+                "consolidation_to_manipulation_pct": 0.0,
+                "manipulation_to_distribution_pct": 0.0,
+                "distribution_with_bos_confluence_pct": 0.0,
+                "avg_bars_manipulation_to_distribution": 0.0,
+            }
             return {
                 "backtest_id": self.backtest_id,
                 "total_trades": 0,
                 "error": "No trades generated",
                 "funnel_stats": self.rejection_stats,
+                "amd_conformity": amd_conformity,
             }
 
         # Convert to DataFrame for analysis
@@ -1224,6 +1438,25 @@ class BacktestEngine:
                     trades_df["confluence_score"].mean(), 2
                 )
 
+        # AMD conformity summary
+        consol_count = self.amd_stats.get("consolidations_found", 0)
+        manip_count = self.amd_stats.get("manipulations_found", 0)
+        dist_count = self.amd_stats.get("distributions_found", 0)
+        dist_conf_count = self.amd_stats.get("distributions_with_bos_confluence", 0)
+        bars_total = self.amd_stats.get("manip_to_dist_bars_total", 0)
+        bars_count = self.amd_stats.get("manip_to_dist_count", 0)
+
+        amd_conformity = {
+            "consolidations_found": consol_count,
+            "manipulations_found": manip_count,
+            "distributions_found": dist_count,
+            "distributions_with_bos_confluence": dist_conf_count,
+            "consolidation_to_manipulation_pct": round((manip_count / consol_count) * 100, 2) if consol_count > 0 else 0.0,
+            "manipulation_to_distribution_pct": round((dist_count / manip_count) * 100, 2) if manip_count > 0 else 0.0,
+            "distribution_with_bos_confluence_pct": round((dist_conf_count / dist_count) * 100, 2) if dist_count > 0 else 0.0,
+            "avg_bars_manipulation_to_distribution": round((bars_total / bars_count), 2) if bars_count > 0 else 0.0,
+        }
+
         return {
             "backtest_id": self.backtest_id,
             "initial_capital": self.initial_capital,
@@ -1263,6 +1496,7 @@ class BacktestEngine:
             "funnel_stats": self.rejection_stats,
             "confluence_stats": self.confluence_stats,
             "cost_stats": self.cost_stats,
+            "amd_conformity": amd_conformity,
         }
 
     def save_trades_to_db(self, db: Database):

@@ -25,7 +25,10 @@ class ManipulationResult:
     swept_liquidity: bool = False  # Whether manipulation swept prior swing
     swept_level: float = 0.0       # The swing level that was swept
     swept_swing_idx: int = 0       # Index of the swept swing point
-    
+    # Volume spike during manipulation (stop hunt creates volume)
+    volume_confirmed: bool = False
+    volume_ratio: float = 0.0      # Max vol during manip / baseline
+
     @property
     def is_bullish_setup(self) -> bool:
         """Fakeout DOWN = bullish setup (expecting upward distribution)."""
@@ -283,5 +286,56 @@ def confirm_liquidity_sweep(
             manip.swept_liquidity = True
             manip.swept_level = swing.price
             manip.swept_swing_idx = swing.candle_idx
+
+    return manip
+
+
+def confirm_volume_spike(
+    df: pd.DataFrame,
+    manip: ManipulationResult,
+    volume_ma_period: int = None,
+    spike_ratio: float = None,
+) -> ManipulationResult:
+    """
+    Confirm manipulation had elevated volume (stop triggers create volume).
+
+    Args:
+        df: DataFrame with OHLC and tick_volume data
+        manip: ManipulationResult to validate
+        volume_ma_period: Period for volume MA baseline (default from config)
+        spike_ratio: Min ratio of manipulation vol to baseline (default from config)
+
+    Returns:
+        Updated ManipulationResult with volume_confirmed and volume_ratio set
+    """
+    if not manip.valid:
+        return manip
+
+    if "tick_volume" not in df.columns:
+        return manip
+
+    volume_ma_period = volume_ma_period or 20
+    spike_ratio = spike_ratio or STRATEGY.get("manipulation_volume_spike_ratio", 1.5)
+    return_candles = STRATEGY.get("manipulation_return_candles", 12)
+
+    manip_start = max(0, manip.return_candle_idx - return_candles)
+    manip_end = min(manip.return_candle_idx + 1, len(df))
+
+    if manip_end <= manip_start or manip_end > len(df):
+        return manip
+
+    vol_ma = df["tick_volume"].rolling(volume_ma_period).mean()
+    manip_vol = df["tick_volume"].iloc[manip_start:manip_end].max()
+
+    baseline_idx = manip_start - 1
+    if baseline_idx < volume_ma_period:
+        return manip
+    baseline_vol = vol_ma.iloc[baseline_idx]
+    if pd.isna(baseline_vol) or baseline_vol <= 0:
+        return manip
+
+    if manip_vol >= baseline_vol * spike_ratio:
+        manip.volume_confirmed = True
+        manip.volume_ratio = float(manip_vol / baseline_vol)
 
     return manip

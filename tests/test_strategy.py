@@ -38,6 +38,8 @@ from src.strategy.market_structure import (
 from src.strategy.time_filters import TimeFilterEngine
 from src.strategy.news_filter import NewsFilterEngine
 from src.backtest.execution import ExecutionEngine, CostBreakdown
+from src.backtest.engine import BacktestEngine
+from src.strategy.distribution import DistributionResult
 
 
 def create_sample_candles(
@@ -376,6 +378,40 @@ class TestExecutionCosts:
         # 0.5 lot * $7/lot = $3.50
         assert commission == 3.5
 
+    def test_execution_costs_scale_with_position_size(self):
+        """Test that execution costs scale with position size."""
+        engine = ExecutionEngine(spread_points=30.0, slippage_model="NONE", commission_per_lot=7.0)
+
+        entry = EntrySignal(
+            valid=True,
+            direction="LONG",
+            entry_price=2000.0,
+            desired_entry_price=1999.0,
+        )
+        candle = pd.Series({
+            "open": 2001.0,
+            "high": 2002.0,
+            "low": 1998.0,
+            "close": 2000.5,
+        })
+
+        fill_small = engine.simulate_entry_fill(entry, candle, atr=5.0, position_size=0.1)
+        fill_large = engine.simulate_entry_fill(entry, candle, atr=5.0, position_size=1.0)
+
+        assert fill_small.filled and fill_large.filled
+        assert round(fill_large.costs.total_cost, 2) == round(fill_small.costs.total_cost * 10, 2)
+
+    def test_execution_engine_uses_config_keys(self, monkeypatch):
+        """Test that execution engine honors config keys."""
+        from config import EXECUTION
+
+        monkeypatch.setitem(EXECUTION, "entry_fill_model", "CLOSE")
+        monkeypatch.setitem(EXECUTION, "intrabar_fill_rule", "BEST_CASE")
+
+        engine = ExecutionEngine()
+        assert engine.fill_model == "CLOSE"
+        assert engine.intrabar_assumption == "BEST_CASE"
+
     def test_intrabar_worst_case_long_sl_first(self):
         """Test worst-case intrabar assumption - SL hit before TP for long."""
         engine = ExecutionEngine(intrabar_assumption="WORST_CASE")
@@ -436,12 +472,12 @@ class TestSessionFilter:
         """Test that killzone correctly identifies valid times."""
         engine = TimeFilterEngine(enabled=True)
 
-        # 14:00 UTC should be in killzone (12:00-16:00)
-        ts_in_killzone = datetime(2024, 1, 15, 14, 0, 0, tzinfo=pytz.UTC)
+        # 09:00 UTC should be in killzone (07:00-17:00)
+        ts_in_killzone = datetime(2024, 1, 15, 9, 0, 0, tzinfo=pytz.UTC)
         assert engine.is_in_kill_zone(ts_in_killzone)
 
-        # 08:00 UTC should be outside killzone
-        ts_outside = datetime(2024, 1, 15, 8, 0, 0, tzinfo=pytz.UTC)
+        # 18:00 UTC should be outside killzone
+        ts_outside = datetime(2024, 1, 15, 18, 0, 0, tzinfo=pytz.UTC)
         assert not engine.is_in_kill_zone(ts_outside)
 
     def test_asian_session_detection(self):
@@ -465,8 +501,8 @@ class TestSessionFilter:
         ts = datetime(2024, 1, 15, 14, 0, 0, tzinfo=pytz.UTC)
 
         # Record trades directly to test limit
-        engine.record_trade(ts)
-        engine.record_trade(ts)
+        for _ in range(engine.max_trades_per_day):
+            engine.record_trade(ts)
 
         # Check limit is reached
         assert engine.has_reached_daily_limit(ts)
@@ -838,10 +874,11 @@ class TestIntegration:
     def test_full_pipeline_structure(self):
         """Test that all components can be imported and initialized."""
         from src.backtest.engine import BacktestEngine
+        from config import BACKTEST
 
         engine = BacktestEngine()
         assert engine is not None
-        assert engine.initial_capital == 10000.0
+        assert engine.initial_capital == BACKTEST["initial_capital"]
 
     def test_sample_backtest(self):
         """Test running backtest on sample data."""
@@ -950,6 +987,57 @@ class TestIntegration:
         assert funnel.get("filtered_session", 0) == 0
         assert funnel.get("filtered_news", 0) == 0
         assert funnel.get("filtered_htf_bias", 0) == 0
+
+
+class TestDistributionFollowThrough:
+    """Tests for distribution follow-through enforcement."""
+
+    def test_distribution_follow_through_rejection(self, monkeypatch):
+        """Ensure weak distribution is rejected when follow-through validation fails."""
+        from config import SESSION_FILTER, STRATEGY
+
+        # Disable session timing requirements for this test
+        monkeypatch.setitem(SESSION_FILTER, "require_consolidation_in_asian", False)
+        monkeypatch.setitem(SESSION_FILTER, "require_distribution_in_london_ny", False)
+        monkeypatch.setitem(STRATEGY, "require_liquidity_sweep", False)
+
+        df = create_sample_candles(200, volatility=2.0)
+        df["atr"] = 1.0
+
+        engine = BacktestEngine(
+            enable_session_filter=False,
+            enable_news_filter=False,
+            enable_htf_bias=False,
+            enable_key_levels=False,
+            enable_volume_filter=False,
+            enable_fundamentals=False,
+        )
+
+        # Force consolidation/manipulation/distribution to appear valid
+        monkeypatch.setattr(engine, "_is_consolidation_arrays", lambda *args, **kwargs: True)
+        monkeypatch.setattr(
+            engine,
+            "_check_manipulation_after",
+            lambda *args, **kwargs: ManipulationResult(
+                valid=True, direction="DOWN", extreme_price=1980.0, return_candle_idx=150, atr=1.0
+            ),
+        )
+        monkeypatch.setattr(
+            engine,
+            "_check_distribution_after",
+            lambda *args, **kwargs: DistributionResult(
+                valid=True, direction="UP", break_price=2000.0, break_distance=1.0,
+                body_expansion=2.0, break_candle_idx=160, atr=1.0
+            ),
+        )
+        monkeypatch.setattr(
+            "src.backtest.engine.validate_distribution_strength",
+            lambda *args, **kwargs: False
+        )
+
+        engine._scan_for_patterns(df, current_idx=len(df) - 1, verbose=False)
+
+        assert engine.rejection_stats["no_distribution_follow_through"] > 0
 
 
 if __name__ == "__main__":

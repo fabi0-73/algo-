@@ -520,6 +520,95 @@ def detect_breaker_block(
     return None
 
 
+def find_breakers_in_range(
+    df: pd.DataFrame,
+    start_idx: int,
+    end_idx: int,
+    direction: str,
+    current_idx: int,
+    atr: float = None,
+    tolerance_mult: float = 0.5,
+) -> List["BreakerBlock"]:
+    """
+    Find Breaker Blocks in a range that are valid at current_idx.
+
+    For LONG we need BULLISH breakers (bearish OB broken up).
+    For SHORT we need BEARISH breakers (bullish OB broken down).
+
+    Args:
+        df: DataFrame with OHLC data
+        start_idx: Start of search range
+        end_idx: End of search range
+        direction: Expected move direction ("BULLISH" or "BEARISH")
+        current_idx: Current candle index (breakers must be formed by this point)
+        atr: ATR for OB detection
+        tolerance_mult: Unused, for API consistency
+
+    Returns:
+        List of BreakerBlock objects
+    """
+    # Breaker direction matches entry direction: LONG -> BULLISH breaker, SHORT -> BEARISH breaker
+    # BULLISH breaker = bearish OB broken up; BEARISH breaker = bullish OB broken down
+    ob_direction = "BEARISH" if direction == "BULLISH" else "BULLISH"
+    obs = find_order_blocks_in_range(
+        df=df,
+        start_idx=start_idx,
+        end_idx=end_idx,
+        direction=ob_direction,
+        atr=atr,
+    )
+    breakers = []
+    for ob in obs:
+        bb = detect_breaker_block(df, ob, current_idx)
+        if bb is not None and bb.valid and bb.direction == direction:
+            breakers.append(bb)
+    return breakers
+
+
+def find_breaker_at_retest_level(
+    df: pd.DataFrame,
+    retest_level: float,
+    search_start_idx: int,
+    search_end_idx: int,
+    current_idx: int,
+    direction: str,
+    atr: float,
+    tolerance_mult: float = 0.5,
+) -> Optional["BreakerBlock"]:
+    """
+    Find a Breaker Block near the retest level for entry confluence.
+
+    Args:
+        df: DataFrame with OHLC data
+        retest_level: The price level being retested
+        search_start_idx: Start of search range
+        search_end_idx: End of search range
+        current_idx: Current candle index
+        direction: "BULLISH" or "BEARISH"
+        atr: ATR value
+        tolerance_mult: How close breaker must be to retest level (ATR multiple)
+
+    Returns:
+        BreakerBlock if found near retest level, None otherwise
+    """
+    breakers = find_breakers_in_range(
+        df=df,
+        start_idx=search_start_idx,
+        end_idx=search_end_idx,
+        direction=direction,
+        current_idx=current_idx,
+        atr=atr,
+        tolerance_mult=tolerance_mult,
+    )
+    if not breakers:
+        return None
+    tolerance = tolerance_mult * atr
+    for bb in breakers:
+        if bb.bottom - tolerance <= retest_level <= bb.top + tolerance:
+            return bb
+    return None
+
+
 def is_price_at_breaker(
     candle: pd.Series,
     breaker: BreakerBlock,

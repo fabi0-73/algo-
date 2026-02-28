@@ -12,6 +12,30 @@ import numpy as np
 from config import EXECUTION, RISK_MODEL
 
 
+def _get_exec_setting(key: str, aliases: list = None, default=None):
+    """Fetch execution config value with backward-compatible aliases."""
+    if key in EXECUTION and EXECUTION[key] is not None:
+        return EXECUTION[key]
+    if aliases:
+        for alias in aliases:
+            if alias in EXECUTION and EXECUTION[alias] is not None:
+                return EXECUTION[alias]
+    return default
+
+
+def _get_preset_setting(preset: dict, key: str, aliases: list = None):
+    """Fetch value from account preset with aliases."""
+    if not preset:
+        return None
+    if key in preset and preset[key] is not None:
+        return preset[key]
+    if aliases:
+        for alias in aliases:
+            if alias in preset and preset[alias] is not None:
+                return preset[alias]
+    return None
+
+
 class IntrabarRule(Enum):
     """How to handle when both SL and TP are touched in same candle."""
     WORST_CASE = "WORST_CASE"
@@ -96,31 +120,66 @@ class ExecutionEngine:
             contract_size: Contract size (oz per lot for XAU)
             random_seed: Seed for random decisions
         """
-        self.fill_model = fill_model or EXECUTION.get("fill_model", "LIMIT_AT_RETEST")
-        self.intrabar_assumption = intrabar_assumption or EXECUTION.get("intrabar_assumption", "WORST_CASE")
-        self.spread_points = spread_points if spread_points is not None else EXECUTION.get("spread_points", 30.0)
-        self.slippage_model = slippage_model or EXECUTION.get("slippage_model", "ATR_MULT")
-        self.slippage_atr_mult = slippage_atr_mult if slippage_atr_mult is not None else EXECUTION.get("slippage_atr_mult", 0.1)
-        self.commission_per_lot = commission_per_lot if commission_per_lot is not None else EXECUTION.get("commission_per_lot", 7.0)
+        account_type = (EXECUTION.get("account_type") or "").upper()
+        presets = EXECUTION.get("account_presets", {})
+        preset = presets.get(account_type, {})
+
+        self.fill_model = fill_model or _get_exec_setting(
+            "entry_fill_model", aliases=["fill_model"], default="LIMIT_AT_RETEST"
+        )
+        self.intrabar_assumption = intrabar_assumption or _get_exec_setting(
+            "intrabar_fill_rule", aliases=["intrabar_assumption"], default="WORST_CASE"
+        )
+        self.spread_model = _get_exec_setting("spread_model", default="FIXED")
+
+        if spread_points is None:
+            spread_points = _get_preset_setting(
+                preset, "fixed_spread_points", aliases=["spread_points"]
+            )
+        if spread_points is None:
+            spread_points = _get_exec_setting(
+                "fixed_spread_points", aliases=["spread_points"], default=30.0
+            )
+        self.spread_points = spread_points
+
+        self.slippage_model = (slippage_model or _get_exec_setting(
+            "slippage_model", default="ATR_MULT"
+        ) or "NONE").upper()
+        self.slippage_atr_mult = slippage_atr_mult if slippage_atr_mult is not None else _get_exec_setting(
+            "slippage_atr_mult", default=0.1
+        )
+        self.slippage_points = _get_exec_setting("slippage_points", default=0.0)
+
+        if commission_per_lot is None:
+            commission_per_lot = _get_preset_setting(
+                preset, "commission_per_lot_round_turn", aliases=["commission_per_lot"]
+            )
+        if commission_per_lot is None:
+            commission_per_lot = _get_exec_setting(
+                "commission_per_lot_round_turn", aliases=["commission_per_lot"], default=7.0
+            )
+        self.commission_per_lot = commission_per_lot
         self.contract_size = contract_size if contract_size is not None else RISK_MODEL.get("contract_size", 100)
 
         seed = random_seed if random_seed is not None else EXECUTION.get("random_seed", 42)
         self.rng = random.Random(seed)
 
-    def _calculate_spread_cost(self, position_size: float) -> float:
+    def _calculate_spread_cost(self, position_size: float, spread_points: float = None) -> float:
         """Calculate spread cost in USD."""
         # spread_points in price points, 1 point = $0.01 for XAUUSD
         # Cost = spread_points * 0.01 * contract_size * lots
-        spread_usd_per_oz = self.spread_points * 0.01
+        spread_points = self.spread_points if spread_points is None else spread_points
+        spread_usd_per_oz = spread_points * 0.01
         return spread_usd_per_oz * self.contract_size * position_size
 
     def _calculate_slippage(self, atr: float) -> float:
         """Calculate slippage in price points."""
-        if self.slippage_model == "NONE":
+        model = (self.slippage_model or "NONE").upper()
+        if model == "NONE":
             return 0.0
-        elif self.slippage_model == "FIXED":
-            return EXECUTION.get("slippage_points", 5.0)
-        elif self.slippage_model == "ATR_MULT":
+        elif model in ("FIXED", "FIXED_POINTS"):
+            return self.slippage_points
+        elif model == "ATR_MULT":
             return atr * self.slippage_atr_mult
         return 0.0
 
@@ -138,6 +197,7 @@ class ExecutionEngine:
         entry,  # EntrySignal object
         candle: pd.Series,
         atr: float,
+        position_size: float = None,
     ) -> FillResult:
         """
         Simulate entry fill based on fill model.
@@ -150,9 +210,16 @@ class ExecutionEngine:
         Returns:
             FillResult with fill status and costs
         """
-        position_size = 0.1  # Default, will be overridden by risk calc
+        position_size = 0.1 if position_size is None else position_size
 
-        if self.fill_model == "CLOSE":
+        entry_type = (getattr(entry, "desired_entry_type", "") or "").upper()
+
+        if entry_type == "MARKET":
+            # Explicit market entry override (e.g., enter on retest candle close)
+            fill_price = candle["close"]
+            filled = True
+            fill_reason = "Market fill at close"
+        elif self.fill_model == "CLOSE":
             # Always fill at candle close (legacy mode)
             fill_price = candle["close"]
             filled = True
@@ -185,7 +252,11 @@ class ExecutionEngine:
             )
 
         # Calculate costs
-        spread_cost = self._calculate_spread_cost(position_size)
+        if (self.spread_model or "").upper() == "COLUMN" and "spread" in candle:
+            spread_points = float(candle["spread"])
+        else:
+            spread_points = self.spread_points
+        spread_cost = self._calculate_spread_cost(position_size, spread_points=spread_points)
         slippage_cost = self._calculate_slippage_cost(position_size, atr)
         commission_cost = self._calculate_commission(position_size)
 

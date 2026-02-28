@@ -1,6 +1,7 @@
 """
 Data Fetching Script
 Downloads historical candle data from MT5 and stores in PostgreSQL.
+Uses chunked requests to avoid broker bar limits (e.g. 2 years of M5).
 """
 import sys
 import os
@@ -9,6 +10,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import argparse
 from datetime import datetime, timedelta
 import logging
+
+import pandas as pd
 
 from src.data.mt5_client import MT5Client
 from src.data.db import Database
@@ -20,6 +23,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Chunk size in months to stay under typical MT5 bar limits per request
+CHUNK_MONTHS = 6
+
 
 def fetch_and_store(
     symbol: str = None,
@@ -30,6 +36,7 @@ def fetch_and_store(
 ):
     """
     Fetch historical data from MT5 and store in database.
+    Requests data in chunks to avoid "Invalid params" on large ranges.
     
     Args:
         symbol: Trading symbol (default from config)
@@ -47,7 +54,7 @@ def fetch_and_store(
     if start_date is None:
         start_date = end_date - timedelta(days=months * 30)
     
-    logger.info(f"Fetching {symbol} {timeframe} from {start_date} to {end_date}")
+    logger.info(f"Fetching {symbol} {timeframe} from {start_date} to {end_date} ({months} months)")
     
     # Initialize database
     db = Database()
@@ -58,27 +65,41 @@ def fetch_and_store(
     if existing_range[0] is not None:
         logger.info(f"Existing data: {existing_range[0]} to {existing_range[1]}")
     
-    # Fetch from MT5
+    # Fetch from MT5 in chunks
+    chunks = []
+    current_start = start_date
     with MT5Client() as client:
-        # Get symbol info
         info = client.get_symbol_info(symbol)
         if info:
             logger.info(f"Symbol info: spread={info['spread']}, digits={info['digits']}")
-        
-        # Fetch candles
-        df = client.get_candles(
-            symbol=symbol,
-            timeframe=timeframe,
-            start_date=start_date,
-            end_date=end_date,
-        )
-        
-        if df is None or df.empty:
-            logger.error("No data fetched")
-            return
-        
-        logger.info(f"Fetched {len(df)} candles from MT5")
-        logger.info(f"Date range: {df['timestamp'].min()} to {df['timestamp'].max()}")
+        while current_start < end_date:
+            chunk_end = min(
+                current_start + timedelta(days=CHUNK_MONTHS * 30),
+                end_date,
+            )
+            logger.info(f"Chunk: {current_start.date()} to {chunk_end.date()}")
+            df_chunk = client.get_candles(
+                symbol=symbol,
+                timeframe=timeframe,
+                start_date=current_start,
+                end_date=chunk_end,
+            )
+            if df_chunk is not None and not df_chunk.empty:
+                chunks.append(df_chunk)
+                logger.info(f"  Fetched {len(df_chunk)} candles")
+            else:
+                logger.warning(f"  No data for this chunk")
+            current_start = chunk_end
+            if current_start >= end_date:
+                break
+    
+    if not chunks:
+        logger.error("No data fetched")
+        return
+    
+    df = pd.concat(chunks, ignore_index=True)
+    df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    logger.info(f"Fetched {len(df)} candles from MT5 (date range: {df['timestamp'].min()} to {df['timestamp'].max()})")
     
     # Store in database
     rows = db.insert_candles(df)

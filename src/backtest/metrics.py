@@ -515,8 +515,10 @@ def generate_funnel_report(funnel_stats: Dict[str, int]) -> str:
         "-" * 40,
         f"  -> No Manipulation:    {funnel_stats.get('no_manipulation', 0)}",
         f"  -> No Distribution:    {funnel_stats.get('no_distribution', 0)}",
+        f"  -> Weak Distribution:  {funnel_stats.get('no_distribution_follow_through', 0)}",
         f"  -> No BOS:             {funnel_stats.get('no_bos', 0)}",
         f"  -> No Entry/Retest:    {funnel_stats.get('no_entry_retest', 0)}",
+        f"  -> Entry Too Late:     {funnel_stats.get('entry_too_late', 0)}",
         f"  -> Short Filtered:     {funnel_stats.get('short_filtered', 0)}",
         f"  -> Risk Invalid:       {funnel_stats.get('risk_invalid', 0)}",
         f"  -> Pattern Duplicates: {funnel_stats.get('pattern_duplicates', 0)}",
@@ -535,6 +537,32 @@ def generate_funnel_report(funnel_stats: Dict[str, int]) -> str:
         f"  -> Fill Not Triggered: {funnel_stats.get('fill_not_triggered', 0)}",
         "",
         f"ENTRIES EXECUTED:        {funnel_stats.get('entries_executed', 0)}",
+        "=" * 60,
+    ]
+
+    return "\n".join(lines)
+
+
+def generate_amd_conformity_report(amd_conformity: Dict[str, float]) -> str:
+    """Generate a report of AMD pattern conformity statistics."""
+    if not amd_conformity:
+        return ""
+
+    lines = [
+        "",
+        "=" * 60,
+        "AMD CONFORMITY",
+        "=" * 60,
+        "",
+        f"Consolidations Found:              {amd_conformity.get('consolidations_found', 0)}",
+        f"Manipulations Found:               {amd_conformity.get('manipulations_found', 0)}",
+        f"Distributions Found:               {amd_conformity.get('distributions_found', 0)}",
+        f"Distributions w/ BOS+Confluence:   {amd_conformity.get('distributions_with_bos_confluence', 0)}",
+        "",
+        f"Consolidation -> Manipulation:     {amd_conformity.get('consolidation_to_manipulation_pct', 0.0):.2f}%",
+        f"Manipulation -> Distribution:      {amd_conformity.get('manipulation_to_distribution_pct', 0.0):.2f}%",
+        f"Distribution w/ BOS+Confluence:    {amd_conformity.get('distribution_with_bos_confluence_pct', 0.0):.2f}%",
+        f"Avg Bars Manipulation->Distribution: {amd_conformity.get('avg_bars_manipulation_to_distribution', 0.0):.2f}",
         "=" * 60,
     ]
 

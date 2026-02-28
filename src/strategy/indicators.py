@@ -186,7 +186,10 @@ def is_rejection_candle(
         return upper_wick >= body * wick_ratio
 
 
-def add_indicators(df: pd.DataFrame, atr_period: int = 14) -> pd.DataFrame:
+def add_indicators(
+    df: pd.DataFrame,
+    atr_period: int = 14,
+) -> pd.DataFrame:
     """
     Add all indicators to a DataFrame.
     
@@ -204,5 +207,5 @@ def add_indicators(df: pd.DataFrame, atr_period: int = 14) -> pd.DataFrame:
     df["upper_wick"] = df.apply(calculate_upper_wick, axis=1)
     df["lower_wick"] = df.apply(calculate_lower_wick, axis=1)
     df["is_bullish"] = df["close"] > df["open"]
-    
+
     return df

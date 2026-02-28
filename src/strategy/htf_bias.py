@@ -261,7 +261,6 @@ class HTFBiasEngine:
             return True, HTFBiasResult(), ""
 
         bias = self.get_bias_at_index(df, idx)
-
         # Determine required bias for direction
         if direction == "LONG":
             required_bias = Bias.BULL

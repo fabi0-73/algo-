@@ -153,7 +153,7 @@ All parameters are configurable in `config.py`:
 |-----------|---------|-------------|
 | `fill_model` | LIMIT_AT_RETEST | Entry fill simulation |
 | `intrabar_assumption` | WORST_CASE | SL/TP ambiguity handling |
-| `spread_points` | 30 | Bid/ask spread (3 pips) |
+| `spread_points` | 7 | Bid/ask spread (IC Markets RAW avg) |
 | `slippage_model` | ATR_MULT | Slippage calculation |
 | `commission_per_lot` | 7.0 | Round-trip commission |
 
@@ -161,9 +161,9 @@ All parameters are configurable in `config.py`:
 
 | Filter | Default | Description |
 |--------|---------|-------------|
-| Kill Zone | 12:00-16:00 UTC | London/NY overlap only |
-| Asian Avoidance | 23:00-08:00 UTC | No entries during Asian |
-| Max Trades/Day | 2 | Daily trade limit |
+| Kill Zone | 07:00-10:00 & 13:00-16:00 UTC | London open + NY overlap only |
+| Asian Avoidance | 23:00-08:00 UTC | Entries gated by KZ; avoid Asian |
+| Max Trades/Day | 5 | Daily trade limit |
 | News Blackout | T-5 to T+15 min | Avoid high-impact USD news |
 | Rollover | 21:00 UTC | Close positions before rollover |
 

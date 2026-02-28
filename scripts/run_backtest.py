@@ -10,10 +10,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import argparse
 from datetime import datetime, timedelta
 import logging
-
 from src.data.db import Database
 from src.backtest.engine import BacktestEngine
-from src.backtest.metrics import calculate_metrics, generate_report, generate_funnel_report
+from src.backtest.metrics import (
+    calculate_metrics,
+    generate_report,
+    generate_funnel_report,
+)
 from src.visualization.charts import generate_report as generate_visual_report
 from config import STRATEGY, BACKTEST, VALIDATION, EXECUTION
 
@@ -46,6 +49,9 @@ def run_backtest(
     enable_key_levels: bool = None,
     enable_volume_filter: bool = None,
     enable_fundamentals: bool = None,
+    split_ratio: float = None,
+    train_only: bool = False,
+    test_only: bool = False,
 ):
     """
     Run backtest on historical data from database.
@@ -70,6 +76,9 @@ def run_backtest(
         enable_key_levels: Enable key level scoring
         enable_volume_filter: Enable volume confirmation
         enable_fundamentals: Enable fundamentals filter (DXY/yields)
+        split_ratio: Train/test split ratio (time-based)
+        train_only: Run only the training split
+        test_only: Run only the test split
     """
     symbol = symbol or STRATEGY["symbol"]
     timeframe = timeframe or STRATEGY["timeframe"]
@@ -97,10 +106,25 @@ def run_backtest(
         logger.warning(f"Less than {VALIDATION['min_months']} months of data. Results may not be reliable.")
 
     # Log execution settings
+    account_type = (EXECUTION.get("account_type") or "").upper()
+    preset = EXECUTION.get("account_presets", {}).get(account_type, {})
+    effective_spread = spread_points
+    if effective_spread is None:
+        effective_spread = preset.get("fixed_spread_points")
+    if effective_spread is None:
+        effective_spread = EXECUTION.get("fixed_spread_points", 0.25)
+    effective_commission = commission_per_lot
+    if effective_commission is None:
+        effective_commission = preset.get("commission_per_lot_round_turn")
+    if effective_commission is None:
+        effective_commission = EXECUTION.get("commission_per_lot_round_turn", 7.0)
     logger.info("Execution settings:")
     logger.info(f"  Fill model: {fill_model or EXECUTION.get('entry_fill_model', 'LIMIT_AT_RETEST')}")
     logger.info(f"  Intrabar: {intrabar_assumption or EXECUTION.get('intrabar_fill_rule', 'WORST_CASE')}")
-    logger.info(f"  Spread: {spread_points or EXECUTION.get('fixed_spread_points', 0.25)} pts")
+    if account_type:
+        logger.info(f"  Account: {account_type}")
+    logger.info(f"  Spread: {effective_spread} pts")
+    logger.info(f"  Commission: {effective_commission} per lot RT")
 
     # Log filter settings
     logger.info("Filter settings:")
@@ -111,57 +135,111 @@ def run_backtest(
     logger.info(f"  Volume filter: {enable_volume_filter if enable_volume_filter is not None else True}")
     logger.info(f"  Fundamentals: {enable_fundamentals if enable_fundamentals is not None else False}")
 
-    # Run backtest with new options
-    engine = BacktestEngine(
-        initial_capital=initial_capital,
-        max_trade_duration=200,
-        # Execution model
-        fill_model=fill_model,
-        intrabar_assumption=intrabar_assumption,
-        spread_points=spread_points,
-        slippage_model=slippage_model,
-        commission_per_lot=commission_per_lot,
-        # Filters
-        enable_session_filter=enable_session_filter,
-        enable_news_filter=enable_news_filter,
-        enable_htf_bias=enable_htf_bias,
-        enable_key_levels=enable_key_levels,
-        enable_volume_filter=enable_volume_filter,
-        enable_fundamentals=enable_fundamentals,
-    )
-    results = engine.run(df, verbose=verbose)
+    def _run_single(df_slice):
+        engine = BacktestEngine(
+            initial_capital=initial_capital,
+            max_trade_duration=200,
+            # Execution model
+            fill_model=fill_model,
+            intrabar_assumption=intrabar_assumption,
+            spread_points=spread_points,
+            slippage_model=slippage_model,
+            commission_per_lot=commission_per_lot,
+            # Filters
+            enable_session_filter=enable_session_filter,
+            enable_news_filter=enable_news_filter,
+            enable_htf_bias=enable_htf_bias,
+            enable_key_levels=enable_key_levels,
+            enable_volume_filter=enable_volume_filter,
+            enable_fundamentals=enable_fundamentals,
+        )
+        return engine, engine.run(df_slice, verbose=verbose)
 
+    def _print_summary(res, label):
+        if res is None:
+            return
+        if "error" in res:
+            logger.error(f"{label} backtest failed: {res['error']}")
+            # Still show funnel stats to help diagnose 0-trade runs
+            funnel = res.get("funnel_stats")
+            if funnel:
+                print("\n" + "=" * 60)
+                print(f"SIGNAL FUNNEL ({label.upper()})")
+                print("=" * 60)
+                print(f"  Consolidations found:    {funnel.get('consolidations_found', 0)}")
+                print(f"  -> No manipulation:      {funnel.get('no_manipulation', 0)}")
+                print(f"  -> No distribution:      {funnel.get('no_distribution', 0)}")
+                print(f"  -> Weak distribution:    {funnel.get('no_distribution_follow_through', 0)}")
+                print(f"  -> No BOS:               {funnel.get('no_bos', 0)}")
+                print(f"  -> No entry/retest:      {funnel.get('no_entry_retest', 0)}")
+                print(f"  -> Entry too late:       {funnel.get('entry_too_late', 0)}")
+                print("\n  FILTER REJECTIONS:")
+                print(f"  -> Session/Killzone:     {funnel.get('filtered_session', 0)}")
+                print(f"  -> News blackout:        {funnel.get('filtered_news', 0)}")
+                print(f"  -> HTF bias:             {funnel.get('filtered_htf_bias', 0)}")
+                print(f"  -> Key levels:           {funnel.get('filtered_key_levels', 0)}")
+                print(f"  -> Volume:               {funnel.get('filtered_volume', 0)}")
+                print(f"  -> Fundamentals:         {funnel.get('filtered_fundamentals', 0)}")
+                print(f"  -> Fill not triggered:   {funnel.get('fill_not_triggered', 0)}")
+                print("=" * 60)
+            return
+            return
+
+        print("\n" + "=" * 60)
+        print(f"BACKTEST RESULTS ({label.upper()})")
+        print("=" * 60)
+        print(f"Backtest ID:      {res['backtest_id']}")
+        print(f"Total Trades:     {res['total_trades']}")
+        print(f"Win Rate:         {res['win_rate']:.1f}%")
+        print(f"Expectancy:       {res['expectancy_r']:.3f}R")
+        print(f"Profit Factor:    {res['profit_factor']:.2f}")
+        print(f"Max Drawdown:     {res['max_drawdown_pct']:.1f}%")
+        print("=" * 60)
+
+        print("\nP&L BREAKDOWN:")
+        print(f"  Gross P&L:      ${res.get('gross_pnl_usd', 0):,.2f}")
+        print(f"  Net P&L:        ${res.get('net_pnl_usd', 0):,.2f}")
+        print(f"  Final Capital:  ${res['final_capital']:,.2f}")
+
+        cost_stats = res.get("cost_stats", {})
+        if cost_stats:
+            print("\nEXECUTION COSTS:")
+            print(f"  Spread:         ${cost_stats.get('total_spread_cost', 0):,.2f}")
+            print(f"  Slippage:       ${cost_stats.get('total_slippage_cost', 0):,.2f}")
+            print(f"  Commission:     ${cost_stats.get('total_commission_cost', 0):,.2f}")
+            print(f"  Total Costs:    ${cost_stats.get('total_costs', 0):,.2f}")
+        print("=" * 60)
+
+    results = None
+    results_train = None
+    results_test = None
+    engine_full = None
+    engine_train = None
+    engine_test = None
+
+    if split_ratio is not None:
+        df = df.sort_values("timestamp").reset_index(drop=True)
+        split_idx = int(len(df) * split_ratio)
+        train_df = df.iloc[:split_idx].copy()
+        test_df = df.iloc[split_idx:].copy()
+        logger.info(f"Split ratio: {split_ratio:.2f} (train {len(train_df)} / test {len(test_df)} candles)")
+
+        if not test_only:
+            engine_train, results_train = _run_single(train_df)
+            _print_summary(results_train, "train")
+        if not train_only:
+            engine_test, results_test = _run_single(test_df)
+            _print_summary(results_test, "test")
+
+        results = results_test or results_train
+    else:
+        engine_full, results = _run_single(df)
+        _print_summary(results, "full")
+
+    if results is None:
+        return None
     if "error" in results:
-        logger.error(f"Backtest failed: {results['error']}")
         return results
-
-    # Print summary
-    print("\n" + "=" * 60)
-    print("BACKTEST RESULTS")
-    print("=" * 60)
-    print(f"Backtest ID:      {results['backtest_id']}")
-    print(f"Total Trades:     {results['total_trades']}")
-    print(f"Win Rate:         {results['win_rate']:.1f}%")
-    print(f"Expectancy:       {results['expectancy_r']:.3f}R")
-    print(f"Profit Factor:    {results['profit_factor']:.2f}")
-    print(f"Max Drawdown:     {results['max_drawdown_pct']:.1f}%")
-    print("=" * 60)
-
-    # P&L breakdown with costs
-    print("\nP&L BREAKDOWN:")
-    print(f"  Gross P&L:      ${results.get('gross_pnl_usd', 0):,.2f}")
-    print(f"  Net P&L:        ${results.get('net_pnl_usd', 0):,.2f}")
-    print(f"  Final Capital:  ${results['final_capital']:,.2f}")
-
-    # Cost breakdown
-    cost_stats = results.get("cost_stats", {})
-    if cost_stats:
-        print("\nEXECUTION COSTS:")
-        print(f"  Spread:         ${cost_stats.get('total_spread_cost', 0):,.2f}")
-        print(f"  Slippage:       ${cost_stats.get('total_slippage_cost', 0):,.2f}")
-        print(f"  Commission:     ${cost_stats.get('total_commission_cost', 0):,.2f}")
-        print(f"  Total Costs:    ${cost_stats.get('total_costs', 0):,.2f}")
-    print("=" * 60)
 
     # Exit reason breakdown
     print("\nEXIT REASONS:")
@@ -189,8 +267,10 @@ def run_backtest(
         print(f"  Consolidations found:    {funnel.get('consolidations_found', 0)}")
         print(f"  -> No manipulation:      {funnel.get('no_manipulation', 0)}")
         print(f"  -> No distribution:      {funnel.get('no_distribution', 0)}")
+        print(f"  -> Weak distribution:    {funnel.get('no_distribution_follow_through', 0)}")
         print(f"  -> No BOS:               {funnel.get('no_bos', 0)}")
         print(f"  -> No entry/retest:      {funnel.get('no_entry_retest', 0)}")
+        print(f"  -> Entry too late:       {funnel.get('entry_too_late', 0)}")
         print(f"  -> Short filtered:       {funnel.get('short_filtered', 0)}")
         print(f"  -> Risk invalid:         {funnel.get('risk_invalid', 0)}")
         print(f"  -> Pattern duplicates:   {funnel.get('pattern_duplicates', 0)}")
@@ -218,15 +298,27 @@ def run_backtest(
         print(f"  Entries with BOS:        {conf.get('entries_with_bos', 0)}")
         print("=" * 60)
 
+    run_sets = []
+    if engine_train and results_train:
+        run_sets.append(("train", engine_train, results_train))
+    if engine_test and results_test:
+        run_sets.append(("test", engine_test, results_test))
+    if engine_full and results:
+        run_sets.append(("full", engine_full, results))
+
     # Save trades if requested
-    if save_trades and results["trades"]:
-        engine.save_trades_to_db(db)
-        logger.info("Trades saved to database")
+    if save_trades:
+        for label, eng, res in run_sets:
+            if res.get("trades"):
+                eng.save_trades_to_db(db)
+                logger.info("Trades saved to database (%s)", label)
 
     # Generate charts
-    if generate_charts and results["trades"]:
-        report_dir = generate_visual_report(results, show_charts=False)
-        logger.info(f"Visual report saved to {report_dir}")
+    if generate_charts:
+        for label, _, res in run_sets:
+            if res.get("trades"):
+                report_dir = generate_visual_report(res, show_charts=False)
+                logger.info("Visual report saved to %s (%s)", report_dir, label)
 
     return results
 
@@ -265,6 +357,9 @@ Examples:
     parser.add_argument("--save", action="store_true", help="Save trades to database")
     parser.add_argument("--no-charts", action="store_true", help="Skip chart generation")
     parser.add_argument("--verbose", "-v", action="store_true", help="Log each trade")
+    parser.add_argument("--split", type=float, help="Train/test split ratio (e.g., 0.7)")
+    parser.add_argument("--train-only", action="store_true", help="Run only the training split")
+    parser.add_argument("--test-only", action="store_true", help="Run only the test split")
 
     # Execution model options
     parser.add_argument(
@@ -319,6 +414,9 @@ Examples:
         enable_key_levels=not args.no_keylevel if args.no_keylevel else None,
         enable_volume_filter=not args.no_volume if args.no_volume else None,
         enable_fundamentals=args.enable_fundamentals if args.enable_fundamentals else None,
+        split_ratio=args.split,
+        train_only=args.train_only,
+        test_only=args.test_only,
     )
 
 
