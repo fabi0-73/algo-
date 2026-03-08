@@ -28,6 +28,12 @@ class ManipulationResult:
     # Volume spike during manipulation (stop hunt creates volume)
     volume_confirmed: bool = False
     volume_ratio: float = 0.0      # Max vol during manip / baseline
+    # Judas swing quality fields
+    manipulation_candle_count: int = 0  # Candles from break to return
+    velocity_score: float = 0.0         # Break distance per candle / ATR
+    session_score: float = 0.0          # Higher during London open
+    midnight_price_swept: bool = False  # Swept above/below midnight open
+    judas_quality: int = 0              # Composite quality score (0-3)
 
     @property
     def is_bullish_setup(self) -> bool:
@@ -338,4 +344,169 @@ def confirm_volume_spike(
         manip.volume_confirmed = True
         manip.volume_ratio = float(manip_vol / baseline_vol)
 
+    return manip
+
+
+def get_midnight_open_fast(
+    midnight_opens: dict, timestamps_arr, current_idx: int
+) -> Optional[float]:
+    """O(1) midnight open lookup using pre-computed dict."""
+    ts = pd.Timestamp(timestamps_arr[current_idx])
+    if hasattr(ts, "hour"):
+        target_date = ts.date() if ts.hour >= 5 else (ts - pd.Timedelta(days=1)).date()
+        return midnight_opens.get(target_date)
+    return None
+
+
+def get_midnight_open(df: pd.DataFrame, current_idx: int) -> Optional[float]:
+    """
+    Get the midnight (00:00 EST / 05:00 UTC) open price for the trading day
+    of the candle at current_idx.
+
+    Returns None if no midnight candle is found.
+    """
+    if "timestamp" not in df.columns:
+        return None
+
+    current_ts = df.iloc[current_idx].get("timestamp")
+    if current_ts is None:
+        return None
+
+    if hasattr(current_ts, "hour"):
+        target_hour = 5  # 05:00 UTC = 00:00 EST
+        current_date = current_ts.date() if current_ts.hour >= target_hour else (current_ts - pd.Timedelta(days=1)).date()
+
+        for i in range(current_idx, max(current_idx - 300, -1), -1):
+            ts = df.iloc[i].get("timestamp")
+            if ts is None:
+                continue
+            if ts.date() == current_date and ts.hour == target_hour and ts.minute == 0:
+                return float(df.iloc[i]["open"])
+            if ts.date() < current_date:
+                break
+
+    return None
+
+
+def score_judas_quality(
+    df: pd.DataFrame,
+    manip: ManipulationResult,
+    break_candle_idx: int = -1,
+) -> ManipulationResult:
+    """
+    Score manipulation quality as a Judas Swing.
+
+    Quality factors:
+    1. Candle count: Fast sweeps (1-3 candles) score +1
+    2. Velocity: Break distance per candle >= judas_min_velocity_atr * ATR scores +1
+    3. Session: Manipulation during London open (07:00-10:00 UTC) scores +1
+    4. Midnight sweep: Price swept above/below midnight open scores +1 (bonus)
+
+    Args:
+        df: DataFrame with OHLC and timestamp data
+        manip: ManipulationResult to score
+        break_candle_idx: Index of the first break candle (-1 = estimate)
+
+    Returns:
+        ManipulationResult with judas quality fields populated
+    """
+    if not manip.valid:
+        return manip
+
+    max_quality_candles = STRATEGY.get("judas_max_candles", 5)
+    min_velocity_atr = STRATEGY.get("judas_min_velocity_atr", 0.3)
+    atr = manip.atr if manip.atr > 0 else 1.0
+
+    # Estimate break candle if not provided
+    if break_candle_idx < 0:
+        return_candles = STRATEGY.get("manipulation_return_candles", 12)
+        break_candle_idx = max(0, manip.return_candle_idx - return_candles)
+
+    candle_count = manip.return_candle_idx - break_candle_idx
+    manip.manipulation_candle_count = max(1, candle_count)
+
+    # Velocity: break distance per candle normalised by ATR
+    if manip.manipulation_candle_count > 0 and atr > 0:
+        manip.velocity_score = (manip.break_distance / manip.manipulation_candle_count) / atr
+    else:
+        manip.velocity_score = 0.0
+
+    # Composite quality
+    quality = 0
+
+    if manip.manipulation_candle_count <= max_quality_candles:
+        quality += 1
+
+    if manip.velocity_score >= min_velocity_atr:
+        quality += 1
+
+    # Session scoring: London open (07:00-10:00 UTC)
+    if STRATEGY.get("judas_london_bonus", True) and "timestamp" in df.columns:
+        ts = df.iloc[min(manip.return_candle_idx, len(df) - 1)].get("timestamp")
+        if ts is not None and hasattr(ts, "hour"):
+            if 7 <= ts.hour <= 10:
+                manip.session_score = 1.0
+                quality += 1
+
+    # Midnight price sweep
+    midnight_open = get_midnight_open(df, manip.return_candle_idx)
+    if midnight_open is not None:
+        if manip.direction == "UP" and manip.extreme_price > midnight_open:
+            manip.midnight_price_swept = True
+        elif manip.direction == "DOWN" and manip.extreme_price < midnight_open:
+            manip.midnight_price_swept = True
+
+    manip.judas_quality = quality
+    return manip
+
+
+def score_judas_quality_fast(
+    timestamps_arr,
+    midnight_opens: dict,
+    manip: ManipulationResult,
+    break_candle_idx: int = -1,
+) -> ManipulationResult:
+    """Same scoring logic as score_judas_quality but using pre-extracted arrays."""
+    if not manip.valid:
+        return manip
+
+    max_quality_candles = STRATEGY.get("judas_max_candles", 5)
+    min_velocity_atr = STRATEGY.get("judas_min_velocity_atr", 0.3)
+    atr = manip.atr if manip.atr > 0 else 1.0
+
+    if break_candle_idx < 0:
+        return_candles = STRATEGY.get("manipulation_return_candles", 12)
+        break_candle_idx = max(0, manip.return_candle_idx - return_candles)
+
+    candle_count = manip.return_candle_idx - break_candle_idx
+    manip.manipulation_candle_count = max(1, candle_count)
+
+    if manip.manipulation_candle_count > 0 and atr > 0:
+        manip.velocity_score = (manip.break_distance / manip.manipulation_candle_count) / atr
+    else:
+        manip.velocity_score = 0.0
+
+    quality = 0
+
+    if manip.manipulation_candle_count <= max_quality_candles:
+        quality += 1
+
+    if manip.velocity_score >= min_velocity_atr:
+        quality += 1
+
+    if STRATEGY.get("judas_london_bonus", True):
+        idx = min(manip.return_candle_idx, len(timestamps_arr) - 1)
+        ts = pd.Timestamp(timestamps_arr[idx])
+        if hasattr(ts, "hour") and 7 <= ts.hour <= 10:
+            manip.session_score = 1.0
+            quality += 1
+
+    midnight_open = get_midnight_open_fast(midnight_opens, timestamps_arr, manip.return_candle_idx)
+    if midnight_open is not None:
+        if manip.direction == "UP" and manip.extreme_price > midnight_open:
+            manip.midnight_price_swept = True
+        elif manip.direction == "DOWN" and manip.extreme_price < midnight_open:
+            manip.midnight_price_swept = True
+
+    manip.judas_quality = quality
     return manip

@@ -44,6 +44,7 @@ def detect_swing_high(
     idx: int,
     lookback: int = 5,
     lookahead: int = 5,
+    highs_arr=None,
 ) -> Optional[SwingPoint]:
     """
     Detect if a candle is a swing high.
@@ -55,6 +56,7 @@ def detect_swing_high(
         idx: Index to check
         lookback: Candles to check before
         lookahead: Candles to check after
+        highs_arr: Pre-extracted highs array (avoids df.iloc when provided)
     
     Returns:
         SwingPoint if this is a swing high
@@ -62,22 +64,21 @@ def detect_swing_high(
     if idx < lookback or idx >= len(df) - lookahead:
         return None
     
-    current_high = df.iloc[idx]["high"]
+    h = highs_arr if highs_arr is not None else df["high"].values
+    current_high = h[idx]
     
-    # Check candles before
     for i in range(1, lookback + 1):
-        if df.iloc[idx - i]["high"] >= current_high:
+        if h[idx - i] >= current_high:
             return None
     
-    # Check candles after
     for i in range(1, lookahead + 1):
-        if df.iloc[idx + i]["high"] >= current_high:
+        if h[idx + i] >= current_high:
             return None
     
     return SwingPoint(
         valid=True,
         type="HIGH",
-        price=current_high,
+        price=float(current_high),
         candle_idx=idx,
         strength=min(lookback, lookahead),
     )
@@ -88,6 +89,7 @@ def detect_swing_low(
     idx: int,
     lookback: int = 5,
     lookahead: int = 5,
+    lows_arr=None,
 ) -> Optional[SwingPoint]:
     """
     Detect if a candle is a swing low.
@@ -99,6 +101,7 @@ def detect_swing_low(
         idx: Index to check
         lookback: Candles to check before
         lookahead: Candles to check after
+        lows_arr: Pre-extracted lows array (avoids df.iloc when provided)
     
     Returns:
         SwingPoint if this is a swing low
@@ -106,22 +109,21 @@ def detect_swing_low(
     if idx < lookback or idx >= len(df) - lookahead:
         return None
     
-    current_low = df.iloc[idx]["low"]
+    l = lows_arr if lows_arr is not None else df["low"].values
+    current_low = l[idx]
     
-    # Check candles before
     for i in range(1, lookback + 1):
-        if df.iloc[idx - i]["low"] <= current_low:
+        if l[idx - i] <= current_low:
             return None
     
-    # Check candles after
     for i in range(1, lookahead + 1):
-        if df.iloc[idx + i]["low"] <= current_low:
+        if l[idx + i] <= current_low:
             return None
     
     return SwingPoint(
         valid=True,
         type="LOW",
-        price=current_low,
+        price=float(current_low),
         candle_idx=idx,
         strength=min(lookback, lookahead),
     )
@@ -133,6 +135,8 @@ def find_swing_points(
     end_idx: int,
     swing_lookback: int = None,
     swing_type: str = None,
+    highs_arr=None,
+    lows_arr=None,
 ) -> List[SwingPoint]:
     """
     Find all swing points in a range.
@@ -143,6 +147,8 @@ def find_swing_points(
         end_idx: End of range
         swing_lookback: Lookback for swing detection
         swing_type: Filter by type ("HIGH", "LOW", or None for both)
+        highs_arr: Pre-extracted highs array
+        lows_arr: Pre-extracted lows array
     
     Returns:
         List of SwingPoint objects
@@ -156,16 +162,15 @@ def find_swing_points(
     
     for idx in range(start_idx + swing_lookback, end_idx - lookahead):
         if swing_type is None or swing_type == "HIGH":
-            high = detect_swing_high(df, idx, swing_lookback, lookahead)
+            high = detect_swing_high(df, idx, swing_lookback, lookahead, highs_arr=highs_arr)
             if high:
                 swing_points.append(high)
         
         if swing_type is None or swing_type == "LOW":
-            low = detect_swing_low(df, idx, swing_lookback, lookahead)
+            low = detect_swing_low(df, idx, swing_lookback, lookahead, lows_arr=lows_arr)
             if low:
                 swing_points.append(low)
     
-    # Sort by index
     swing_points.sort(key=lambda x: x.candle_idx)
     
     return swing_points
@@ -176,6 +181,7 @@ def find_recent_swing_high(
     current_idx: int,
     lookback: int = 50,
     swing_strength: int = 3,
+    highs_arr=None,
 ) -> Optional[SwingPoint]:
     """
     Find the most recent swing high before current index.
@@ -185,15 +191,15 @@ def find_recent_swing_high(
         current_idx: Current index
         lookback: How far back to search
         swing_strength: Minimum swing strength
+        highs_arr: Pre-extracted highs array
     
     Returns:
         Most recent SwingPoint HIGH or None
     """
     start_idx = max(0, current_idx - lookback)
     
-    # Search backwards for swing highs
     for idx in range(current_idx - swing_strength - 1, start_idx, -1):
-        swing = detect_swing_high(df, idx, swing_strength, swing_strength)
+        swing = detect_swing_high(df, idx, swing_strength, swing_strength, highs_arr=highs_arr)
         if swing:
             return swing
     
@@ -205,6 +211,7 @@ def find_recent_swing_low(
     current_idx: int,
     lookback: int = 50,
     swing_strength: int = 3,
+    lows_arr=None,
 ) -> Optional[SwingPoint]:
     """
     Find the most recent swing low before current index.
@@ -214,15 +221,15 @@ def find_recent_swing_low(
         current_idx: Current index
         lookback: How far back to search
         swing_strength: Minimum swing strength
+        lows_arr: Pre-extracted lows array
     
     Returns:
         Most recent SwingPoint LOW or None
     """
     start_idx = max(0, current_idx - lookback)
     
-    # Search backwards for swing lows
     for idx in range(current_idx - swing_strength - 1, start_idx, -1):
-        swing = detect_swing_low(df, idx, swing_strength, swing_strength)
+        swing = detect_swing_low(df, idx, swing_strength, swing_strength, lows_arr=lows_arr)
         if swing:
             return swing
     
@@ -234,6 +241,9 @@ def detect_break_of_structure(
     candle_idx: int,
     swing: SwingPoint,
     require_close: bool = True,
+    closes_arr=None,
+    highs_arr=None,
+    lows_arr=None,
 ) -> Optional[StructureBreak]:
     """
     Detect if a candle breaks a swing point (Break of Structure).
@@ -243,6 +253,9 @@ def detect_break_of_structure(
         candle_idx: Index of candle to check
         swing: The swing point to check against
         require_close: Whether to require close beyond swing (not just wick)
+        closes_arr: Pre-extracted closes array
+        highs_arr: Pre-extracted highs array
+        lows_arr: Pre-extracted lows array
     
     Returns:
         StructureBreak if BOS occurred
@@ -250,37 +263,37 @@ def detect_break_of_structure(
     if candle_idx >= len(df) or candle_idx <= swing.candle_idx:
         return None
     
-    candle = df.iloc[candle_idx]
-    
+    c = closes_arr if closes_arr is not None else df["close"].values
+    h = highs_arr if highs_arr is not None else df["high"].values
+    l_ = lows_arr if lows_arr is not None else df["low"].values
+
     if swing.type == "HIGH":
-        # Bullish BOS: Close above swing high
         if require_close:
-            breaks = candle["close"] > swing.price
+            breaks = c[candle_idx] > swing.price
         else:
-            breaks = candle["high"] > swing.price
+            breaks = h[candle_idx] > swing.price
         
         if breaks:
             return StructureBreak(
                 valid=True,
                 direction="BULLISH",
                 broken_level=swing.price,
-                break_price=candle["close"],
+                break_price=float(c[candle_idx]),
                 break_candle_idx=candle_idx,
                 swing_idx=swing.candle_idx,
             )
     else:
-        # Bearish BOS: Close below swing low
         if require_close:
-            breaks = candle["close"] < swing.price
+            breaks = c[candle_idx] < swing.price
         else:
-            breaks = candle["low"] < swing.price
+            breaks = l_[candle_idx] < swing.price
         
         if breaks:
             return StructureBreak(
                 valid=True,
                 direction="BEARISH",
                 broken_level=swing.price,
-                break_price=candle["close"],
+                break_price=float(c[candle_idx]),
                 break_candle_idx=candle_idx,
                 swing_idx=swing.candle_idx,
             )
@@ -294,6 +307,9 @@ def find_bos_after_manipulation(
     expected_direction: str,
     search_window: int = 20,
     swing_lookback: int = None,
+    highs_arr=None,
+    lows_arr=None,
+    closes_arr=None,
 ) -> Optional[StructureBreak]:
     """
     Find Break of Structure after manipulation phase.
@@ -312,38 +328,42 @@ def find_bos_after_manipulation(
         expected_direction: Expected BOS direction ("BULLISH" or "BEARISH")
         search_window: Candles to search after manipulation
         swing_lookback: Swing detection lookback
+        highs_arr: Pre-extracted highs array
+        lows_arr: Pre-extracted lows array
+        closes_arr: Pre-extracted closes array
     
     Returns:
         StructureBreak if found
     """
     swing_lookback = swing_lookback or STRATEGY.get("bos_swing_lookback", 5)
     
-    # Find relevant swing point before manipulation return
     if expected_direction == "BULLISH":
-        # Need to break a swing high
         swing = find_recent_swing_high(
             df,
             manipulation_return_idx,
             lookback=30,
             swing_strength=min(swing_lookback, 3),
+            highs_arr=highs_arr,
         )
     else:
-        # Need to break a swing low
         swing = find_recent_swing_low(
             df,
             manipulation_return_idx,
             lookback=30,
             swing_strength=min(swing_lookback, 3),
+            lows_arr=lows_arr,
         )
     
     if swing is None:
         return None
     
-    # Check for BOS in the search window
     end_idx = min(manipulation_return_idx + search_window, len(df))
     
     for idx in range(manipulation_return_idx + 1, end_idx):
-        bos = detect_break_of_structure(df, idx, swing, require_close=True)
+        bos = detect_break_of_structure(
+            df, idx, swing, require_close=True,
+            closes_arr=closes_arr, highs_arr=highs_arr, lows_arr=lows_arr,
+        )
         if bos:
             return bos
     
@@ -354,6 +374,7 @@ def validate_structure_break(
     df: pd.DataFrame,
     bos: StructureBreak,
     min_displacement_pips: float = 0,
+    closes_arr=None,
 ) -> bool:
     """
     Validate that a BOS has follow-through (not just a wick spike).
@@ -362,6 +383,7 @@ def validate_structure_break(
         df: DataFrame with OHLC data
         bos: The StructureBreak to validate
         min_displacement_pips: Minimum move beyond broken level
+        closes_arr: Pre-extracted closes array
     
     Returns:
         True if BOS appears valid
@@ -369,19 +391,16 @@ def validate_structure_break(
     if not bos.valid:
         return False
     
-    # Check that at least one subsequent candle confirms the break
     next_idx = bos.break_candle_idx + 1
     if next_idx >= len(df):
         return True  # Can't validate, assume valid
     
-    next_candle = df.iloc[next_idx]
+    c = closes_arr if closes_arr is not None else df["close"].values
     
     if bos.direction == "BULLISH":
-        # Check if price stayed above broken level
-        return next_candle["close"] > bos.broken_level
+        return c[next_idx] > bos.broken_level
     else:
-        # Check if price stayed below broken level
-        return next_candle["close"] < bos.broken_level
+        return c[next_idx] < bos.broken_level
 
 
 def get_market_structure_bias(

@@ -170,6 +170,8 @@ def detect_equal_levels(
     consolidation: ConsolidationResult,
     tolerance_atr_mult: float = None,
     min_touches: int = None,
+    highs_arr: np.ndarray = None,
+    lows_arr: np.ndarray = None,
 ) -> ConsolidationResult:
     """
     Detect equal highs/lows within consolidation (liquidity pools).
@@ -182,6 +184,8 @@ def detect_equal_levels(
         consolidation: The consolidation result to enrich
         tolerance_atr_mult: How close highs/lows must be to count as equal (default from config)
         min_touches: Minimum touches to confirm equal level (default from config)
+        highs_arr: Pre-extracted highs numpy array (avoids df slicing when provided)
+        lows_arr: Pre-extracted lows numpy array (avoids df slicing when provided)
 
     Returns:
         ConsolidationResult with equal level fields set
@@ -200,11 +204,13 @@ def detect_equal_levels(
     if start >= len(df) or end > len(df):
         return consolidation
 
-    window = df.iloc[start:end]
     tolerance = tolerance_atr_mult * consolidation.atr
 
-    # Check for equal highs (multiple touches of same high level)
-    highs = window["high"].values
+    if highs_arr is not None:
+        highs = highs_arr[start:end]
+    else:
+        highs = df.iloc[start:end]["high"].values
+
     for level in highs:
         touches = sum(1 for h in highs if abs(h - level) <= tolerance)
         if touches >= min_touches:
@@ -212,8 +218,11 @@ def detect_equal_levels(
             consolidation.equal_high_level = float(level)
             break
 
-    # Check for equal lows
-    lows = window["low"].values
+    if lows_arr is not None:
+        lows = lows_arr[start:end]
+    else:
+        lows = df.iloc[start:end]["low"].values
+
     for level in lows:
         touches = sum(1 for l in lows if abs(l - level) <= tolerance)
         if touches >= min_touches:

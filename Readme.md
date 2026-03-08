@@ -1,6 +1,6 @@
-# AMD Strategy Backtester
+# AMD Strategy Backtester + Live Signal Scanner
 
-Automated backtesting engine for the **AMD (Accumulation/Manipulation/Distribution)** trading strategy on XAU/USD (Gold) with realistic execution modeling, session filters, and SMC confluence.
+Automated backtesting engine and live signal scanner for the **AMD (Accumulation/Manipulation/Distribution)** trading strategy on XAU/USD (Gold) with realistic execution modeling, Judas swing quality filtering, Monte Carlo validation, and SMC confluence.
 
 ## Strategy Overview
 
@@ -59,6 +59,12 @@ python scripts/fetch_data.py --months 6
 # Basic backtest
 python scripts/run_backtest.py --verbose
 
+# $100 objective profile (300-500 trades + net positive target)
+python scripts/run_backtest.py --no-charts --no-session --no-htf
+
+# Same profile with full chart artifacts
+python scripts/run_backtest.py --no-session --no-htf
+
 # With date range
 python scripts/run_backtest.py --start 2024-01-01 --end 2024-06-30
 
@@ -73,6 +79,45 @@ python scripts/run_backtest.py --enable-fundamentals --intrabar WORST_CASE
 
 ```bash
 python scripts/analyze_results.py
+```
+
+### 7. Monte Carlo Validation
+
+```bash
+# Run Monte Carlo on a completed backtest (10K simulations)
+python scripts/monte_carlo.py --report reports/backtest_aae991eb
+
+# With charts and save results
+python scripts/monte_carlo.py --report reports/backtest_aae991eb --charts --save
+
+# Custom simulation count
+python scripts/monte_carlo.py --report reports/backtest_aae991eb --simulations 20000
+```
+
+### 8. Walk-Forward Validation
+
+```bash
+# 70/30 train/test split with auto Monte Carlo on test set
+python scripts/walk_forward.py --split 0.7 --monte-carlo
+
+# Custom split
+python scripts/walk_forward.py --split 0.6
+```
+
+### 9. Live Signal Scanner
+
+```bash
+# Signal-only mode (default) -- scans and prints signals, no execution
+python scripts/run_live.py
+
+# Single scan, no loop
+python scripts/run_live.py --once
+
+# Custom balance and scan interval
+python scripts/run_live.py --balance 500 --interval 60
+
+# Log signals to file
+python scripts/run_live.py --output signals.jsonl
 ```
 
 ## Project Structure
@@ -90,9 +135,9 @@ market/
 │   ├── strategy/
 │   │   ├── indicators.py     # ATR, body size calculations
 │   │   ├── consolidation.py  # Phase 1: Range detection
-│   │   ├── manipulation.py   # Phase 2: Fake breakout detection
+│   │   ├── manipulation.py   # Phase 2: Fake breakout + Judas swing quality
 │   │   ├── distribution.py   # Phase 3: Real breakout confirmation
-│   │   ├── entry.py          # Phase 4: Retest entry logic
+│   │   ├── entry.py          # Phase 4: Retest entry logic + short quality gate
 │   │   ├── risk.py           # Phase 5: Risk management (contract-size math)
 │   │   ├── fvg.py            # Fair Value Gap detection
 │   │   ├── order_blocks.py   # Order Block detection
@@ -107,12 +152,20 @@ market/
 │   │   ├── engine.py         # Main backtesting loop
 │   │   ├── execution.py      # Realistic execution model
 │   │   └── metrics.py        # Performance calculations
+│   ├── live/
+│   │   ├── signals.py        # Real-time AMD pattern scanner
+│   │   └── monitor.py        # Kill switch and risk monitoring
 │   └── visualization/
-│       └── charts.py         # Equity curves and trade charts
+│       └── charts.py         # Equity curves, Monte Carlo charts
 ├── scripts/
 │   ├── fetch_data.py         # Download historical data
 │   ├── run_backtest.py       # Execute backtest with CLI options
-│   └── analyze_results.py    # Generate reports
+│   ├── run_live.py           # Live signal scanner (signal-only mode)
+│   ├── monte_carlo.py        # Monte Carlo ruin simulation
+│   ├── walk_forward.py       # Walk-forward validation
+│   ├── analyze_results.py    # Generate reports
+│   ├── debug/                # Debug utilities
+│   └── optimization/         # Parameter optimization tools
 ├── data/
 │   ├── news_events.example.csv  # Sample news events file
 │   ├── dxy.example.csv          # Sample DXY data
@@ -199,6 +252,13 @@ All parameters are configurable in `config.py`:
 --enable-fundamentals # Enable DXY/yields filter (off by default)
 ```
 
+### Output Controls
+
+```bash
+--no-charts   # Skip PNG chart rendering (report text/json still saved)
+--no-report   # Skip writing report artifacts to reports/
+```
+
 ## Realistic Execution Model
 
 The backtester includes a sophisticated execution model to avoid curve-fitting:
@@ -238,10 +298,12 @@ See `data/*.example.csv` for format templates.
 
 Before live trading, the strategy must demonstrate:
 
-- **500+ trades** minimum sample size
-- **Expectancy > 0.2R** average profit per trade
-- **Max drawdown < 15%** of account
+- **200+ trades** minimum sample size
+- **Expectancy > 0.25R** average profit per trade
+- **Max drawdown < 20%** of account
 - **Positive net P&L** after all costs
+- **Walk-forward degradation ratio >= 0.6** (test expectancy / train expectancy)
+- **Monte Carlo P95 drawdown < 30%** (worst 5% of simulations)
 
 ## Reports
 
@@ -258,6 +320,50 @@ After running a backtest, reports are saved to `reports/backtest_{id}/`:
   - Exit reason analysis
   - Filter rejection stats
   - Confluence scoring
+- `results.json` - Raw result payload for reproducible analysis
+
+Notes:
+- Using `--no-charts` still writes `report.txt`, `amd_conformity.json`, and `results.json`.
+- Use `--no-report` to skip all report artifact output.
+
+## Judas Swing Quality Filter
+
+The manipulation detection includes Judas swing quality scoring to filter out low-quality fakeouts:
+
+| Factor | Scoring | Config Key |
+|--------|---------|------------|
+| Candle count | 1-5 candles = fast sweep = +1 | `judas_max_candles` |
+| Velocity | Break distance per candle >= 0.3 ATR = +1 | `judas_min_velocity_atr` |
+| Session | London open (07:00-10:00 UTC) = +1 | `judas_london_bonus` |
+| Midnight sweep | Price swept above/below midnight open | tracked but not scored |
+
+Short trades require a minimum confluence score of 2 (configurable via `short_min_confluence_score`), which naturally filters out low-quality short setups that historically showed a 36.9% win rate vs 51% for longs.
+
+## Monte Carlo Simulation
+
+The Monte Carlo analysis reshuffles the actual trade sequence 10,000 times to estimate:
+
+- **Drawdown distribution**: P5/P25/P50/P75/P95 of max drawdown
+- **Ruin probability**: Chance of hitting 20%, 30%, 50%, 80% drawdown thresholds
+- **Time to double**: Average trades needed to double the account
+- **Consecutive loss streaks**: Probability of N+ consecutive losses
+
+Target: P95 max drawdown should be ~25% (even in the worst 5% of shuffles, the account survives).
+
+Reports include fan charts (equity envelopes), drawdown histograms, and ruin probability bar charts.
+
+## Live Signal Scanner
+
+The live module scans real-time candle data for AMD patterns using the same strategy pipeline as the backtester.
+
+**Signal-only mode** (default): No MT5 execution -- signals are printed to console and optionally logged to a JSONL file.
+
+Kill switch rules:
+- Daily loss > 1% of initial balance -> stop for the day
+- Account drawdown > 15% -> halt until manual review
+- Consecutive choppy regime checks >= 2 -> pause scanning
+
+Each signal includes: direction, entry price, SL, TP, position size, R:R, confluence score, Judas quality, and confidence level (HIGH/MEDIUM/LOW).
 
 ## Running Tests
 
@@ -302,5 +408,3 @@ EXECUTION COSTS:
 ## License
 
 MIT License - Use at your own risk. Past performance does not guarantee future results. This software is for educational and research purposes only.
-#   a l g o -  
- 

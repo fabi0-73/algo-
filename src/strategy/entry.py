@@ -770,7 +770,7 @@ def check_entry_at_candle(
     equal_level_swept = _equal_level_swept(consolidation, manipulation)
     volume_confirmed = getattr(manipulation, "volume_confirmed", False)
 
-    # Calculate confluence score (BOS + FVG + OB + equal levels + volume + breaker)
+    # Calculate confluence score (BOS + FVG + OB + equal levels + volume + breaker + judas quality)
     confluence_score = 0
     if bos_confirmed:
         confluence_score += 1
@@ -785,7 +785,16 @@ def check_entry_at_candle(
     if breaker_confluence:
         confluence_score += 1
 
+    # Add Judas swing quality to confluence (from manipulation scoring)
+    judas_quality = getattr(manipulation, "judas_quality", 0)
+    if judas_quality >= 2:
+        confluence_score += 1
+
+    # Apply direction-specific confluence minimums
     min_confluence = STRATEGY.get("min_confluence_score", 0)
+    if direction == "SHORT":
+        short_min = STRATEGY.get("short_min_confluence_score", min_confluence)
+        min_confluence = max(min_confluence, short_min)
     if min_confluence > 0 and confluence_score < min_confluence:
         return EntrySignal(valid=False)
 

@@ -20,6 +20,8 @@ from src.strategy.manipulation import (
     ManipulationResult,
     confirm_liquidity_sweep,
     confirm_volume_spike,
+    score_judas_quality,
+    score_judas_quality_fast,
 )
 from src.strategy.distribution import detect_distribution, DistributionResult, validate_distribution_strength
 from src.strategy.entry import (
@@ -278,6 +280,21 @@ class BacktestEngine:
         self.atr_period = STRATEGY["atr_period"]
         self.min_lookback = self.lookback + self.atr_period + 20
 
+    def _build_midnight_opens(self) -> dict:
+        """Pre-compute midnight (05:00 UTC) open prices keyed by date.
+
+        Replaces the per-manipulation 300-bar backward scan with a single
+        forward pass over all timestamps, yielding O(1) lookups later.
+        """
+        result = {}
+        ts_arr = self._timestamps
+        opens_arr = self._opens
+        for i in range(len(ts_arr)):
+            ts = pd.Timestamp(ts_arr[i])
+            if hasattr(ts, "hour") and ts.hour == 5 and ts.minute == 0:
+                result[ts.date()] = float(opens_arr[i])
+        return result
+
     def run(self, df: pd.DataFrame, verbose: bool = False) -> Dict[str, Any]:
         """Run backtest on historical data."""
         if len(df) < self.min_lookback:
@@ -305,6 +322,18 @@ class BacktestEngine:
 
         # Add fundamentals if enabled
         df = self.fundamentals.add_fundamentals(df)
+
+        # Pre-extract numpy arrays for the entire dataset (avoids millions of df[col].values calls)
+        self._highs = df["high"].values
+        self._lows = df["low"].values
+        self._opens = df["open"].values
+        self._closes = df["close"].values
+        self._timestamps = df["timestamp"].values
+        self._atrs = df["atr"].values
+        self._tick_volumes = df["tick_volume"].values if "tick_volume" in df.columns else None
+
+        # Pre-compute midnight open lookup: O(1) per query instead of 300-bar backward scan
+        self._midnight_opens = self._build_midnight_opens()
 
         # Reset state
         self.trades = []
@@ -375,24 +404,21 @@ class BacktestEngine:
         }
 
         logger.info(f"Starting backtest on {len(df)} candles")
-        logger.info(f"Date range: {df['timestamp'].iloc[0]} to {df['timestamp'].iloc[-1]}")
+        logger.info(f"Date range: {self._timestamps[0]} to {self._timestamps[-1]}")
 
         # Main loop - process each bar
         total_bars = len(df) - self.min_lookback
         progress_interval = max(1000, total_bars // 50)  # Log every ~2%
         
         for i in range(self.min_lookback, len(df)):
-            current_candle = df.iloc[i]
-            ts = current_candle.get("timestamp")
-
             # Progress logging (so long runs don't appear stuck)
             if (i - self.min_lookback) % progress_interval == 0:
                 progress_pct = ((i - self.min_lookback) / total_bars) * 100
                 logger.info(f"Processing bar {i}/{len(df)} ({progress_pct:.1f}%) - Trades: {len(self.trades)}")
 
-            # Check open position first
+            # Check open position first (df.iloc only when in position -- rare)
             if self.state.in_position:
-                self._check_exit(df, i, current_candle, verbose)
+                self._check_exit(df, i, df.iloc[i], verbose)
 
             # Look for new setups if not in position
             if not self.state.in_position:
@@ -419,7 +445,7 @@ class BacktestEngine:
 
         if self.state.in_position and self.state.current_trade:
             trade = self.state.current_trade
-            current_price = df.iloc[current_idx]["close"]
+            current_price = float(self._closes[current_idx])
 
             if trade.direction == "LONG":
                 unrealized = (current_price - trade.entry_price) * trade.position_size * 100
@@ -544,19 +570,16 @@ class BacktestEngine:
         4. Check if current price offers retest entry
         """
         lookback = self.lookback
-        atr = df['atr'].iloc[current_idx]
-        row = df.iloc[current_idx]
+        atr = float(self._atrs[current_idx])
 
         if pd.isna(atr) or atr == 0:
             return
 
-        # Prefer numpy arrays for hot path (avoid repeated df.iloc in loop)
-        highs = df["high"].values
-        lows = df["low"].values
-        closes = df["close"].values
+        highs = self._highs
+        lows = self._lows
+        closes = self._closes
 
         # Scan backwards for consolidation zones (step by 2 for speed)
-        # Check consolidations within configured window
         min_offset = STRATEGY.get("pattern_min_bars_after_consolidation", 10)
         max_offset_cfg = STRATEGY.get("pattern_max_bars_after_consolidation", 60)
         max_offset = min(max_offset_cfg, current_idx - lookback)
@@ -567,7 +590,6 @@ class BacktestEngine:
             if consol_start_idx < self.atr_period:
                 continue
 
-            # Consolidation window (numpy slice - faster than df.iloc)
             hw = highs[consol_start_idx : consol_end_idx + 1]
             lw = lows[consol_start_idx : consol_end_idx + 1]
             cw = closes[consol_start_idx : consol_end_idx + 1]
@@ -594,7 +616,7 @@ class BacktestEngine:
             )
             # Enrich with equal highs/lows (liquidity pools) when enabled
             if STRATEGY.get("detect_equal_levels", True):
-                consol = detect_equal_levels(df, consol)
+                consol = detect_equal_levels(df, consol, highs_arr=self._highs, lows_arr=self._lows)
 
             # Now check for manipulation AFTER consolidation
             manip = self._check_manipulation_after(df, consol, current_idx)
@@ -602,6 +624,9 @@ class BacktestEngine:
                 self.rejection_stats["no_manipulation"] += 1
                 continue
             self.amd_stats["manipulations_found"] += 1
+
+            # Score Judas swing quality (candle count, velocity, session)
+            manip = score_judas_quality_fast(self._timestamps, self._midnight_opens, manip)
 
             # Confirm liquidity sweep if required
             if STRATEGY.get("require_liquidity_sweep", False):
@@ -640,13 +665,13 @@ class BacktestEngine:
 
             # Session timing: Asian accumulation -> London/NY distribution
             if SESSION_FILTER.get("require_consolidation_in_asian", False):
-                consol_start_ts = df.iloc[consol.start_idx].get("timestamp")
-                consol_end_ts = df.iloc[consol.end_idx].get("timestamp")
+                consol_start_ts = pd.Timestamp(self._timestamps[consol.start_idx])
+                consol_end_ts = pd.Timestamp(self._timestamps[consol.end_idx])
                 if not self.time_filter.consolidation_formed_in_asian(consol_start_ts, consol_end_ts):
                     self.rejection_stats["filtered_consolidation_not_asian"] += 1
                     continue
             if SESSION_FILTER.get("require_distribution_in_london_ny", False):
-                dist_ts = df.iloc[dist.break_candle_idx].get("timestamp")
+                dist_ts = pd.Timestamp(self._timestamps[dist.break_candle_idx])
                 if not self.time_filter.distribution_in_london_ny(dist_ts):
                     self.rejection_stats["filtered_distribution_not_london_ny"] += 1
                     continue
@@ -665,7 +690,8 @@ class BacktestEngine:
                 expected_bos_dir = "BULLISH" if manip.direction == "DOWN" else "BEARISH"
                 bos = find_bos_after_manipulation(
                     df, manip.return_candle_idx, expected_bos_dir,
-                    search_window=20, swing_lookback=STRATEGY.get("bos_swing_lookback", 5)
+                    search_window=20, swing_lookback=STRATEGY.get("bos_swing_lookback", 5),
+                    highs_arr=self._highs, lows_arr=self._lows, closes_arr=self._closes,
                 )
 
                 if STRATEGY.get("bos_required", False) and (bos is None or not bos.valid):
@@ -725,6 +751,7 @@ class BacktestEngine:
                 )
 
             volume_confirmed = getattr(manip, "volume_confirmed", False)
+            judas_quality = getattr(manip, "judas_quality", 0)
             confluence_score = 0
             if bos is not None and bos.valid:
                 confluence_score += 1
@@ -735,6 +762,8 @@ class BacktestEngine:
             if equal_level_swept:
                 confluence_score += 1
             if volume_confirmed:
+                confluence_score += 1
+            if judas_quality >= 2:
                 confluence_score += 1
 
             min_confluence = STRATEGY.get("min_confluence_score", 0)
@@ -754,6 +783,9 @@ class BacktestEngine:
             if entry.direction == "SHORT" and not STRATEGY.get("allow_short_trades", True):
                 self.rejection_stats["short_filtered"] += 1
                 continue
+
+            # Deferred row creation -- only when entry is valid and filters need a Series
+            row = df.iloc[current_idx]
 
             # Check all filters
             can_enter, filter_reason = self._check_filters(
@@ -870,7 +902,7 @@ class BacktestEngine:
 
         # Check for upward fakeout
         upward = self._find_fakeout(
-            df, search_start, search_end,
+            search_start, search_end,
             range_high, range_low, min_break, max_return_candles,
             direction="UP", atr=atr
         )
@@ -879,7 +911,7 @@ class BacktestEngine:
 
         # Check for downward fakeout
         downward = self._find_fakeout(
-            df, search_start, search_end,
+            search_start, search_end,
             range_high, range_low, min_break, max_return_candles,
             direction="DOWN", atr=atr
         )
@@ -887,7 +919,6 @@ class BacktestEngine:
 
     def _find_fakeout(
         self,
-        df: pd.DataFrame,
         start_idx: int,
         end_idx: int,
         range_high: float,
@@ -897,10 +928,10 @@ class BacktestEngine:
         direction: str,
         atr: float,
     ) -> ManipulationResult:
-        """Find a fakeout pattern in the given range (uses arrays for speed)."""
-        h = df["high"].values
-        l_ = df["low"].values
-        c = df["close"].values
+        """Find a fakeout pattern in the given range (uses pre-extracted arrays)."""
+        h = self._highs
+        l_ = self._lows
+        c = self._closes
 
         break_idx = -1
         extreme = 0.0 if direction == "UP" else float("inf")
@@ -926,6 +957,7 @@ class BacktestEngine:
                                 break_distance=extreme - range_high,
                                 return_candle_idx=i,
                                 atr=atr,
+                                manipulation_candle_count=max(1, i - break_idx),
                             )
                     if i - break_idx > max_return_candles:
                         break_idx = -1
@@ -946,6 +978,7 @@ class BacktestEngine:
                                 break_distance=range_low - extreme,
                                 return_candle_idx=i,
                                 atr=atr,
+                                manipulation_candle_count=max(1, i - break_idx),
                             )
                     if i - break_idx > max_return_candles:
                         break_idx = -1
@@ -960,9 +993,9 @@ class BacktestEngine:
         manip: ManipulationResult,
         current_idx: int,
     ) -> DistributionResult:
-        """Check for distribution after manipulation (uses arrays for speed)."""
-        o = df["open"].values
-        c = df["close"].values
+        """Check for distribution after manipulation (uses pre-extracted arrays)."""
+        o = self._opens
+        c = self._closes
 
         atr = manip.atr
         min_break = STRATEGY["distribution_break_atr_mult"] * atr
@@ -1491,6 +1524,10 @@ class BacktestEngine:
                 "meets_min_trades": total_trades >= VALIDATION["min_trades"],
                 "meets_expectancy": expectancy >= VALIDATION["min_expectancy_r"],
                 "meets_drawdown": max_drawdown <= VALIDATION["max_drawdown_pct"],
+                # Objective profile for small-capital optimization branch
+                "meets_trade_band_300_500": 300 <= total_trades <= 500,
+                "meets_net_positive": total_net_pnl > 0,
+                "objective_pass": (300 <= total_trades <= 500) and (total_net_pnl > 0),
             },
             # Stats
             "funnel_stats": self.rejection_stats,

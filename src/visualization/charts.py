@@ -512,6 +512,7 @@ def generate_report(
     results: Dict[str, Any],
     output_dir: str = "reports",
     show_charts: bool = False,
+    render_charts: bool = True,
 ) -> str:
     """
     Generate full visual report with all charts.
@@ -520,6 +521,7 @@ def generate_report(
         results: Backtest results dictionary
         output_dir: Directory to save reports
         show_charts: Whether to display charts
+        render_charts: Whether to render and save PNG charts
 
     Returns:
         Path to report directory
@@ -537,46 +539,47 @@ def generate_report(
     funnel_stats = results.get("funnel_stats", {})
     amd_conformity = results.get("amd_conformity", {})
 
-    # Generate charts
-    if equity_curve:
-        plot_equity_curve(
-            equity_curve,
-            mtm_equity_curve=mtm_equity_curve,
-            title=f"Equity Curve - Backtest {backtest_id}",
-            save_path=os.path.join(report_dir, "equity_curve.png"),
-            show=show_charts,
-        )
+    # Generate charts when requested
+    if render_charts:
+        if equity_curve:
+            plot_equity_curve(
+                equity_curve,
+                mtm_equity_curve=mtm_equity_curve,
+                title=f"Equity Curve - Backtest {backtest_id}",
+                save_path=os.path.join(report_dir, "equity_curve.png"),
+                show=show_charts,
+            )
 
-    if trades:
-        plot_r_distribution(
-            trades,
-            title=f"R-Multiple Distribution - Backtest {backtest_id}",
-            save_path=os.path.join(report_dir, "r_distribution.png"),
-            show=show_charts,
-        )
+        if trades:
+            plot_r_distribution(
+                trades,
+                title=f"R-Multiple Distribution - Backtest {backtest_id}",
+                save_path=os.path.join(report_dir, "r_distribution.png"),
+                show=show_charts,
+            )
 
-        plot_monthly_performance(
-            trades,
-            title=f"Monthly Performance - Backtest {backtest_id}",
-            save_path=os.path.join(report_dir, "monthly_performance.png"),
-            show=show_charts,
-        )
+            plot_monthly_performance(
+                trades,
+                title=f"Monthly Performance - Backtest {backtest_id}",
+                save_path=os.path.join(report_dir, "monthly_performance.png"),
+                show=show_charts,
+            )
 
-    if cost_stats:
-        plot_cost_breakdown(
-            cost_stats,
-            title=f"Cost Breakdown - Backtest {backtest_id}",
-            save_path=os.path.join(report_dir, "cost_breakdown.png"),
-            show=show_charts,
-        )
+        if cost_stats:
+            plot_cost_breakdown(
+                cost_stats,
+                title=f"Cost Breakdown - Backtest {backtest_id}",
+                save_path=os.path.join(report_dir, "cost_breakdown.png"),
+                show=show_charts,
+            )
 
-    if funnel_stats:
-        plot_funnel_analysis(
-            funnel_stats,
-            title=f"Pattern Funnel - Backtest {backtest_id}",
-            save_path=os.path.join(report_dir, "funnel_analysis.png"),
-            show=show_charts,
-        )
+        if funnel_stats:
+            plot_funnel_analysis(
+                funnel_stats,
+                title=f"Pattern Funnel - Backtest {backtest_id}",
+                save_path=os.path.join(report_dir, "funnel_analysis.png"),
+                show=show_charts,
+            )
 
     # Generate text report
     metrics = calculate_metrics(
@@ -606,5 +609,163 @@ def generate_report(
             import json
             json.dump(amd_conformity, f, indent=2)
 
+    # Persist raw result payload for reproducibility
+    results_path = os.path.join(report_dir, "results.json")
+    with open(results_path, "w") as f:
+        import json
+        json.dump(results, f, indent=2, default=str)
+
     print(f"Report generated: {report_dir}")
     return report_dir
+
+
+# =============================================================================
+# Monte Carlo Visualization Functions
+# =============================================================================
+
+
+def plot_monte_carlo_fan(
+    equity_percentiles: Dict[str, list],
+    title: str = "Monte Carlo Equity Fan Chart",
+    save_path: str = None,
+    show: bool = True,
+) -> plt.Figure:
+    """
+    Plot equity path fan chart showing P5/P25/P50/P75/P95 envelopes.
+
+    Args:
+        equity_percentiles: Dict with keys P5, P25, P50, P75, P95
+            each mapping to a list of equity values per trade index
+        title: Chart title
+        save_path: Path to save figure
+        show: Whether to display
+
+    Returns:
+        Matplotlib figure
+    """
+    fig, ax = plt.subplots(figsize=(14, 7))
+
+    x = list(range(len(equity_percentiles["P50"])))
+
+    ax.fill_between(
+        x, equity_percentiles["P5"], equity_percentiles["P95"],
+        alpha=0.15, color="#2E86AB", label="P5-P95",
+    )
+    ax.fill_between(
+        x, equity_percentiles["P25"], equity_percentiles["P75"],
+        alpha=0.3, color="#2E86AB", label="P25-P75",
+    )
+    ax.plot(x, equity_percentiles["P50"], linewidth=2, color="#2E86AB", label="Median (P50)")
+    ax.plot(x, equity_percentiles["P5"], linewidth=0.8, color="#E74C3C", linestyle="--", alpha=0.7, label="P5 (worst 5%)")
+    ax.plot(x, equity_percentiles["P95"], linewidth=0.8, color="#27AE60", linestyle="--", alpha=0.7, label="P95 (best 5%)")
+
+    ax.axhline(y=equity_percentiles["P50"][0], color="gray", linestyle=":", alpha=0.5)
+
+    ax.set_title(title, fontsize=14, fontweight="bold")
+    ax.set_xlabel("Trade Number")
+    ax.set_ylabel("Account Equity ($)")
+    ax.legend(loc="upper left")
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return fig
+
+
+def plot_drawdown_distribution(
+    max_drawdowns: list,
+    title: str = "Monte Carlo Max Drawdown Distribution",
+    save_path: str = None,
+    show: bool = True,
+) -> plt.Figure:
+    """
+    Plot histogram of max drawdowns across all simulations.
+
+    Args:
+        max_drawdowns: List of max drawdown values (0-1 scale)
+        title: Chart title
+        save_path: Path to save figure
+        show: Whether to display
+
+    Returns:
+        Matplotlib figure
+    """
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    dd_pct = [d * 100 for d in max_drawdowns]
+    ax.hist(dd_pct, bins=60, color="#2E86AB", alpha=0.7, edgecolor="white", linewidth=0.5)
+
+    p50 = np.percentile(dd_pct, 50)
+    p95 = np.percentile(dd_pct, 95)
+    ax.axvline(p50, color="#E67E22", linestyle="--", linewidth=2, label=f"Median: {p50:.1f}%")
+    ax.axvline(p95, color="#E74C3C", linestyle="--", linewidth=2, label=f"P95: {p95:.1f}%")
+    ax.axvline(20, color="#27AE60", linestyle=":", linewidth=2, alpha=0.7, label="Target: 20%")
+
+    ax.set_title(title, fontsize=14, fontweight="bold")
+    ax.set_xlabel("Max Drawdown (%)")
+    ax.set_ylabel("Frequency")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return fig
+
+
+def plot_ruin_probability(
+    ruin_probs: Dict[str, float],
+    title: str = "Ruin Probability by Drawdown Threshold",
+    save_path: str = None,
+    show: bool = True,
+) -> plt.Figure:
+    """
+    Plot ruin probability vs drawdown threshold.
+
+    Args:
+        ruin_probs: Dict mapping threshold labels (e.g. "20%") to probability
+        title: Chart title
+        save_path: Path to save figure
+        show: Whether to display
+
+    Returns:
+        Matplotlib figure
+    """
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    thresholds = list(ruin_probs.keys())
+    probs = list(ruin_probs.values())
+
+    bars = ax.bar(thresholds, probs, color="#2E86AB", alpha=0.8, edgecolor="white", width=0.5)
+
+    for bar, prob in zip(bars, probs):
+        color = "#E74C3C" if prob > 50 else "#E67E22" if prob > 20 else "#27AE60"
+        bar.set_color(color)
+        ax.text(
+            bar.get_x() + bar.get_width() / 2, bar.get_height() + 1,
+            f"{prob:.1f}%", ha="center", va="bottom", fontweight="bold",
+        )
+
+    ax.set_title(title, fontsize=14, fontweight="bold")
+    ax.set_xlabel("Drawdown Threshold")
+    ax.set_ylabel("Probability of Reaching Threshold (%)")
+    ax.set_ylim(0, max(probs) * 1.2 if probs else 100)
+    ax.grid(True, alpha=0.3, axis="y")
+
+    plt.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return fig

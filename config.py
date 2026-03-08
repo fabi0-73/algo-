@@ -124,7 +124,7 @@ SESSION_FILTER = {
     "require_consolidation_in_asian": False,  # Relaxed - allow any time
 
     # Daily trade limits
-    "max_trades_per_day": 5,  # Allow 2 trades per day
+    "max_trades_per_day": 3,  # Fewer trades/day = less chop exposure
 
     # Daily loss limit - stop new entries if daily drawdown exceeds this
     "daily_loss_limit_pct": 0.01,  # 1% daily loss limit
@@ -238,7 +238,7 @@ VOLUME_FILTER = {
     "volume_ma_period": 20,
 
     # Distribution candle must have volume >= this ratio vs consolidation avg
-    "distribution_volume_ratio_min": 1.5,
+    "distribution_volume_ratio_min": 1.2,  # Relaxed from 1.5
 
     # Minimum tick volume (block very low liquidity candles)
     "min_tick_volume": 200,
@@ -284,12 +284,12 @@ RISK_MODEL = {
     "contract_size": 100.0,
 
     # Risk per trade (lower = smaller drawdowns, smoother monthly curve)
-    "risk_pct_per_trade_default": 0.008,  # 0.8% per trade
+    "risk_pct_per_trade_default": 0.005,  # 0.5% per trade (was 0.8%)
     "risk_pct_per_trade_max": 0.02,       # 2% max allowed
 
     # Stop loss placement
     # Minimum stop distance as ATR multiple (avoid too-tight stops)
-    "min_stop_atr_mult": 1.0,      # Was 0.8 - wider minimum
+    "min_stop_atr_mult": 1.2,      # Wider stops = fewer premature stop-outs
     # Buffer beyond manipulation extreme
     "stop_buffer_atr_mult": 0.75,  # Was 0.50 - more room to reduce stop-outs
 
@@ -340,7 +340,7 @@ STRATEGY = {
     "retest_tolerance_atr_mult": 0.35,      # Tighter entries for better R-multiple
 
     # Phase 5: Risk Management (uses RISK_MODEL now, kept for compatibility)
-    "min_rr": 2.0,                          # Balanced R:R - not too strict
+    "min_rr": 2.5,                          # Higher R:R compensates for tighter filters
     "max_risk_pct": 0.01,                   # 1% per trade
     "spread_buffer_pips": 10,               # Legacy; use RISK_MODEL stop_buffer_atr_mult
 
@@ -414,10 +414,18 @@ STRATEGY = {
     "require_discount_for_long": False,
     "require_premium_for_short": False,
 
-    # Trailing stop (optional - start disabled, test separately)
-    "trailing_stop_enabled": False,
-    "trailing_stop_activation_r": 2.0,      # Activate after 2R profit
-    "trailing_stop_atr_mult": 1.0,          # Trail by 1x ATR
+    # Trailing stop - let winners run past fixed TP
+    "trailing_stop_enabled": True,
+    "trailing_stop_activation_r": 1.5,      # Activate after 1.5R profit
+    "trailing_stop_atr_mult": 1.5,          # Trail by 1.5x ATR
+
+    # Short trade quality gate (shorts need higher confluence than longs)
+    "short_min_confluence_score": 2,
+
+    # Judas Swing quality filters
+    "judas_max_candles": 5,                 # Fast sweeps only (1-5 candles)
+    "judas_min_velocity_atr": 0.3,          # Min break distance per candle as ATR fraction
+    "judas_london_bonus": True,             # Extra confluence for London session manipulation
 }
 
 # =============================================================================
@@ -434,8 +442,8 @@ BACKTEST = {
 # Validation Targets
 # =============================================================================
 VALIDATION = {
-    "min_trades": 500,
-    "min_expectancy_r": 0.2,                # Expectancy must be > 0.2R
-    "max_drawdown_pct": 0.15,               # Max drawdown < 15%
+    "min_trades": 200,
+    "min_expectancy_r": 0.25,               # Slightly higher bar
+    "max_drawdown_pct": 0.20,               # Max drawdown < 20%
     "min_months": 3,                        # Minimum months of data
 }

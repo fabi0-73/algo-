@@ -27,6 +27,66 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _print_train_test_comparison(train_res: dict, test_res: dict, split_ratio: float) -> None:
+    """Print train vs test comparison table."""
+    print("\n" + "=" * 72)
+    print("TRAIN vs TEST COMPARISON")
+    print("=" * 72)
+    print(f"Split: {split_ratio:.0%} train / {1 - split_ratio:.0%} test\n")
+
+    header = f"{'Metric':<26} {'Train':>14} {'Test':>14} {'Ratio':>12}"
+    print(header)
+    print("-" * 68)
+
+    rows = [
+        ("Trades", "total_trades"),
+        ("Win Rate (%)", "win_rate"),
+        ("Expectancy (R)", "expectancy_r"),
+        ("Profit Factor", "profit_factor"),
+        ("Max Drawdown (%)", "max_drawdown_pct"),
+        ("Net P&L ($)", "net_pnl_usd"),
+    ]
+    for label, key in rows:
+        tv = train_res.get(key, 0)
+        ev = test_res.get(key, 0)
+        if "usd" in key or "pnl" in key.lower():
+            ts, es = f"${tv:,.2f}", f"${ev:,.2f}"
+        elif "pct" in key or "rate" in key.lower():
+            ts, es = f"{tv:.1f}%", f"{ev:.1f}%"
+        elif isinstance(tv, int):
+            ts, es = str(tv), str(ev)
+        else:
+            ts, es = f"{tv:.3f}", f"{ev:.3f}"
+        ratio_str = f"{ev / tv:.2f}x" if tv and tv != 0 else "N/A"
+        print(f"{label:<26} {ts:>14} {es:>14} {ratio_str:>12}")
+
+    train_exp = train_res.get("expectancy_r", 0)
+    test_exp = test_res.get("expectancy_r", 0)
+    if train_exp > 0:
+        deg = test_exp / train_exp
+        print(f"\nDegradation ratio: {deg:.2f} (target >= 0.60) -> {'PASS' if deg >= 0.6 else 'FAIL'}")
+    print("=" * 72)
+
+
+def _run_monte_carlo_on_results(results: dict, initial_capital: float) -> None:
+    """Run a quick Monte Carlo on the test set trades."""
+    trades = results.get("trades", [])
+    if not trades:
+        return
+
+    try:
+        import numpy as np
+        from scripts.monte_carlo import run_simulation, print_results as mc_print
+        from config import RISK_MODEL
+
+        r_vals = np.array([t.get("r_multiple", 0) for t in trades], dtype=np.float64)
+        risk_pct = RISK_MODEL.get("risk_pct_per_trade_default", 0.005)
+        mc = run_simulation(r_vals, risk_pct, initial_capital, num_simulations=5000)
+        mc_print(mc)
+    except Exception as e:
+        logger.warning(f"Monte Carlo skipped: {e}")
+
+
 def run_backtest(
     symbol: str = None,
     timeframe: str = None,
@@ -35,6 +95,7 @@ def run_backtest(
     initial_capital: float = None,
     save_trades: bool = False,
     generate_charts: bool = True,
+    save_report: bool = True,
     verbose: bool = False,
     # Execution model options
     fill_model: str = None,
@@ -63,7 +124,8 @@ def run_backtest(
         end_date: End date for backtest
         initial_capital: Starting capital
         save_trades: Whether to save trades to database
-        generate_charts: Whether to generate visual report
+        generate_charts: Whether to generate chart images in the report
+        save_report: Whether to save backtest report artifacts
         verbose: Whether to log each trade
         fill_model: Entry fill model (CLOSE, LIMIT_AT_RETEST)
         intrabar_assumption: Intrabar ambiguity (WORST_CASE, BEST_CASE, RANDOM)
@@ -232,6 +294,13 @@ def run_backtest(
             _print_summary(results_test, "test")
 
         results = results_test or results_train
+
+        # Train vs test comparison table
+        if results_train and results_test and "error" not in results_train and "error" not in results_test:
+            _print_train_test_comparison(results_train, results_test, split_ratio)
+
+            # Auto-run Monte Carlo on test set
+            _run_monte_carlo_on_results(results_test, initial_capital)
     else:
         engine_full, results = _run_single(df)
         _print_summary(results, "full")
@@ -251,13 +320,35 @@ def run_backtest(
 
     # Validation
     validation = results["validation"]
+    min_trades_target = VALIDATION.get("min_trades", 200)
+    min_exp_target = VALIDATION.get("min_expectancy_r", 0.25)
+    max_dd_target = VALIDATION.get("max_drawdown_pct", 0.20)
     print("\nVALIDATION:")
-    print(f"  Min 500 trades: {'PASS' if validation['meets_min_trades'] else 'FAIL'} ({results['total_trades']})")
-    print(f"  Expectancy > 0.2R: {'PASS' if validation['meets_expectancy'] else 'FAIL'} ({results['expectancy_r']:.3f})")
-    print(f"  Max DD < 15%: {'PASS' if validation['meets_drawdown'] else 'FAIL'} ({results['max_drawdown_pct']:.1f}%)")
+    print(f"  Min {min_trades_target} trades: {'PASS' if validation['meets_min_trades'] else 'FAIL'} ({results['total_trades']})")
+    print(f"  Expectancy > {min_exp_target}R: {'PASS' if validation['meets_expectancy'] else 'FAIL'} ({results['expectancy_r']:.3f})")
+    print(f"  Max DD < {max_dd_target*100:.0f}%: {'PASS' if validation['meets_drawdown'] else 'FAIL'} ({results['max_drawdown_pct']:.1f}%)")
 
-    all_pass = all(validation.values())
+    all_pass = (
+        validation.get("meets_min_trades", False)
+        and validation.get("meets_expectancy", False)
+        and validation.get("meets_drawdown", False)
+    )
     print(f"\n  OVERALL: {'PASS - Ready for live testing' if all_pass else 'FAIL - Needs optimization'}")
+    print("=" * 60)
+
+    # Objective profile validation for $100 branch (300-500 trades + net positive)
+    print("\nOBJECTIVE PROFILE (300-500 + NET+):")
+    print(
+        f"  Trade Band 300-500: {'PASS' if validation.get('meets_trade_band_300_500', False) else 'FAIL'} "
+        f"({results['total_trades']})"
+    )
+    print(
+        f"  Net P&L Positive:   {'PASS' if validation.get('meets_net_positive', False) else 'FAIL'} "
+        f"(${results.get('net_pnl_usd', 0):,.2f})"
+    )
+    print(
+        f"  Objective Pass:     {'PASS' if validation.get('objective_pass', False) else 'FAIL'}"
+    )
     print("=" * 60)
 
     # Funnel stats (expanded)
@@ -313,12 +404,19 @@ def run_backtest(
                 eng.save_trades_to_db(db)
                 logger.info("Trades saved to database (%s)", label)
 
-    # Generate charts
-    if generate_charts:
+    # Generate report artifacts (text/json always; charts optional)
+    if save_report:
         for label, _, res in run_sets:
             if res.get("trades"):
-                report_dir = generate_visual_report(res, show_charts=False)
-                logger.info("Visual report saved to %s (%s)", report_dir, label)
+                report_dir = generate_visual_report(
+                    res,
+                    show_charts=False,
+                    render_charts=generate_charts,
+                )
+                logger.info(
+                    "Report saved to %s (%s) [charts=%s]",
+                    report_dir, label, "on" if generate_charts else "off"
+                )
 
     return results
 
@@ -351,11 +449,12 @@ Examples:
     parser.add_argument("--timeframe", type=str, help="Timeframe (default: M5)")
     parser.add_argument("--start", type=str, help="Start date (YYYY-MM-DD)")
     parser.add_argument("--end", type=str, help="End date (YYYY-MM-DD)")
-    parser.add_argument("--capital", type=float, help="Initial capital (default: 10000)")
+    parser.add_argument("--capital", type=float, help=f"Initial capital (default: {BACKTEST['initial_capital']})")
 
     # Output options
     parser.add_argument("--save", action="store_true", help="Save trades to database")
-    parser.add_argument("--no-charts", action="store_true", help="Skip chart generation")
+    parser.add_argument("--no-charts", action="store_true", help="Skip chart image generation (report text/json still saved)")
+    parser.add_argument("--no-report", action="store_true", help="Skip writing report artifacts to reports/")
     parser.add_argument("--verbose", "-v", action="store_true", help="Log each trade")
     parser.add_argument("--split", type=float, help="Train/test split ratio (e.g., 0.7)")
     parser.add_argument("--train-only", action="store_true", help="Run only the training split")
@@ -400,6 +499,7 @@ Examples:
         initial_capital=args.capital,
         save_trades=args.save,
         generate_charts=not args.no_charts,
+        save_report=not args.no_report,
         verbose=args.verbose,
         # Execution model
         fill_model=args.fill_model,
