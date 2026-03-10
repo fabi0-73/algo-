@@ -112,6 +112,7 @@ class TradeRecord:
 
     # Trailing stop tracking
     best_price_in_favor: float = 0.0  # Best high (LONG) or best low (SHORT) since entry
+    trailing_active: bool = False     # Whether trailing stop has activated
 
     # Metadata
     backtest_id: str = ""
@@ -1303,6 +1304,15 @@ class BacktestEngine:
                 )
                 if trailing_active and effective_sl != trade.sl_price:
                     trade.sl_price = effective_sl
+                if trailing_active:
+                    trade.trailing_active = True
+
+        # Disable TP when trailing is active — let the trail manage the exit
+        if STRATEGY.get("disable_tp_when_trailing", False) and trade.trailing_active:
+            if trade.direction == "LONG":
+                trade.tp_price = float('inf')
+            else:
+                trade.tp_price = 0.0
 
         # Use execution engine for exit decision (with partial TP support)
         if RISK_MODEL.get("partial_tp_enabled", False):

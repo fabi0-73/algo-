@@ -108,8 +108,8 @@ SESSION_FILTER = {
 
     # Kill Zone - focus on London/NY sessions
     # Times are in session_timezone (UTC by default)
-    "kill_zone_start": "07:00",  # London open
-    "kill_zone_end": "17:00",    # NY session end
+    "kill_zone_start": "06:00",  # Pre-London
+    "kill_zone_end": "20:00",    # Extended into late NY
 
     # Asian Session avoidance - DISABLED to allow Asian session trading
     # Note: Session spans midnight (23:00 -> 08:00)
@@ -124,17 +124,17 @@ SESSION_FILTER = {
     "require_consolidation_in_asian": False,
 
     # Daily trade limits
-    "max_trades_per_day": 2,  # Only best setups per day
+    "max_trades_per_day": 3,  # Allow more setups per day
 
     # Daily loss limit - stop new entries if daily drawdown exceeds this
     "daily_loss_limit_pct": 0.01,  # 1% daily loss limit
 
     # Cooldown after trade (reduce overtrading in chop)
-    "cooldown_minutes_after_trade": 30,
+    "cooldown_minutes_after_trade": 15,
 
     # Overnight holding avoidance
     # Close positions before rollover to avoid swap fees
-    "close_before_rollover": True,
+    "close_before_rollover": False,
     "close_before_rollover_minutes": 5,  # Close 5 min before rollover
     "no_new_entries_before_rollover_minutes": 15,  # No new entries 15 min before
 
@@ -324,25 +324,25 @@ STRATEGY = {
 
     # Phase 1: Consolidation - tight ranges only (genuine accumulation)
     "consolidation_lookback": 12,
-    "consolidation_range_atr_mult": 2.50,   # Reject wide, noisy ranges
-    "consolidation_close_pct": 0.70,         # Require 70% closes inside range
+    "consolidation_range_atr_mult": 3.50,   # Allow slightly wider ranges
+    "consolidation_close_pct": 0.60,         # Accept 60% closes inside range
 
     # Phase 2: Manipulation - decisive stop hunts only
     "manipulation_break_atr_mult": 0.20,     # Must break meaningfully beyond range
-    "manipulation_return_candles": 8,        # Reasonably fast reversals
+    "manipulation_return_candles": 10,       # Allow slightly slower reversals
 
     # Phase 3: Distribution - strong conviction breakout
     "distribution_break_atr_mult": 0.20,    # Real move must be significant
-    "distribution_body_mult": 1.50,         # Strong body expansion = institutional commitment
-    "distribution_follow_through_candles": 3,  # Require 3 candles follow-through
-    "distribution_require_extension": True,    # Follow-through must make new extreme
+    "distribution_body_mult": 1.30,         # Slightly lower body expansion bar
+    "distribution_follow_through_candles": 2,  # Reduced follow-through requirement
+    "distribution_require_extension": False,   # Don't require new extreme
 
     # Phase 4: Entry - quality at entry point
-    "rejection_wick_ratio": 0.35,          # Good wick rejection required
-    "retest_tolerance_atr_mult": 0.30,      # Price must come close to level
+    "rejection_wick_ratio": 0.25,          # Accept more wick patterns
+    "retest_tolerance_atr_mult": 0.40,      # Wider retest zone
 
     # Phase 5: Risk Management (uses RISK_MODEL now, kept for compatibility)
-    "min_rr": 2.5,                          # Strong risk/reward setups
+    "min_rr": 2.0,                          # 2:1 is still good R:R
     "max_risk_pct": 0.01,                   # 1% per trade
     "spread_buffer_pips": 10,               # Legacy; use RISK_MODEL stop_buffer_atr_mult
 
@@ -416,11 +416,11 @@ STRATEGY = {
 
     # Trailing stop - let winners breathe
     "trailing_stop_enabled": True,
-    "trailing_stop_activation_r": 1.5,      # Don't trail too early
-    "trailing_stop_atr_mult": 2.0,          # Wider trail = let winners run
+    "trailing_stop_activation_r": 2.0,      # Let winners develop before trailing
+    "trailing_stop_atr_mult": 2.5,          # Wider trail for bigger runs
 
     # Breakeven stop - protect at 1R
-    "move_sl_to_be_at_r": 1.0,             # Move SL to breakeven at 1R profit
+    "move_sl_to_be_at_r": 1.5,             # Move SL to breakeven at 1.5R profit
 
     # Short trade quality gate (shorts need higher confluence)
     "short_min_confluence_score": 3,
@@ -434,10 +434,13 @@ STRATEGY = {
     "min_judas_quality": 0,                 # Disabled as hard gate; scored in confluence
 
     # Consolidation quality gate
-    "min_consolidation_quality": 1,         # Basic quality required
+    "min_consolidation_quality": 0,         # Removed quality gate
 
     # Stale retest filter
-    "max_bars_after_distribution": 15,      # Reject retests too far after distribution
+    "max_bars_after_distribution": 20,      # Allow later retests
+
+    # Disable TP when trailing stop is active — let trail manage the exit
+    "disable_tp_when_trailing": True,
 }
 
 # =============================================================================
