@@ -130,34 +130,49 @@ def validate_distribution_strength(
     df: pd.DataFrame,
     distribution: DistributionResult,
     min_follow_through_candles: int = 2,
+    require_extension: bool = None,
 ) -> bool:
     """
     Validate that distribution has follow-through (not just a spike).
-    
+
     Args:
         df: Full DataFrame
         distribution: The distribution result
         min_follow_through_candles: Minimum candles that should continue in direction
-    
+        require_extension: If True, follow-through must make new extreme beyond break price
+
     Returns:
         True if distribution appears strong
     """
     if not distribution.valid:
         return False
-    
+
+    if require_extension is None:
+        require_extension = STRATEGY.get("distribution_require_extension", False)
+
     start_idx = distribution.break_candle_idx + 1
     end_idx = min(start_idx + min_follow_through_candles, len(df))
-    
+
     if end_idx <= start_idx:
         return True  # Not enough data to validate, assume valid
-    
+
     follow_through = df.iloc[start_idx:end_idx]
-    
+
     if distribution.direction == "UP":
         # Check if subsequent candles maintain bullish bias
         bullish_count = (follow_through["close"] > follow_through["open"]).sum()
-        return bullish_count >= min_follow_through_candles / 2
+        if bullish_count < min_follow_through_candles / 2:
+            return False
+        # Check for new high extension beyond break price
+        if require_extension and follow_through["high"].max() <= distribution.break_price:
+            return False
+        return True
     else:
         # Check if subsequent candles maintain bearish bias
         bearish_count = (follow_through["close"] < follow_through["open"]).sum()
-        return bearish_count >= min_follow_through_candles / 2
+        if bearish_count < min_follow_through_candles / 2:
+            return False
+        # Check for new low extension beyond break price
+        if require_extension and follow_through["low"].min() >= distribution.break_price:
+            return False
+        return True

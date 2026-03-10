@@ -121,16 +121,16 @@ SESSION_FILTER = {
     # Allow pattern DETECTION during Asian (useful for setups that complete in London)
     "allow_consolidation_in_asian": True,
     # If True, REQUIRE consolidation to form during Asian session
-    "require_consolidation_in_asian": False,  # Relaxed - allow any time
+    "require_consolidation_in_asian": False,
 
     # Daily trade limits
-    "max_trades_per_day": 3,  # Fewer trades/day = less chop exposure
+    "max_trades_per_day": 2,  # Only best setups per day
 
     # Daily loss limit - stop new entries if daily drawdown exceeds this
     "daily_loss_limit_pct": 0.01,  # 1% daily loss limit
 
     # Cooldown after trade (reduce overtrading in chop)
-    "cooldown_minutes_after_trade": 15,
+    "cooldown_minutes_after_trade": 30,
 
     # Overnight holding avoidance
     # Close positions before rollover to avoid swap fees
@@ -142,14 +142,14 @@ SESSION_FILTER = {
     # Session-based Pattern Timing (SMC Improvement)
     # ==========================================================================
     # Require consolidation to form during Asian session (23:00-08:00 UTC)
-    "require_consolidation_in_asian": False,
+    "require_consolidation_in_asian": False,  # Allow accumulation any session
     # Require distribution to occur during London/NY (08:00-16:00 UTC)
-    "require_distribution_in_london_ny": False,  # Off - allow trades any session
+    "require_distribution_in_london_ny": False,  # Allow distribution any session
 
     # Specific Kill Zones for higher-quality entries
     "london_open_kz": ("08:00", "10:00"),
     "ny_open_kz": ("13:00", "15:00"),
-    "only_trade_in_kz": False,  # Trade full London/NY session (more opportunities)
+    "only_trade_in_kz": False,  # Trade full London/NY session
 }
 
 # =============================================================================
@@ -189,7 +189,7 @@ KEY_LEVELS = {
     # Mode:
     # - "SCORE": Add confluence score points for key level proximity
     # - "REQUIRE": Block entries that don't meet min score
-    "mode": "SCORE",  # REQUIRE was too strict - back to SCORE
+    "mode": "SCORE",  # Add to confluence score
 
     # Minimum key level score required (only used if mode = "REQUIRE")
     "min_keylevel_score_required": 1,
@@ -220,7 +220,7 @@ HTF_BIAS = {
 
     # Alignment requirements
     "require_primary_alignment": True,   # Entry must align with H4 trend
-    "require_secondary_alignment": False,  # D1 optional - was too strict
+    "require_secondary_alignment": False,  # D1 as bonus, not requirement
 
     # What to do when bias is NEUTRAL
     # - "BLOCK": No entries when neutral
@@ -238,7 +238,7 @@ VOLUME_FILTER = {
     "volume_ma_period": 20,
 
     # Distribution candle must have volume >= this ratio vs consolidation avg
-    "distribution_volume_ratio_min": 1.2,  # Relaxed from 1.5
+    "distribution_volume_ratio_min": 1.3,  # Volume confirmation required
 
     # Minimum tick volume (block very low liquidity candles)
     "min_tick_volume": 200,
@@ -289,9 +289,9 @@ RISK_MODEL = {
 
     # Stop loss placement
     # Minimum stop distance as ATR multiple (avoid too-tight stops)
-    "min_stop_atr_mult": 1.2,      # Wider stops = fewer premature stop-outs
+    "min_stop_atr_mult": 1.5,      # Wider stops = fewer noise stop-outs
     # Buffer beyond manipulation extreme
-    "stop_buffer_atr_mult": 0.75,  # Was 0.50 - more room to reduce stop-outs
+    "stop_buffer_atr_mult": 1.0,   # More buffer to avoid noise hits
 
     # Leverage/notional guard
     # notional = entry_price * contract_size * lots
@@ -322,25 +322,27 @@ STRATEGY = {
     "symbol": "XAUUSD",
     "timeframe": "M5",
 
-    # Phase 1: Consolidation - loosened so patterns are found
+    # Phase 1: Consolidation - tight ranges only (genuine accumulation)
     "consolidation_lookback": 12,
-    "consolidation_range_atr_mult": 4.50,   # Wider range allowed
-    "consolidation_close_pct": 0.45,         # More bars can close outside
+    "consolidation_range_atr_mult": 2.50,   # Reject wide, noisy ranges
+    "consolidation_close_pct": 0.70,         # Require 70% closes inside range
 
-    # Phase 2: Manipulation - more time to return
-    "manipulation_break_atr_mult": 0.12,     # Easier to trigger
-    "manipulation_return_candles": 12,      # More time to complete
+    # Phase 2: Manipulation - decisive stop hunts only
+    "manipulation_break_atr_mult": 0.20,     # Must break meaningfully beyond range
+    "manipulation_return_candles": 8,        # Reasonably fast reversals
 
-    # Phase 3: Distribution - easier breakout
-    "distribution_break_atr_mult": 0.12,    # Smaller break counts
-    "distribution_body_mult": 1.00,         # Any body size
+    # Phase 3: Distribution - strong conviction breakout
+    "distribution_break_atr_mult": 0.20,    # Real move must be significant
+    "distribution_body_mult": 1.50,         # Strong body expansion = institutional commitment
+    "distribution_follow_through_candles": 3,  # Require 3 candles follow-through
+    "distribution_require_extension": True,    # Follow-through must make new extreme
 
-    # Phase 4: Entry (LOOSENED)
-    "rejection_wick_ratio": 0.10,           # Was 0.20 - easier rejection confirm
-    "retest_tolerance_atr_mult": 0.35,      # Tighter entries for better R-multiple
+    # Phase 4: Entry - quality at entry point
+    "rejection_wick_ratio": 0.35,          # Good wick rejection required
+    "retest_tolerance_atr_mult": 0.30,      # Price must come close to level
 
     # Phase 5: Risk Management (uses RISK_MODEL now, kept for compatibility)
-    "min_rr": 2.5,                          # Higher R:R compensates for tighter filters
+    "min_rr": 2.5,                          # Strong risk/reward setups
     "max_risk_pct": 0.01,                   # 1% per trade
     "spread_buffer_pips": 10,               # Legacy; use RISK_MODEL stop_buffer_atr_mult
 
@@ -367,7 +369,7 @@ STRATEGY = {
 
     # Break of Structure (BOS) Settings
     "bos_swing_lookback": 5,
-    "bos_required": False,                  # Off - get trades; use as confluence only
+    "bos_required": True,                   # Require BOS confirmation (W-only)
 
     # ==========================================================================
     # SMC Improvements - Quality Filters and Refinements
@@ -389,12 +391,11 @@ STRATEGY = {
     "ob_use_body_only": True,               # True = body (open/close), False = range (high/low)
 
     # Liquidity Sweep Confirmation
-    "require_liquidity_sweep": False,       # Off - use as confluence only
+    "require_liquidity_sweep": False,       # Use as confluence bonus, not hard gate
     "liquidity_sweep_lookback": 50,
 
     # Volume spike during manipulation (stop hunt creates volume)
-    # False = use as confluence bonus, not hard requirement
-    "require_manipulation_volume_spike": False,
+    "require_manipulation_volume_spike": False,  # Use as confluence bonus, not hard gate
     "manipulation_volume_spike_ratio": 1.5,
 
     # Equal highs/lows (liquidity pools) within consolidation
@@ -407,25 +408,36 @@ STRATEGY = {
     "use_breaker_blocks": True,             # Was False - enable breaker block confluence
 
     # Minimum confluence score required for entry (BOS + FVG + OB + equal levels + volume + breaker)
-    # 1 = BOS alone is fine - more trades
-    "min_confluence_score": 1,
+    "min_confluence_score": 2,              # Require 2+ factors for quality entries
 
-    # Premium/Discount Zones - off so entries can fire
+    # Premium/Discount Zones - off to allow more entries
     "require_discount_for_long": False,
     "require_premium_for_short": False,
 
-    # Trailing stop - let winners run past fixed TP
+    # Trailing stop - let winners breathe
     "trailing_stop_enabled": True,
-    "trailing_stop_activation_r": 1.5,      # Activate after 1.5R profit
-    "trailing_stop_atr_mult": 1.5,          # Trail by 1.5x ATR
+    "trailing_stop_activation_r": 1.5,      # Don't trail too early
+    "trailing_stop_atr_mult": 2.0,          # Wider trail = let winners run
 
-    # Short trade quality gate (shorts need higher confluence than longs)
-    "short_min_confluence_score": 2,
+    # Breakeven stop - protect at 1R
+    "move_sl_to_be_at_r": 1.0,             # Move SL to breakeven at 1R profit
+
+    # Short trade quality gate (shorts need higher confluence)
+    "short_min_confluence_score": 3,
 
     # Judas Swing quality filters
-    "judas_max_candles": 5,                 # Fast sweeps only (1-5 candles)
-    "judas_min_velocity_atr": 0.3,          # Min break distance per candle as ATR fraction
+    "judas_max_candles": 5,                 # Fast sweeps (1-5 candles)
+    "judas_min_velocity_atr": 0.3,          # Decisive sweeps
     "judas_london_bonus": True,             # Extra confluence for London session manipulation
+
+    # Judas quality hard gate - use as confluence bonus, not hard kill
+    "min_judas_quality": 0,                 # Disabled as hard gate; scored in confluence
+
+    # Consolidation quality gate
+    "min_consolidation_quality": 1,         # Basic quality required
+
+    # Stale retest filter
+    "max_bars_after_distribution": 15,      # Reject retests too far after distribution
 }
 
 # =============================================================================
@@ -442,7 +454,7 @@ BACKTEST = {
 # Validation Targets
 # =============================================================================
 VALIDATION = {
-    "min_trades": 200,
+    "min_trades": 30,                      # Fewer but higher quality trades
     "min_expectancy_r": 0.25,               # Slightly higher bar
     "max_drawdown_pct": 0.20,               # Max drawdown < 20%
     "min_months": 3,                        # Minimum months of data

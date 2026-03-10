@@ -14,7 +14,7 @@ import uuid
 
 from config import STRATEGY, BACKTEST, VALIDATION, EXECUTION, TIME_CONFIG, SESSION_FILTER
 from src.strategy.indicators import add_indicators, calculate_atr
-from src.strategy.consolidation import detect_consolidation, ConsolidationResult, detect_equal_levels
+from src.strategy.consolidation import detect_consolidation, ConsolidationResult, detect_equal_levels, score_consolidation_quality
 from src.strategy.manipulation import (
     detect_manipulation,
     ManipulationResult,
@@ -570,7 +570,7 @@ class BacktestEngine:
         4. Check if current price offers retest entry
         """
         lookback = self.lookback
-        atr = float(self._atrs[current_idx])
+        atr = self._atrs[current_idx]
 
         if pd.isna(atr) or atr == 0:
             return
@@ -601,8 +601,8 @@ class BacktestEngine:
             self.rejection_stats["consolidations_found"] += 1
             self.amd_stats["consolidations_found"] += 1
 
-            range_high = float(np.max(hw))
-            range_low = float(np.min(lw))
+            range_high = np.max(hw)
+            range_low = np.min(lw)
 
             # Create consolidation result
             consol = ConsolidationResult(
@@ -618,6 +618,15 @@ class BacktestEngine:
             if STRATEGY.get("detect_equal_levels", True):
                 consol = detect_equal_levels(df, consol, highs_arr=self._highs, lows_arr=self._lows)
 
+            # Quality gate: reject low-quality consolidations
+            min_consol_quality = STRATEGY.get("min_consolidation_quality", 0)
+            if min_consol_quality > 0:
+                quality = score_consolidation_quality(consol)
+                if quality < min_consol_quality:
+                    self.rejection_stats.setdefault("low_consolidation_quality", 0)
+                    self.rejection_stats["low_consolidation_quality"] += 1
+                    continue
+
             # Now check for manipulation AFTER consolidation
             manip = self._check_manipulation_after(df, consol, current_idx)
             if not manip.valid:
@@ -627,6 +636,13 @@ class BacktestEngine:
 
             # Score Judas swing quality (candle count, velocity, session)
             manip = score_judas_quality_fast(self._timestamps, self._midnight_opens, manip)
+
+            # Hard gate: reject low-quality Judas swings
+            min_judas = STRATEGY.get("min_judas_quality", 0)
+            if min_judas > 0 and getattr(manip, "judas_quality", 0) < min_judas:
+                self.rejection_stats.setdefault("no_judas_quality", 0)
+                self.rejection_stats["no_judas_quality"] += 1
+                continue
 
             # Confirm liquidity sweep if required
             if STRATEGY.get("require_liquidity_sweep", False):
@@ -699,7 +715,7 @@ class BacktestEngine:
                     continue
 
             # Detect FVG and Order Blocks for confluence
-            # Skip expensive searches if using RETEST_ONLY mode
+            # Always search for FVG/OB to build confluence score
             fvg_at_level = None
             ob_at_level = None
             entry_mode = STRATEGY.get("entry_mode", ENTRY_MODE_RETEST_ONLY)
@@ -713,27 +729,25 @@ class BacktestEngine:
                 fvg_direction = "BEARISH"
                 ob_direction = "BEARISH"
 
-            # Only search for FVG/OB if entry mode requires them
-            if entry_mode != ENTRY_MODE_RETEST_ONLY:
-                # Find FVG near retest level
-                fvg_at_level = find_fvg_at_retest_level(
-                    df, retest_level,
-                    search_start_idx=consol.start_idx,
-                    search_end_idx=min(dist.break_candle_idx + 10, current_idx),
-                    direction=fvg_direction,
-                    atr=atr,
-                    tolerance_mult=STRATEGY.get("retest_tolerance_atr_mult", 0.4)
-                )
+            # Find FVG near retest level (needed for confluence scoring)
+            fvg_at_level = find_fvg_at_retest_level(
+                df, retest_level,
+                search_start_idx=consol.start_idx,
+                search_end_idx=min(dist.break_candle_idx + 10, current_idx),
+                direction=fvg_direction,
+                atr=atr,
+                tolerance_mult=STRATEGY.get("retest_tolerance_atr_mult", 0.4)
+            )
 
-                # Find Order Block near retest level
-                ob_at_level = find_ob_at_retest_level(
-                    df, retest_level,
-                    search_start_idx=consol.start_idx,
-                    search_end_idx=min(dist.break_candle_idx + 10, current_idx),
-                    direction=ob_direction,
-                    atr=atr,
-                    tolerance_mult=STRATEGY.get("retest_tolerance_atr_mult", 0.4)
-                )
+            # Find Order Block near retest level (needed for confluence scoring)
+            ob_at_level = find_ob_at_retest_level(
+                df, retest_level,
+                search_start_idx=consol.start_idx,
+                search_end_idx=min(dist.break_candle_idx + 10, current_idx),
+                direction=ob_direction,
+                atr=atr,
+                tolerance_mult=STRATEGY.get("retest_tolerance_atr_mult", 0.4)
+            )
 
             # Track distributions with BOS + confluence (AMD conformity)
             equal_level_swept = False
@@ -863,8 +877,8 @@ class BacktestEngine:
 
     def _is_consolidation_arrays(self, high_arr: np.ndarray, low_arr: np.ndarray, close_arr: np.ndarray, atr: float) -> bool:
         """Check consolidation using numpy arrays (faster hot path)."""
-        range_high = float(np.max(high_arr))
-        range_low = float(np.min(low_arr))
+        range_high = np.max(high_arr)
+        range_low = np.min(low_arr)
         range_size = range_high - range_low
 
         max_range = STRATEGY["consolidation_range_atr_mult"] * atr
@@ -1243,6 +1257,33 @@ class BacktestEngine:
                 getattr(trade, "best_price_in_favor", trade.entry_price),
                 candle["low"],
             )
+
+        # Move SL to breakeven at configured R level (before trailing stop)
+        be_trigger_r = STRATEGY.get("move_sl_to_be_at_r", 0)
+        if be_trigger_r > 0 and atr and atr > 0 and not getattr(trade, "sl_moved_to_be", False):
+            sl_for_be = trade.original_sl if trade.original_sl > 0 else trade.sl_price
+            stop_distance_be = (
+                trade.entry_price - sl_for_be
+                if trade.direction == "LONG"
+                else sl_for_be - trade.entry_price
+            )
+            if stop_distance_be > 0:
+                if trade.direction == "LONG":
+                    current_r = (trade.best_price_in_favor - trade.entry_price) / stop_distance_be
+                else:
+                    current_r = (trade.entry_price - trade.best_price_in_favor) / stop_distance_be
+
+                if current_r >= be_trigger_r:
+                    be_buffer = atr * 0.1
+                    if trade.direction == "LONG":
+                        new_be_sl = trade.entry_price + be_buffer
+                        if new_be_sl > trade.sl_price:
+                            trade.sl_price = new_be_sl
+                    else:
+                        new_be_sl = trade.entry_price - be_buffer
+                        if new_be_sl < trade.sl_price:
+                            trade.sl_price = new_be_sl
+                    trade.sl_moved_to_be = True
 
         # Apply trailing stop if enabled
         if STRATEGY.get("trailing_stop_enabled", False) and atr and atr > 0:

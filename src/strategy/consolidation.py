@@ -120,6 +120,46 @@ def detect_consolidation(
     )
 
 
+def score_consolidation_quality(consol: ConsolidationResult) -> int:
+    """
+    Score consolidation quality (0-5). Higher = better setup.
+
+    Scoring:
+    +1 if range_size / atr < 1.5 (tight range)
+    +1 if close_inside_pct >= 0.80 (clean consolidation)
+    +1 if has equal highs or equal lows (liquidity pool present)
+    +1 if has BOTH equal highs AND equal lows (double liquidity)
+    +1 if duration >= 10 bars (sustained accumulation)
+    """
+    if not consol.valid or consol.atr <= 0:
+        return 0
+
+    score = 0
+
+    # Tight range relative to ATR
+    if consol.range_size / consol.atr < 1.5:
+        score += 1
+
+    # High percentage of closes inside range
+    if consol.close_inside_pct >= 0.80:
+        score += 1
+
+    # Has at least one equal level (liquidity pool)
+    if consol.has_equal_highs or consol.has_equal_lows:
+        score += 1
+
+    # Has both equal highs AND lows (double liquidity)
+    if consol.has_equal_highs and consol.has_equal_lows:
+        score += 1
+
+    # Sustained consolidation (longer duration)
+    duration = consol.end_idx - consol.start_idx
+    if duration >= 10:
+        score += 1
+
+    return score
+
+
 def find_consolidation_zones(
     df: pd.DataFrame,
     lookback: int = None,
