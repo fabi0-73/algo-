@@ -5,9 +5,13 @@ All strategy parameters and system settings in one place.
 GOLD INTRADAY STRATEGY - Default settings optimized for XAUUSD M5.
 """
 import os
+from pathlib import Path
+
 from dotenv import load_dotenv
 
-load_dotenv()
+# Load .env from project root (directory containing config.py) so it works regardless of cwd
+_env_path = Path(__file__).resolve().parent / ".env"
+load_dotenv(dotenv_path=_env_path)
 
 # =============================================================================
 # MetaTrader 5 Configuration
@@ -17,6 +21,16 @@ MT5_CONFIG = {
     "password": os.getenv("MT5_PASSWORD", ""),
     "server": os.getenv("MT5_SERVER", ""),
     "path": os.getenv("MT5_PATH", ""),  # Path to terminal64.exe if needed
+}
+
+# =============================================================================
+# Telegram (Live Signal Notifications)
+# =============================================================================
+TELEGRAM = {
+    "enabled": os.getenv("TELEGRAM_ENABLED", "false").lower() == "true",
+    "bot_token": os.getenv("TELEGRAM_BOT_TOKEN", ""),
+    "chat_id": os.getenv("TELEGRAM_CHAT_ID", ""),
+    "disable_notification": False,  # silent messages
 }
 
 # =============================================================================
@@ -108,7 +122,7 @@ SESSION_FILTER = {
 
     # Kill Zone - focus on London/NY sessions
     # Times are in session_timezone (UTC by default)
-    "kill_zone_start": "06:00",  # Pre-London
+    "kill_zone_start": "06:00",  # Pre-London (blackout handles worst hours)
     "kill_zone_end": "20:00",    # Extended into late NY
 
     # Asian Session avoidance - DISABLED to allow Asian session trading
@@ -131,6 +145,9 @@ SESSION_FILTER = {
 
     # Cooldown after trade (reduce overtrading in chop)
     "cooldown_minutes_after_trade": 15,
+
+    # Blackout hours — block specific UTC hours with proven negative expectancy
+    "blackout_hours_utc": [9],  # Block 09:00 UTC (11.1% WR, -$62)
 
     # Overnight holding avoidance
     # Close positions before rollover to avoid swap fees
@@ -225,7 +242,7 @@ HTF_BIAS = {
     # What to do when bias is NEUTRAL
     # - "BLOCK": No entries when neutral
     # - "ALLOW": Allow entries even when neutral
-    "neutral_policy": "BLOCK",
+    "neutral_policy": "BLOCK",  # Block entries during H4 neutral (ALLOW was no-op for trade count)
 }
 
 # =============================================================================
@@ -437,10 +454,13 @@ STRATEGY = {
     "min_consolidation_quality": 0,         # Removed quality gate
 
     # Stale retest filter
-    "max_bars_after_distribution": 20,      # Allow later retests
+    "max_bars_after_distribution": 30,      # Allow later retests (widened from 20)
 
     # Disable TP when trailing stop is active — let trail manage the exit
     "disable_tp_when_trailing": True,
+
+    # Max trade duration in bars (M5 candles)
+    "max_trade_duration": 240,  # 240 bars = 20h on M5 (compromise: less MTM DD than 300, more room than 200)
 }
 
 # =============================================================================

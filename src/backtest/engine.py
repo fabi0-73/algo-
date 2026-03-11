@@ -161,7 +161,7 @@ class BacktestEngine:
         initial_capital: float = None,
         max_risk_pct: float = None,
         min_rr: float = None,
-        max_trade_duration: int = 100,
+        max_trade_duration: int = None,
         # Execution options
         fill_model: str = None,
         intrabar_assumption: str = None,
@@ -179,7 +179,7 @@ class BacktestEngine:
         self.initial_capital = initial_capital or BACKTEST["initial_capital"]
         self.max_risk_pct = max_risk_pct or STRATEGY["max_risk_pct"]
         self.min_rr = min_rr or STRATEGY["min_rr"]
-        self.max_trade_duration = max_trade_duration
+        self.max_trade_duration = max_trade_duration if max_trade_duration is not None else STRATEGY.get("max_trade_duration", 200)
 
         self.backtest_id = str(uuid.uuid4())[:8]
         self.trades: List[TradeRecord] = []
@@ -241,6 +241,7 @@ class BacktestEngine:
             "filtered_daily_limit": 0,
             "filtered_cooldown": 0,
             "filtered_rollover": 0,
+            "filtered_blackout_hour": 0,
             "filtered_premium_discount": 0,
             "filtered_consolidation_not_asian": 0,
             "filtered_distribution_not_london_ny": 0,
@@ -369,6 +370,7 @@ class BacktestEngine:
             "filtered_daily_limit": 0,
             "filtered_cooldown": 0,
             "filtered_rollover": 0,
+            "filtered_blackout_hour": 0,
             "filtered_premium_discount": 0,
             "filtered_consolidation_not_asian": 0,
             "filtered_distribution_not_london_ny": 0,
@@ -494,7 +496,9 @@ class BacktestEngine:
         # 1. Session/Time filter (kill zone, Asian session, daily limits)
         can_enter, reason = self.time_filter.can_enter_trade(ts, self.initial_capital)
         if not can_enter:
-            if "killzone" in reason or "asian" in reason:
+            if "blackout" in reason:
+                self.rejection_stats["filtered_blackout_hour"] += 1
+            elif "killzone" in reason or "asian" in reason:
                 self.rejection_stats["filtered_session"] += 1
             elif "daily_limit" in reason:
                 self.rejection_stats["filtered_daily_limit"] += 1

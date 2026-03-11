@@ -472,12 +472,12 @@ class TestSessionFilter:
         """Test that killzone correctly identifies valid times."""
         engine = TimeFilterEngine(enabled=True)
 
-        # 09:00 UTC should be in killzone (07:00-17:00)
+        # 09:00 UTC should be in killzone (07:00-20:00)
         ts_in_killzone = datetime(2024, 1, 15, 9, 0, 0, tzinfo=pytz.UTC)
         assert engine.is_in_kill_zone(ts_in_killzone)
 
-        # 18:00 UTC should be outside killzone
-        ts_outside = datetime(2024, 1, 15, 18, 0, 0, tzinfo=pytz.UTC)
+        # 21:00 UTC should be outside killzone (kill_zone_end is 20:00)
+        ts_outside = datetime(2024, 1, 15, 21, 0, 0, tzinfo=pytz.UTC)
         assert not engine.is_in_kill_zone(ts_outside)
 
     def test_asian_session_detection(self):

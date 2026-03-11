@@ -84,6 +84,8 @@ class TimeFilterEngine:
         self.close_before_rollover_minutes = close_before_rollover_minutes if close_before_rollover_minutes is not None else SESSION_FILTER["close_before_rollover_minutes"]
         self.no_new_entries_before_rollover_minutes = no_new_entries_before_rollover_minutes if no_new_entries_before_rollover_minutes is not None else SESSION_FILTER["no_new_entries_before_rollover_minutes"]
 
+        self.blackout_hours = SESSION_FILTER.get("blackout_hours_utc", [])
+
         self.data_tz = ZoneInfo(data_timezone or TIME_CONFIG["data_timezone"])
         self.session_tz = ZoneInfo(session_timezone or TIME_CONFIG["session_timezone"])
 
@@ -413,6 +415,12 @@ class TimeFilterEngine:
             in_specific_kz, _ = self.is_in_specific_kill_zone(ts)
             if not in_specific_kz:
                 return False, "outside_specific_killzone"
+
+        # Check blackout hours
+        if self.blackout_hours:
+            session_ts = self.convert_to_session_tz(ts)
+            if session_ts.hour in self.blackout_hours:
+                return False, "blackout_hour"
 
         # Check Asian session
         if self.avoid_asian and self.is_in_asian_session(ts):

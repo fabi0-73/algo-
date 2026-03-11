@@ -200,7 +200,7 @@ def run_backtest(
     def _run_single(df_slice):
         engine = BacktestEngine(
             initial_capital=initial_capital,
-            max_trade_duration=200,
+            max_trade_duration=STRATEGY.get("max_trade_duration", 200),
             # Execution model
             fill_model=fill_model,
             intrabar_assumption=intrabar_assumption,
@@ -237,6 +237,7 @@ def run_backtest(
                 print(f"  -> Entry too late:       {funnel.get('entry_too_late', 0)}")
                 print("\n  FILTER REJECTIONS:")
                 print(f"  -> Session/Killzone:     {funnel.get('filtered_session', 0)}")
+                print(f"  -> Blackout hour:        {funnel.get('filtered_blackout_hour', 0)}")
                 print(f"  -> News blackout:        {funnel.get('filtered_news', 0)}")
                 print(f"  -> HTF bias:             {funnel.get('filtered_htf_bias', 0)}")
                 print(f"  -> Key levels:           {funnel.get('filtered_key_levels', 0)}")
@@ -367,6 +368,7 @@ def run_backtest(
         print(f"  -> Pattern duplicates:   {funnel.get('pattern_duplicates', 0)}")
         print("\n  FILTER REJECTIONS:")
         print(f"  -> Session/Killzone:     {funnel.get('filtered_session', 0)}")
+        print(f"  -> Blackout hour:        {funnel.get('filtered_blackout_hour', 0)}")
         print(f"  -> News blackout:        {funnel.get('filtered_news', 0)}")
         print(f"  -> HTF bias:             {funnel.get('filtered_htf_bias', 0)}")
         print(f"  -> Key levels:           {funnel.get('filtered_key_levels', 0)}")

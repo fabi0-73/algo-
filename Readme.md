@@ -27,17 +27,24 @@ pip install -r requirements.txt
 
 ### 2. Configure Environment
 
-Copy `env.example.txt` to `.env` and fill in your credentials:
+Copy `.env.example` to `.env` and fill in your values:
 
+```bash
+# Windows
+copy .env.example .env
+
+# Linux / Mac
+cp .env.example .env
 ```
-MT5_LOGIN=your_login
-MT5_PASSWORD=your_password
-MT5_SERVER=your_broker_server
-DB_HOST=localhost
-DB_NAME=amd_trading
-DB_USER=postgres
-DB_PASSWORD=your_password
-```
+
+Edit `.env` with your credentials:
+
+| Variable | Description |
+|----------|-------------|
+| `MT5_LOGIN`, `MT5_PASSWORD`, `MT5_SERVER` | MetaTrader 5 (live data); set to 0/empty to skip MT5 |
+| `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | PostgreSQL (optional fallback for candles) |
+| `DATA_TIMEZONE`, `SESSION_TIMEZONE` | Broker timezone (default: UTC) |
+| `TELEGRAM_ENABLED`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | Telegram bot for live signal alerts |
 
 ### 3. Create Database
 
@@ -118,7 +125,17 @@ python scripts/run_live.py --balance 500 --interval 60
 
 # Log signals to file
 python scripts/run_live.py --output signals.jsonl
+
+# Send signals to Telegram (requires TELEGRAM_* in .env)
+python scripts/run_live.py --telegram
+
+# Test Telegram connection (sends one message and exits)
+python scripts/run_live.py --telegram-test
 ```
+
+**Testing the Telegram node:** Ensure `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are set in `.env`, then run `python scripts/run_live.py --telegram-test`. You should receive a single message in the chat.
+
+**"Chat not found" (400):** The bot can only send to chats it knows. (1) In Telegram, open your bot and send `/start` (or tap Start). (2) Get your chat ID: open `https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getUpdates` in a browser (paste your token in place of `<YOUR_BOT_TOKEN>`). In the JSON, find `"chat":{"id": 123456789}` — that number is `TELEGRAM_CHAT_ID` for a private chat. For a group, add the bot to the group, send any message there, then call getUpdates again; use the negative `chat.id` (e.g. `-1001234567890`) in `.env`. Restart the script after changing `.env`.
 
 ## Project Structure
 

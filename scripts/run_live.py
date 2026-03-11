@@ -27,9 +27,10 @@ import logging
 import time
 from datetime import datetime
 
-from config import STRATEGY, BACKTEST, MT5_CONFIG
+from config import STRATEGY, BACKTEST, MT5_CONFIG, TELEGRAM
 from src.live.signals import LiveSignalScanner
 from src.live.monitor import LiveMonitor
+from src.live.telegram_notifier import TelegramNotifier
 
 logging.basicConfig(
     level=logging.INFO,
@@ -78,6 +79,7 @@ def run_signal_loop(
     interval_seconds: int,
     once: bool = False,
     output_file: str = None,
+    use_telegram: bool = None,
 ):
     """
     Continuous signal scanning loop.
@@ -89,6 +91,7 @@ def run_signal_loop(
         interval_seconds: Seconds between scans
         once: If True, scan once and exit
         output_file: Optional file path to append signals as JSON lines
+        use_telegram: If True, send signals to Telegram. If None, use TELEGRAM["enabled"] from config.
     """
     scanner = LiveSignalScanner(symbol=symbol, account_balance=balance)
     monitor = LiveMonitor(
@@ -97,6 +100,16 @@ def run_signal_loop(
         max_account_dd_pct=0.15,
         max_trades_per_day=3,
     )
+
+    telegram_notifier = None
+    if use_telegram if use_telegram is not None else TELEGRAM.get("enabled", False):
+        token = TELEGRAM.get("bot_token", "").strip()
+        chat_id = TELEGRAM.get("chat_id", "").strip()
+        if token and chat_id:
+            telegram_notifier = TelegramNotifier(bot_token=token, chat_id=chat_id)
+            logger.info("Telegram: enabled")
+        else:
+            logger.warning("Telegram requested but TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID missing; skipping Telegram")
 
     logger.info("=" * 60)
     logger.info("AMD LIVE SIGNAL SCANNER")
@@ -150,6 +163,9 @@ def run_signal_loop(
                     with open(output_file, "a") as f:
                         f.write(json.dumps(sig_dict) + "\n")
 
+                if telegram_notifier:
+                    telegram_notifier.send_signal(sig)
+
                 logger.info(
                     f"SIGNAL: {sig.direction} {sig.symbol} @ {sig.entry_price} | "
                     f"SL: {sig.stop_loss} | TP: {sig.take_profit} | "
@@ -183,17 +199,36 @@ Examples:
 
   # Log signals to file
   python scripts/run_live.py --output signals.jsonl
+
+  # Send signals to Telegram
+  python scripts/run_live.py --telegram
+
+  # Test Telegram connection (sends one message and exits)
+  python scripts/run_live.py --telegram-test
         """,
     )
 
+    parser.add_argument("--telegram-test", action="store_true", help="Send a test message to Telegram and exit (verify bot token and chat_id)")
     parser.add_argument("--symbol", type=str, default=None, help="Symbol (default from config)")
     parser.add_argument("--timeframe", type=str, default=None, help="Timeframe (default from config)")
     parser.add_argument("--balance", type=float, default=None, help="Account balance")
     parser.add_argument("--interval", type=int, default=300, help="Scan interval in seconds (default 300)")
     parser.add_argument("--once", action="store_true", help="Single scan, no loop")
     parser.add_argument("--output", type=str, default=None, help="Output file for signal JSON lines")
+    parser.add_argument("--telegram", action="store_true", help="Send signals to Telegram (uses TELEGRAM_* env vars)")
 
     args = parser.parse_args()
+
+    if args.telegram_test:
+        token = TELEGRAM.get("bot_token", "").strip()
+        chat_id = TELEGRAM.get("chat_id", "").strip()
+        if not token or not chat_id:
+            logger.error("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set in .env for --telegram-test")
+            sys.exit(1)
+        notifier = TelegramNotifier(bot_token=token, chat_id=chat_id)
+        ok = notifier.send_test_message()
+        logger.info("Telegram test: %s", "OK" if ok else "FAILED")
+        sys.exit(0 if ok else 1)
 
     symbol = args.symbol or STRATEGY["symbol"]
     timeframe = args.timeframe or STRATEGY["timeframe"]
@@ -206,6 +241,7 @@ Examples:
         interval_seconds=args.interval,
         once=args.once,
         output_file=args.output,
+        use_telegram=True if args.telegram else None,
     )
 
 
