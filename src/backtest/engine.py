@@ -114,6 +114,10 @@ class TradeRecord:
     best_price_in_favor: float = 0.0  # Best high (LONG) or best low (SHORT) since entry
     trailing_active: bool = False     # Whether trailing stop has activated
 
+    # Confidence sizing
+    confidence_tier: str = ""        # "high", "medium", "standard", or "base"
+    risk_pct_used: float = 0.0      # Actual risk % used for this trade
+
     # Metadata
     backtest_id: str = ""
 
@@ -334,6 +338,26 @@ class BacktestEngine:
         self._atrs = df["atr"].values
         self._tick_volumes = df["tick_volume"].values if "tick_volume" in df.columns else None
 
+        # Pre-compute rolling max/min and consolidation validity for all windows
+        from numpy.lib.stride_tricks import sliding_window_view
+        lookback = self.lookback
+        _hw = sliding_window_view(self._highs, lookback + 1)
+        _lw = sliding_window_view(self._lows, lookback + 1)
+        self._roll_high_max = _hw.max(axis=1)   # shape (N - lookback,)
+        self._roll_low_min = _lw.min(axis=1)
+
+        # Pre-compute range sizes and close_pct for every window
+        self._roll_range_size = self._roll_high_max - self._roll_low_min
+
+        # Pre-compute close_pct pass/fail for all windows
+        close_pct_threshold = STRATEGY["consolidation_close_pct"]
+        _cw = sliding_window_view(self._closes, lookback + 1)
+        # For each window, count closes inside [range_low, range_high]
+        _range_low_2d = self._roll_low_min[:, np.newaxis]   # broadcast
+        _range_high_2d = self._roll_high_max[:, np.newaxis]
+        _inside = ((_cw >= _range_low_2d) & (_cw <= _range_high_2d)).sum(axis=1)
+        self._roll_close_pct_pass = (_inside / (lookback + 1)) >= close_pct_threshold
+
         # Pre-compute midnight open lookup: O(1) per query instead of 300-bar backward scan
         self._midnight_opens = self._build_midnight_opens()
 
@@ -412,26 +436,51 @@ class BacktestEngine:
         # Main loop - process each bar
         total_bars = len(df) - self.min_lookback
         progress_interval = max(1000, total_bars // 50)  # Log every ~2%
-        
+        # Pre-compute a rolling minimum of range_size over the scan window
+        # This allows us to skip bars where NO consolidation window can pass the range check
+        _min_offset = STRATEGY.get("pattern_min_bars_after_consolidation", 10)
+        _max_offset_cfg = STRATEGY.get("pattern_max_bars_after_consolidation", 60)
+        # The scan window for bar i covers consol_start from (i - max_offset - lookback) to (i - min_offset - lookback)
+        # That's a range of (max_offset - min_offset)/2 + 1 windows
+        # We want min(range_size) over a sliding window of that width on self._roll_range_size
+        _scan_half_width = (_max_offset_cfg - _min_offset) // 2 + 1
+        if _scan_half_width > 0 and len(self._roll_range_size) > _scan_half_width:
+            _rs_view = sliding_window_view(self._roll_range_size, _scan_half_width)
+            self._roll_range_min_in_scan = _rs_view.min(axis=1)
+        else:
+            self._roll_range_min_in_scan = self._roll_range_size
+
+        import time as _time
+        _t_scan = 0.0
+        _t_exit = 0.0
+        _t_loop_start = _time.perf_counter()
+        self._perf_consol_pass = 0
+        self._perf_scan_calls = 0
+
         for i in range(self.min_lookback, len(df)):
             # Progress logging (so long runs don't appear stuck)
             if (i - self.min_lookback) % progress_interval == 0:
                 progress_pct = ((i - self.min_lookback) / total_bars) * 100
-                logger.info(f"Processing bar {i}/{len(df)} ({progress_pct:.1f}%) - Trades: {len(self.trades)}")
+                _elapsed = _time.perf_counter() - _t_loop_start
+                logger.info(f"Processing bar {i}/{len(df)} ({progress_pct:.1f}%) - Trades: {len(self.trades)} | elapsed={_elapsed:.1f}s scan={_t_scan:.1f}s exit={_t_exit:.1f}s | scan_calls={self._perf_scan_calls} consol_pass={self._perf_consol_pass}")
 
             # Check open position first (df.iloc only when in position -- rare)
             if self.state.in_position:
+                _t0 = _time.perf_counter()
                 self._check_exit(df, i, df.iloc[i], verbose)
+                _t_exit += _time.perf_counter() - _t0
 
             # Look for new setups if not in position
             if not self.state.in_position:
+                _t0 = _time.perf_counter()
                 self._scan_for_patterns(df, i, verbose)
+                _t_scan += _time.perf_counter() - _t0
 
             # Update equity curves
             self.equity_curve.append(self.current_balance)
 
-            # Calculate MTM equity
-            mtm_equity = self._calculate_mtm_equity(df, i)
+            # Calculate MTM equity (skip function call when not in position ~95% of bars)
+            mtm_equity = self.current_balance if not self.state.in_position else self._calculate_mtm_equity(df, i)
             self.mtm_equity_curve.append(mtm_equity)
 
         # Close any open position at end
@@ -564,6 +613,25 @@ class BacktestEngine:
 
         return True, ""
 
+    def _get_confidence_tier(self, confluence_score: int, entry_hour: int) -> tuple:
+        """Return (tier_name, risk_pct) based on confluence score and entry hour."""
+        from config import CONFIDENCE_SIZING, RISK_MODEL
+
+        if not CONFIDENCE_SIZING.get("enabled", False):
+            return ("base", RISK_MODEL["risk_pct_per_trade_default"])
+
+        prime_start = CONFIDENCE_SIZING.get("prime_hours_start", 13)
+        prime_end = CONFIDENCE_SIZING.get("prime_hours_end", 17)
+        is_prime = prime_start <= entry_hour <= prime_end
+
+        for tier in CONFIDENCE_SIZING.get("tiers", []):
+            if confluence_score >= tier["min_confluence_score"]:
+                if tier.get("prime_hours_only", False) and not is_prime:
+                    continue
+                return (tier["name"], tier["risk_pct"])
+
+        return ("base", CONFIDENCE_SIZING.get("base_risk_pct", 0.003))
+
     def _scan_for_patterns(self, df: pd.DataFrame, current_idx: int, verbose: bool):
         """
         Scan for complete AMD patterns looking backwards.
@@ -577,6 +645,8 @@ class BacktestEngine:
         lookback = self.lookback
         atr = self._atrs[current_idx]
 
+        self._perf_scan_calls += 1
+
         if pd.isna(atr) or atr == 0:
             return
 
@@ -584,32 +654,58 @@ class BacktestEngine:
         lows = self._lows
         closes = self._closes
 
-        # Scan backwards for consolidation zones (step by 2 for speed)
+        # Cache config lookups as locals
+        max_range_mult = STRATEGY["consolidation_range_atr_mult"]
         min_offset = STRATEGY.get("pattern_min_bars_after_consolidation", 10)
         max_offset_cfg = STRATEGY.get("pattern_max_bars_after_consolidation", 60)
+
+        # Pre-computed rolling arrays (local refs for speed)
+        roll_high_max = self._roll_high_max
+        roll_low_min = self._roll_low_min
+        roll_range_size = self._roll_range_size
+        max_range = max_range_mult * atr
+        atr_period = self.atr_period
+
         max_offset = min(max_offset_cfg, current_idx - lookback)
+        if max_offset <= min_offset:
+            return
+
+        # Quick check: can ANY window in scan range pass the range check?
+        # Use pre-computed rolling minimum of range_size
+        hi_start = current_idx - min_offset - lookback
+        lo_start = current_idx - max_offset - lookback
+        lo_start = max(lo_start, atr_period)
+        if hi_start < atr_period:
+            return
+
+        range_min_arr = self._roll_range_min_in_scan
+        # The rolling min array is indexed by the start of the min-window
+        # We need min(range_size[lo_start:hi_start+1])
+        # range_min_arr[k] = min(range_size[k:k+scan_half_width])
+        if lo_start < len(range_min_arr):
+            if range_min_arr[lo_start] > max_range:
+                return
+
+        # Scan backwards for consolidation zones (step by 2 for speed)
         for consol_end_offset in range(min_offset, max_offset, 2):
             consol_end_idx = current_idx - consol_end_offset
             consol_start_idx = consol_end_idx - lookback
 
-            if consol_start_idx < self.atr_period:
+            if consol_start_idx < atr_period:
                 continue
 
-            hw = highs[consol_start_idx : consol_end_idx + 1]
-            lw = lows[consol_start_idx : consol_end_idx + 1]
-            cw = closes[consol_start_idx : consol_end_idx + 1]
-
-            # Check if this was a valid consolidation
-            if not self._is_consolidation_arrays(hw, lw, cw, atr):
+            # Fast consolidation check: two scalar comparisons
+            if roll_range_size[consol_start_idx] > max_range:
                 continue
 
+            range_high = roll_high_max[consol_start_idx]
+            range_low = roll_low_min[consol_start_idx]
+
+            self._perf_consol_pass += 1
             self.rejection_stats["consolidations_found"] += 1
             self.amd_stats["consolidations_found"] += 1
 
-            range_high = np.max(hw)
-            range_low = np.min(lw)
-
-            # Create consolidation result
+            # Create consolidation result (lightweight, before expensive checks)
             consol = ConsolidationResult(
                 valid=True,
                 range_high=range_high,
@@ -619,7 +715,15 @@ class BacktestEngine:
                 start_idx=consol_start_idx,
                 end_idx=consol_end_idx,
             )
-            # Enrich with equal highs/lows (liquidity pools) when enabled
+
+            # Check manipulation FIRST (cheap numpy pre-check eliminates ~80%)
+            manip = self._check_manipulation_after(df, consol, current_idx)
+            if not manip.valid:
+                self.rejection_stats["no_manipulation"] += 1
+                continue
+            self.amd_stats["manipulations_found"] += 1
+
+            # Only enrich with equal levels AFTER manipulation passes
             if STRATEGY.get("detect_equal_levels", True):
                 consol = detect_equal_levels(df, consol, highs_arr=self._highs, lows_arr=self._lows)
 
@@ -631,13 +735,6 @@ class BacktestEngine:
                     self.rejection_stats.setdefault("low_consolidation_quality", 0)
                     self.rejection_stats["low_consolidation_quality"] += 1
                     continue
-
-            # Now check for manipulation AFTER consolidation
-            manip = self._check_manipulation_after(df, consol, current_idx)
-            if not manip.valid:
-                self.rejection_stats["no_manipulation"] += 1
-                continue
-            self.amd_stats["manipulations_found"] += 1
 
             # Score Judas swing quality (candle count, velocity, session)
             manip = score_judas_quality_fast(self._timestamps, self._midnight_opens, manip)
@@ -816,8 +913,14 @@ class BacktestEngine:
                     logger.debug(f"Entry filtered: {filter_reason}")
                 continue
 
-            # Calculate risk with contract-size based math
-            risk = calculate_risk(entry, self.current_balance, self.min_rr, self.max_risk_pct)
+            # Get confidence tier for position sizing
+            entry_hour = row.get("timestamp").hour if hasattr(row.get("timestamp"), "hour") else 0
+            confluence_score = getattr(entry, "confluence_score", 0)
+            confidence_tier, tier_risk_pct = self._get_confidence_tier(confluence_score, entry_hour)
+
+            # Calculate risk with confidence-based sizing
+            risk = calculate_risk(entry, self.current_balance, self.min_rr, self.max_risk_pct,
+                                  risk_pct_override=tier_risk_pct)
             if not risk.valid:
                 self.rejection_stats["risk_invalid"] += 1
                 if verbose and risk.rejection_reason:
@@ -851,6 +954,8 @@ class BacktestEngine:
 
             # Execute entry with filled price
             self.rejection_stats["entries_executed"] += 1
+            self._pending_confidence_tier = confidence_tier
+            self._pending_risk_pct = tier_risk_pct
             self._execute_entry(entry, risk, fill_result, row, current_idx, df, verbose)
 
             # Record trade for session tracking
@@ -919,22 +1024,35 @@ class BacktestEngine:
         if search_start >= search_end:
             return ManipulationResult(valid=False)
 
+        # Quick numpy pre-check: can any fakeout exist in this window?
+        h_slice = self._highs[search_start:search_end]
+        l_slice = self._lows[search_start:search_end]
+        has_up_break = h_slice.max() > range_high + min_break
+        has_down_break = l_slice.min() < range_low - min_break
+
+        if not has_up_break and not has_down_break:
+            return ManipulationResult(valid=False)
+
         # Check for upward fakeout
-        upward = self._find_fakeout(
-            search_start, search_end,
-            range_high, range_low, min_break, max_return_candles,
-            direction="UP", atr=atr
-        )
-        if upward.valid:
-            return upward
+        if has_up_break:
+            upward = self._find_fakeout(
+                search_start, search_end,
+                range_high, range_low, min_break, max_return_candles,
+                direction="UP", atr=atr
+            )
+            if upward.valid:
+                return upward
 
         # Check for downward fakeout
-        downward = self._find_fakeout(
-            search_start, search_end,
-            range_high, range_low, min_break, max_return_candles,
-            direction="DOWN", atr=atr
-        )
-        return downward
+        if has_down_break:
+            downward = self._find_fakeout(
+                search_start, search_end,
+                range_high, range_low, min_break, max_return_candles,
+                direction="DOWN", atr=atr
+            )
+            return downward
+
+        return ManipulationResult(valid=False)
 
     def _find_fakeout(
         self,
@@ -1218,6 +1336,8 @@ class BacktestEngine:
             htf_bias_secondary=htf_secondary,
             key_level_score=kl_score.total_score,
             backtest_id=self.backtest_id,
+            confidence_tier=getattr(self, '_pending_confidence_tier', 'base'),
+            risk_pct_used=getattr(self, '_pending_risk_pct', 0.003),
         )
 
         self.state.in_position = True
@@ -1229,7 +1349,8 @@ class BacktestEngine:
                 f"ENTRY: {entry.direction} @ {fill.fill_price:.2f} | "
                 f"SL: {risk.stop_loss:.2f} | TP: {risk.take_profit:.2f} | "
                 f"Size: {risk.position_size:.2f} | "
-                f"Costs: ${fill.costs.total_cost:.2f}"
+                f"Costs: ${fill.costs.total_cost:.2f} | "
+                f"Tier: {trade.confidence_tier} ({trade.risk_pct_used*100:.1f}%)"
             )
 
     def _check_exit(self, df: pd.DataFrame, current_idx: int, candle: pd.Series, verbose: bool):
@@ -1292,10 +1413,12 @@ class BacktestEngine:
 
         # Apply trailing stop if enabled
         if STRATEGY.get("trailing_stop_enabled", False) and atr and atr > 0:
+            # Use original SL for R calculation so trailing works after BE move
+            ref_sl = trade.original_sl if trade.original_sl > 0 else trade.sl_price
             stop_distance = (
-                trade.entry_price - trade.sl_price
+                trade.entry_price - ref_sl
                 if trade.direction == "LONG"
-                else trade.sl_price - trade.entry_price
+                else ref_sl - trade.entry_price
             )
             if stop_distance > 0:
                 effective_sl, trailing_active = get_effective_stop_with_trailing(
@@ -1545,6 +1668,26 @@ class BacktestEngine:
             "avg_bars_manipulation_to_distribution": round((bars_total / bars_count), 2) if bars_count > 0 else 0.0,
         }
 
+        # Confidence tier breakdown
+        from collections import defaultdict
+        tier_stats = defaultdict(lambda: {"count": 0, "wins": 0, "pnl": 0.0})
+        for trade in self.trades:
+            tier = getattr(trade, "confidence_tier", "") or "base"
+            tier_stats[tier]["count"] += 1
+            if trade.r_multiple > 0:
+                tier_stats[tier]["wins"] += 1
+            tier_stats[tier]["pnl"] += trade.net_pnl
+        # Compute win rates
+        confidence_tier_stats = {}
+        for tier_name, stats in tier_stats.items():
+            wr = (stats["wins"] / stats["count"] * 100) if stats["count"] > 0 else 0
+            confidence_tier_stats[tier_name] = {
+                "count": stats["count"],
+                "wins": stats["wins"],
+                "win_rate": round(wr, 1),
+                "pnl": round(stats["pnl"], 2),
+            }
+
         return {
             "backtest_id": self.backtest_id,
             "initial_capital": self.initial_capital,
@@ -1589,6 +1732,7 @@ class BacktestEngine:
             "confluence_stats": self.confluence_stats,
             "cost_stats": self.cost_stats,
             "amd_conformity": amd_conformity,
+            "confidence_tier_stats": confidence_tier_stats,
         }
 
     def save_trades_to_db(self, db: Database):

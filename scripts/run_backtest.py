@@ -391,6 +391,32 @@ def run_backtest(
         print(f"  Entries with BOS:        {conf.get('entries_with_bos', 0)}")
         print("=" * 60)
 
+    # Confidence tier stats
+    if "confidence_tier_stats" in results:
+        tier_stats = results["confidence_tier_stats"]
+        print("\nCONFIDENCE TIER BREAKDOWN:")
+        print(f"  {'Tier':<12} {'Count':>6} {'Wins':>6} {'WR%':>8} {'PnL':>10}")
+        print("  " + "-" * 46)
+        for tier_name in ["high", "medium", "standard", "base"]:
+            if tier_name in tier_stats:
+                ts = tier_stats[tier_name]
+                print(f"  {tier_name:<12} {ts['count']:>6} {ts['wins']:>6} {ts['win_rate']:>7.1f}% ${ts['pnl']:>9.2f}")
+        print("=" * 60)
+
+    # Trailing stop stats
+    if results.get("trades"):
+        import pandas as _pd
+        _tdf = _pd.DataFrame(results["trades"])
+        if "trailing_active" in _tdf.columns:
+            trail_count = _tdf["trailing_active"].sum()
+            be_count = _tdf.get("sl_moved_to_be", _pd.Series(dtype=bool)).sum() if "sl_moved_to_be" in _tdf.columns else 0
+            big_winners = len(_tdf[_tdf["r_multiple"] >= 3.0])
+            print(f"\nEXIT MANAGEMENT:")
+            print(f"  BE activations:          {be_count}")
+            print(f"  Trailing activations:    {trail_count}")
+            print(f"  Big winners (>=3R):      {big_winners}")
+            print("=" * 60)
+
     run_sets = []
     if engine_train and results_train:
         run_sets.append(("train", engine_train, results_train))

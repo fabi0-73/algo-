@@ -147,7 +147,7 @@ SESSION_FILTER = {
     "cooldown_minutes_after_trade": 15,
 
     # Blackout hours — block specific UTC hours with proven negative expectancy
-    "blackout_hours_utc": [9],  # Block 09:00 UTC (11.1% WR, -$62)
+    "blackout_hours_utc": [9, 19],  # Block 09:00 UTC (11.1% WR) and 19:00 UTC (0% WR, catastrophic)
 
     # Overnight holding avoidance
     # Close positions before rollover to avoid swap fees
@@ -301,7 +301,7 @@ RISK_MODEL = {
     "contract_size": 100.0,
 
     # Risk per trade (lower = smaller drawdowns, smoother monthly curve)
-    "risk_pct_per_trade_default": 0.005,  # 0.5% per trade (was 0.8%)
+    "risk_pct_per_trade_default": 0.003,  # 0.3% base risk (confidence sizing scales up for best setups)
     "risk_pct_per_trade_max": 0.02,       # 2% max allowed
 
     # Stop loss placement
@@ -341,12 +341,12 @@ STRATEGY = {
 
     # Phase 1: Consolidation - tight ranges only (genuine accumulation)
     "consolidation_lookback": 12,
-    "consolidation_range_atr_mult": 3.50,   # Allow slightly wider ranges
+    "consolidation_range_atr_mult": 4.00,   # Accept slightly wider consolidations
     "consolidation_close_pct": 0.60,         # Accept 60% closes inside range
 
     # Phase 2: Manipulation - decisive stop hunts only
     "manipulation_break_atr_mult": 0.20,     # Must break meaningfully beyond range
-    "manipulation_return_candles": 10,       # Allow slightly slower reversals
+    "manipulation_return_candles": 12,       # Allow slower manipulation reversals
 
     # Phase 3: Distribution - strong conviction breakout
     "distribution_break_atr_mult": 0.20,    # Real move must be significant
@@ -355,8 +355,8 @@ STRATEGY = {
     "distribution_require_extension": False,   # Don't require new extreme
 
     # Phase 4: Entry - quality at entry point
-    "rejection_wick_ratio": 0.25,          # Accept more wick patterns
-    "retest_tolerance_atr_mult": 0.40,      # Wider retest zone
+    "rejection_wick_ratio": 0.20,          # Accept more wick patterns at retest
+    "retest_tolerance_atr_mult": 0.55,      # Wider retest zone — biggest lever for trade count
 
     # Phase 5: Risk Management (uses RISK_MODEL now, kept for compatibility)
     "min_rr": 2.0,                          # 2:1 is still good R:R
@@ -433,11 +433,11 @@ STRATEGY = {
 
     # Trailing stop - let winners breathe
     "trailing_stop_enabled": True,
-    "trailing_stop_activation_r": 2.0,      # Let winners develop before trailing
-    "trailing_stop_atr_mult": 2.5,          # Wider trail for bigger runs
+    "trailing_stop_activation_r": 2.0,      # Baseline value — trail bug is fixed so it'll work when reached
+    "trailing_stop_atr_mult": 2.5,          # Baseline value — wide trail lets big winners run
 
     # Breakeven stop - protect at 1R
-    "move_sl_to_be_at_r": 1.5,             # Move SL to breakeven at 1.5R profit
+    "move_sl_to_be_at_r": 1.0,             # Move SL to breakeven at 1.0R profit (proven: 65.7% activation rate)
 
     # Short trade quality gate (shorts need higher confluence)
     "short_min_confluence_score": 3,
@@ -454,7 +454,7 @@ STRATEGY = {
     "min_consolidation_quality": 0,         # Removed quality gate
 
     # Stale retest filter
-    "max_bars_after_distribution": 30,      # Allow later retests (widened from 20)
+    "max_bars_after_distribution": 40,      # Allow later retests (widened from 30)
 
     # Disable TP when trailing stop is active — let trail manage the exit
     "disable_tp_when_trailing": True,
@@ -471,6 +471,49 @@ BACKTEST = {
     "commission_per_lot": 7.0,              # Commission in USD per lot (legacy)
     "pip_value": 0.01,                      # XAU pip value (legacy, prefer RISK_MODEL)
     "lot_size": 100,                        # 1 lot = 100 oz for XAU (legacy)
+}
+
+# =============================================================================
+# Validation Targets
+# =============================================================================
+# =============================================================================
+# CONFIDENCE-BASED POSITION SIZING
+# =============================================================================
+# Instead of flat risk on every trade, tier risk by trade quality.
+# High-confidence setups (score 4+ in prime hours) get more risk,
+# amplifying winners while keeping base risk low.
+CONFIDENCE_SIZING = {
+    "enabled": True,
+
+    # Base risk (applied to all trades that don't match any tier)
+    "base_risk_pct": 0.003,        # 0.3% — conservative base
+
+    # Tier definitions: checked top-down, first match wins
+    "tiers": [
+        {
+            "name": "high",
+            "min_confluence_score": 4,
+            "prime_hours_only": True,     # H13-17 UTC
+            "risk_pct": 0.008,            # 0.8% — 90.9% WR historically
+        },
+        {
+            "name": "medium",
+            "min_confluence_score": 4,
+            "prime_hours_only": False,
+            "risk_pct": 0.005,            # 0.5% — score 4+ any hour: 61.3% WR
+        },
+        {
+            "name": "standard",
+            "min_confluence_score": 2,
+            "prime_hours_only": True,
+            "risk_pct": 0.005,            # 0.5% — prime hours even at score 2-3
+        },
+        # Fallthrough: base_risk_pct (0.3%) for everything else
+    ],
+
+    # Prime hours definition (UTC)
+    "prime_hours_start": 13,
+    "prime_hours_end": 17,    # inclusive: H13, H14, H15, H16, H17
 }
 
 # =============================================================================

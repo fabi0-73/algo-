@@ -59,6 +59,7 @@ def calculate_risk(
     spread_buffer_pips: float = None,  # Legacy parameter, ignored if use_risk_model=True
     atr: float = None,
     use_risk_model: bool = True,
+    risk_pct_override: float = None,    # From confidence sizing — overrides default risk_pct
 ) -> RiskParams:
     """
     Calculate stop loss, take profit, and position size using contract-size math.
@@ -85,7 +86,10 @@ def calculate_risk(
     # Get config values
     if use_risk_model:
         contract_size = RISK_MODEL["contract_size"]
-        risk_pct = max_risk_pct or RISK_MODEL["risk_pct_per_trade_default"]
+        if risk_pct_override is not None:
+            risk_pct = risk_pct_override
+        else:
+            risk_pct = max_risk_pct or RISK_MODEL["risk_pct_per_trade_default"]
         risk_pct = min(risk_pct, RISK_MODEL["risk_pct_per_trade_max"])
         min_stop_atr_mult = RISK_MODEL["min_stop_atr_mult"]
         stop_buffer_atr_mult = RISK_MODEL["stop_buffer_atr_mult"]
