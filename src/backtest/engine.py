@@ -246,6 +246,7 @@ class BacktestEngine:
             "filtered_cooldown": 0,
             "filtered_rollover": 0,
             "filtered_blackout_hour": 0,
+            "filtered_blackout_weekday": 0,
             "filtered_premium_discount": 0,
             "filtered_consolidation_not_asian": 0,
             "filtered_distribution_not_london_ny": 0,
@@ -395,6 +396,7 @@ class BacktestEngine:
             "filtered_cooldown": 0,
             "filtered_rollover": 0,
             "filtered_blackout_hour": 0,
+            "filtered_blackout_weekday": 0,
             "filtered_premium_discount": 0,
             "filtered_consolidation_not_asian": 0,
             "filtered_distribution_not_london_ny": 0,
@@ -545,7 +547,9 @@ class BacktestEngine:
         # 1. Session/Time filter (kill zone, Asian session, daily limits)
         can_enter, reason = self.time_filter.can_enter_trade(ts, self.initial_capital)
         if not can_enter:
-            if "blackout" in reason:
+            if reason == "blackout_weekday":
+                self.rejection_stats["filtered_blackout_weekday"] += 1
+            elif "blackout" in reason:
                 self.rejection_stats["filtered_blackout_hour"] += 1
             elif "killzone" in reason or "asian" in reason:
                 self.rejection_stats["filtered_session"] += 1

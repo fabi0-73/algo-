@@ -141,13 +141,16 @@ SESSION_FILTER = {
     "max_trades_per_day": 3,  # Allow more setups per day
 
     # Daily loss limit - stop new entries if daily drawdown exceeds this
-    "daily_loss_limit_pct": 0.01,  # 1% daily loss limit
+    "daily_loss_limit_pct": 0.008,  # 0.8% daily loss limit — stops trading earlier on bad days
 
     # Cooldown after trade (reduce overtrading in chop)
     "cooldown_minutes_after_trade": 15,
 
     # Blackout hours — block specific UTC hours with proven negative expectancy
-    "blackout_hours_utc": [9, 19],  # Block 09:00 UTC (11.1% WR) and 19:00 UTC (0% WR, catastrophic)
+    "blackout_hours_utc": [6, 7, 9, 19],  # Block 06-07 UTC (40% WR, -$51), 09:00 UTC (11.1% WR), 19:00 UTC (0% WR)
+
+    # Blackout weekdays — block entire days with proven negative expectancy
+    "blackout_weekdays": [],  # Empty = no weekday blackout (Wed filter tested: hurt Nov, net negative)
 
     # Overnight holding avoidance
     # Close positions before rollover to avoid swap fees
@@ -425,7 +428,7 @@ STRATEGY = {
     "use_breaker_blocks": True,             # Was False - enable breaker block confluence
 
     # Minimum confluence score required for entry (BOS + FVG + OB + equal levels + volume + breaker)
-    "min_confluence_score": 2,              # Require 2+ factors for quality entries
+    "min_confluence_score": 3,              # Require 3+ factors — score-2 had 61.5% loss rate
 
     # Premium/Discount Zones - off to allow more entries
     "require_discount_for_long": False,
@@ -492,23 +495,18 @@ CONFIDENCE_SIZING = {
     "tiers": [
         {
             "name": "high",
-            "min_confluence_score": 4,
+            "min_confluence_score": 5,
             "prime_hours_only": True,     # H13-17 UTC
-            "risk_pct": 0.008,            # 0.8% — 90.9% WR historically
-        },
-        {
-            "name": "medium",
-            "min_confluence_score": 4,
-            "prime_hours_only": False,
-            "risk_pct": 0.005,            # 0.5% — score 4+ any hour: 61.3% WR
+            "risk_pct": 0.008,            # 0.8% — elite setups only
         },
         {
             "name": "standard",
-            "min_confluence_score": 2,
+            "min_confluence_score": 3,
             "prime_hours_only": True,
-            "risk_pct": 0.005,            # 0.5% — prime hours even at score 2-3
+            "risk_pct": 0.005,            # 0.5% — prime hours, score 3+
         },
         # Fallthrough: base_risk_pct (0.3%) for everything else
+        # MEDIUM tier removed — 48.4% loss rate, -$245 damage
     ],
 
     # Prime hours definition (UTC)
