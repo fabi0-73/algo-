@@ -65,7 +65,9 @@ class TelegramNotifier:
             tags.append("MID")
         confluence_tags = "  ".join(tags) if tags else "—"
 
-        header = f"{signal.direction} {self._esc(signal.symbol)}  |  {self._esc(signal.confidence)} confidence"
+        tier_label = signal.confidence.upper()
+        risk_pct_str = f"{signal.risk_pct * 100:.1f}%" if signal.risk_pct else ""
+        header = f"{signal.direction} {self._esc(signal.symbol)}  |  {tier_label} tier  ({risk_pct_str} risk)"
         block1 = (
             f"Entry:  {signal.entry_price:,.2f}  (LIMIT)\n"
             f"SL:     {signal.stop_loss:,.2f}\n"

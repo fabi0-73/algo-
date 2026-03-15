@@ -82,9 +82,11 @@ EXECUTION = {
     "commission_per_lot_round_turn": 7.0,  # USD per lot round-turn
 
     # Slippage Model
+    # Note: slippage values are in USD/oz (price-space), NOT MT5 points.
+    # This differs from spread_points which uses MT5 points (1 pt = $0.01).
     "slippage_model": "ATR_MULT",  # "NONE", "FIXED_POINTS", "ATR_MULT"
-    "slippage_points": 0.05,  # Used if slippage_model = "FIXED_POINTS"
-    "slippage_atr_mult": 0.02,  # 2% of ATR; used if slippage_model = "ATR_MULT"
+    "slippage_points": 0.05,  # USD/oz; used if slippage_model = "FIXED_POINTS"
+    "slippage_atr_mult": 0.02,  # 2% of ATR (USD/oz); used if slippage_model = "ATR_MULT"
 
     # Intrabar Fill Ambiguity
     # When both SL and TP are touched in the same candle:
@@ -449,6 +451,11 @@ STRATEGY = {
     "judas_max_candles": 5,                 # Fast sweeps (1-5 candles)
     "judas_min_velocity_atr": 0.3,          # Decisive sweeps
     "judas_london_bonus": True,             # Extra confluence for London session manipulation
+    "judas_london_start_hour": 7,           # London open window start (UTC)
+    "judas_london_end_hour": 10,            # London open window end (UTC, inclusive)
+
+    # Order Block detection
+    "ob_lookback": 10,                      # How far back to search for OB candle
 
     # Judas quality hard gate - use as confluence bonus, not hard kill
     "min_judas_quality": 0,                 # Disabled as hard gate; scored in confluence
@@ -505,6 +512,12 @@ CONFIDENCE_SIZING = {
             "prime_hours_only": True,
             "risk_pct": 0.005,            # 0.5% — prime hours, score 3+
         },
+        {
+            "name": "off_hours",
+            "min_confluence_score": 5,
+            "prime_hours_only": False,
+            "risk_pct": 0.005,            # 0.5% — high-confluence off-hours (not punished)
+        },
         # Fallthrough: base_risk_pct (0.3%) for everything else
         # MEDIUM tier removed — 48.4% loss rate, -$245 damage
     ],
@@ -512,6 +525,28 @@ CONFIDENCE_SIZING = {
     # Prime hours definition (UTC)
     "prime_hours_start": 13,
     "prime_hours_end": 17,    # inclusive: H13, H14, H15, H16, H17
+}
+
+# =============================================================================
+# Phantom Fills Analysis
+# =============================================================================
+# When enabled, simulates trades that passed all filters but whose limit entry
+# was never filled ("Fill Not Triggered"). Enters at candle close instead.
+# Results tracked separately — never affects real trades or equity.
+PHANTOM_FILLS = {
+    "enabled": False,               # Must explicitly enable via --phantom-fills
+    "entry_price_mode": "CLOSE",    # Enter at candle close when limit misses
+    "recalculate_risk": True,       # Recalculate position size for worse entry
+}
+
+# =============================================================================
+# Market Chase — Enter at close when limit misses on high-quality setups
+# =============================================================================
+MARKET_CHASE = {
+    "enabled": False,               # Must explicitly enable via --market-chase
+    "direction_filter": "LONG",     # Only chase LONGs (60.2% WR vs 50% SHORT)
+    "min_confluence_score": 5,      # Score 5: 67.6% WR, PF 2.12
+    "max_entry_slippage_atr": 1.5,  # Reject if close is > 1.5 ATR worse than limit
 }
 
 # =============================================================================
@@ -523,3 +558,67 @@ VALIDATION = {
     "max_drawdown_pct": 0.20,               # Max drawdown < 20%
     "min_months": 3,                        # Minimum months of data
 }
+
+
+# =============================================================================
+# Configuration Validation
+# =============================================================================
+def validate_config() -> list[str]:
+    """Check for conflicting or problematic configuration settings.
+
+    Returns a list of warning messages.  Empty list means no issues found.
+    """
+    warnings = []
+
+    # Max possible confluence score (BOS + FVG + OB + equal_levels + volume + breaker = 6)
+    max_possible = 6
+    min_req = STRATEGY.get("min_confluence_score", 0)
+    if min_req > max_possible:
+        warnings.append(
+            f"min_confluence_score ({min_req}) exceeds max possible ({max_possible}). "
+            "No entries will ever pass."
+        )
+    short_min = STRATEGY.get("short_min_confluence_score", min_req)
+    if short_min > max_possible:
+        warnings.append(
+            f"short_min_confluence_score ({short_min}) exceeds max possible ({max_possible})."
+        )
+
+    # Risk bounds
+    risk_pct = RISK_MODEL.get("risk_pct_per_trade_default", 0)
+    risk_max = RISK_MODEL.get("risk_pct_per_trade_max", 0)
+    if risk_pct > risk_max:
+        warnings.append(
+            f"risk_pct_per_trade_default ({risk_pct}) exceeds risk_pct_per_trade_max ({risk_max})."
+        )
+    if risk_pct <= 0:
+        warnings.append("risk_pct_per_trade_default is zero or negative — no trades will size.")
+
+    # Confidence tiers risk vs max risk
+    if CONFIDENCE_SIZING.get("enabled"):
+        for tier in CONFIDENCE_SIZING.get("tiers", []):
+            tier_risk = tier.get("risk_pct", 0)
+            if tier_risk > risk_max:
+                warnings.append(
+                    f"Confidence tier '{tier.get('name')}' risk ({tier_risk}) "
+                    f"exceeds risk_pct_per_trade_max ({risk_max})."
+                )
+
+    # Timezone validity
+    try:
+        from zoneinfo import ZoneInfo
+        ZoneInfo(TIME_CONFIG.get("data_timezone", "UTC"))
+        ZoneInfo(TIME_CONFIG.get("session_timezone", "UTC"))
+    except Exception as e:
+        warnings.append(f"Invalid timezone in TIME_CONFIG: {e}")
+
+    # Trailing stop activation should be reachable
+    trailing_r = STRATEGY.get("trailing_stop_activation_r", 0)
+    be_r = STRATEGY.get("move_sl_to_be_at_r", 0)
+    if STRATEGY.get("trailing_stop_enabled") and trailing_r > 0 and be_r >= trailing_r:
+        warnings.append(
+            f"BE stop at {be_r}R activates at/after trailing at {trailing_r}R — "
+            "trailing may never activate."
+        )
+
+    return warnings

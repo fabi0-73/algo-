@@ -5,8 +5,11 @@ Supports multiple entry modes with SMC confluence (FVG, Order Block, BOS).
 """
 from dataclasses import dataclass, field
 from typing import Optional, List
+import logging
 import pandas as pd
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 from config import STRATEGY
 from .consolidation import ConsolidationResult
@@ -76,21 +79,56 @@ def is_in_premium_zone(price: float, range_high: float, range_low: float) -> boo
     return price > midpoint
 
 
-def _equal_level_swept(consolidation: ConsolidationResult, manip: ManipulationResult) -> bool:
-    """True if manipulation swept an equal high or equal low (liquidity pool)."""
+def _equal_level_swept(consolidation: ConsolidationResult, manip: ManipulationResult, atr: float = 1.0) -> bool:
+    """True if manipulation swept an equal high or equal low (liquidity pool).
+
+    Uses ATR-based tolerance to match how equal levels are detected in
+    consolidation (equal_level_tolerance_atr_mult * ATR).
+    """
+    tolerance = atr * 0.05  # Match consolidation detection tolerance
     if manip.direction == "UP":
         return bool(
             consolidation.has_equal_highs
             and consolidation.equal_high_level > 0
-            and manip.extreme_price >= consolidation.equal_high_level - 1e-9
+            and manip.extreme_price >= consolidation.equal_high_level - tolerance
         )
     if manip.direction == "DOWN":
         return bool(
             consolidation.has_equal_lows
             and consolidation.equal_low_level > 0
-            and manip.extreme_price <= consolidation.equal_low_level + 1e-9
+            and manip.extreme_price <= consolidation.equal_low_level + tolerance
         )
     return False
+
+
+def calculate_confluence_score(
+    bos_confirmed: bool,
+    fvg_at_level: bool,
+    ob_at_level: bool,
+    equal_level_swept: bool,
+    volume_confirmed: bool,
+    breaker_confluence: bool = False,
+) -> int:
+    """Calculate institutional confluence score from SMC factors.
+
+    Returns a score 0-6 based on how many factors are present:
+    BOS (+1), FVG (+1), OB (+1), equal level swept (+1),
+    volume confirmed (+1), breaker block (+1).
+    """
+    score = 0
+    if bos_confirmed:
+        score += 1
+    if fvg_at_level:
+        score += 1
+    if ob_at_level:
+        score += 1
+    if equal_level_swept:
+        score += 1
+    if volume_confirmed:
+        score += 1
+    if breaker_confluence:
+        score += 1
+    return score
 
 
 def check_premium_discount_filter(
@@ -461,7 +499,7 @@ def check_entry_with_confluence(
         return EntrySignal(valid=False)
 
     # Confluence from consolidation/manipulation (equal levels swept, volume spike)
-    equal_level_swept = _equal_level_swept(consolidation, manipulation)
+    equal_level_swept = _equal_level_swept(consolidation, manipulation, atr=atr)
     volume_confirmed = getattr(manipulation, "volume_confirmed", False)
 
     # Start looking after distribution breakout
@@ -549,22 +587,17 @@ def check_entry_with_confluence(
                 )
             breaker_confluence = breaker_at_level is not None and breaker_at_level.valid
 
-            # Calculate confluence score (BOS + FVG + OB + equal levels + volume + breaker)
-            confluence_score = 0
-            if bos_confirmed:
-                confluence_score += 1
-            if fvg_at_level:
-                fvg_confluence = True
-                confluence_score += 1
-            if ob_at_level:
-                ob_confluence = True
-                confluence_score += 1
-            if equal_level_swept:
-                confluence_score += 1
-            if volume_confirmed:
-                confluence_score += 1
-            if breaker_confluence:
-                confluence_score += 1
+            # Calculate confluence score using shared function
+            fvg_confluence = bool(fvg_at_level)
+            ob_confluence = bool(ob_at_level)
+            confluence_score = calculate_confluence_score(
+                bos_confirmed=bos_confirmed,
+                fvg_at_level=fvg_confluence,
+                ob_at_level=ob_confluence,
+                equal_level_swept=equal_level_swept,
+                volume_confirmed=volume_confirmed,
+                breaker_confluence=breaker_confluence,
+            )
 
             min_confluence = STRATEGY.get("min_confluence_score", 0)
             if min_confluence > 0 and confluence_score < min_confluence:
@@ -751,8 +784,12 @@ def check_entry_at_candle(
             entry_triggered = True
     
     elif entry_mode == ENTRY_MODE_PEAK_LOW:
-        # For peak low, we always trigger at retest (most aggressive)
-        entry_triggered = True
+        # PEAK_LOW requires cross-bar state tracking to find the true peak,
+        # which isn't possible in the bar-by-bar check_entry_at_candle path.
+        # Fall back to rejection-based entry instead of blindly triggering.
+        logger.warning("PEAK_LOW mode not supported in bar-by-bar entry; falling back to rejection check")
+        if is_rejection_candle(candle, expected_rejection, rejection_wick_ratio):
+            entry_triggered = True
     
     if not entry_triggered:
         return EntrySignal(valid=False)
@@ -767,28 +804,20 @@ def check_entry_at_candle(
             current_idx, ob_dir, atr, tolerance_mult=0.5
         )
     breaker_confluence = breaker_at_level is not None and breaker_at_level.valid
-    equal_level_swept = _equal_level_swept(consolidation, manipulation)
+    equal_level_swept = _equal_level_swept(consolidation, manipulation, atr=atr)
     volume_confirmed = getattr(manipulation, "volume_confirmed", False)
 
-    # Calculate confluence score (BOS + FVG + OB + equal levels + volume + breaker + judas quality)
-    confluence_score = 0
-    if bos_confirmed:
-        confluence_score += 1
-    if fvg_confluence:
-        confluence_score += 1
-    if ob_confluence:
-        confluence_score += 1
-    if equal_level_swept:
-        confluence_score += 1
-    if volume_confirmed:
-        confluence_score += 1
-    if breaker_confluence:
-        confluence_score += 1
-
-    # Add Judas swing quality to confluence (from manipulation scoring)
-    judas_quality = getattr(manipulation, "judas_quality", 0)
-    if judas_quality >= 2:
-        confluence_score += 1
+    # Calculate confluence score using shared function
+    # Note: Judas quality is a pattern quality metric, not an institutional confluence
+    # factor. It is enforced separately via min_judas_quality hard gate.
+    confluence_score = calculate_confluence_score(
+        bos_confirmed=bos_confirmed,
+        fvg_at_level=fvg_confluence,
+        ob_at_level=ob_confluence,
+        equal_level_swept=equal_level_swept,
+        volume_confirmed=volume_confirmed,
+        breaker_confluence=breaker_confluence,
+    )
 
     # Apply direction-specific confluence minimums
     min_confluence = STRATEGY.get("min_confluence_score", 0)

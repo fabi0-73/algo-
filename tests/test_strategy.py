@@ -434,10 +434,11 @@ class TestExecutionCosts:
 
         exit_decision = engine.check_exit(MockTrade(), candle, atr=5.0)
 
-        # Worst case for long: SL hit first
+        # Worst case for long: SL hit first (with unfavorable slippage)
         assert exit_decision.should_exit
         assert exit_decision.exit_reason == "SL"
-        assert exit_decision.exit_price == 1995.0
+        # SL price slipped unfavorably: 1995.0 - slippage (atr*0.02 = 0.10)
+        assert exit_decision.exit_price < 1995.0  # Worse than exact SL
 
     def test_intrabar_worst_case_short_sl_first(self):
         """Test worst-case intrabar assumption - SL hit before TP for short."""
@@ -459,10 +460,11 @@ class TestExecutionCosts:
 
         exit_decision = engine.check_exit(MockTrade(), candle, atr=5.0)
 
-        # Worst case for short: SL hit first
+        # Worst case for short: SL hit first (with unfavorable slippage)
         assert exit_decision.should_exit
         assert exit_decision.exit_reason == "SL"
-        assert exit_decision.exit_price == 2005.0
+        # SL price slipped unfavorably: 2005.0 + slippage (atr*0.02 = 0.10)
+        assert exit_decision.exit_price > 2005.0  # Worse than exact SL
 
 
 class TestSessionFilter:
@@ -1002,7 +1004,9 @@ class TestDistributionFollowThrough:
         monkeypatch.setitem(STRATEGY, "require_liquidity_sweep", False)
 
         df = create_sample_candles(200, volatility=2.0)
-        df["atr"] = 1.0
+        # Set ATR high enough that range_size < consolidation_range_atr_mult * ATR
+        # passes the fast pre-check (default mult is 4.0, so ATR=20 allows ranges up to 80)
+        df["atr"] = 20.0
 
         engine = BacktestEngine(
             enable_session_filter=False,
@@ -1034,6 +1038,46 @@ class TestDistributionFollowThrough:
             "src.backtest.engine.validate_distribution_strength",
             lambda *args, **kwargs: False
         )
+
+        # Initialize arrays that run() normally sets up
+        engine._highs = df["high"].values
+        engine._lows = df["low"].values
+        engine._opens = df["open"].values
+        engine._closes = df["close"].values
+        engine._timestamps = df["timestamp"].values
+        engine._atrs = df["atr"].values
+        engine._tick_volumes = df["tick_volume"].values if "tick_volume" in df.columns else None
+
+        # Pre-compute rolling windows
+        from numpy.lib.stride_tricks import sliding_window_view
+        lookback = engine.lookback
+        _hw = sliding_window_view(engine._highs, lookback + 1)
+        _lw = sliding_window_view(engine._lows, lookback + 1)
+        engine._roll_high_max = _hw.max(axis=1)
+        engine._roll_low_min = _lw.min(axis=1)
+        engine._roll_range_size = engine._roll_high_max - engine._roll_low_min
+
+        # Pre-compute close_pct pass/fail
+        close_pct_threshold = STRATEGY.get("consolidation_close_pct", 0.60)
+        _cw = sliding_window_view(engine._closes, lookback + 1)
+        _range_low_2d = engine._roll_low_min[:, np.newaxis]
+        _range_high_2d = engine._roll_high_max[:, np.newaxis]
+        _inside = ((_cw >= _range_low_2d) & (_cw <= _range_high_2d)).sum(axis=1)
+        engine._roll_close_pct_pass = (_inside / (lookback + 1)) >= close_pct_threshold
+
+        _min_offset = STRATEGY.get("pattern_min_bars_after_consolidation", 10)
+        _max_offset_cfg = STRATEGY.get("pattern_max_bars_after_consolidation", 60)
+        _scan_half_width = (_max_offset_cfg - _min_offset) // 2 + 1
+        if _scan_half_width > 0 and len(engine._roll_range_size) > _scan_half_width:
+            _rs_view = sliding_window_view(engine._roll_range_size, _scan_half_width)
+            engine._roll_range_min_in_scan = _rs_view.min(axis=1)
+        else:
+            engine._roll_range_min_in_scan = engine._roll_range_size
+
+        # Pre-compute midnight opens and perf counters
+        engine._midnight_opens = {}
+        engine._perf_scan_calls = 0
+        engine._perf_consol_pass = 0
 
         engine._scan_for_patterns(df, current_idx=len(df) - 1, verbose=False)
 

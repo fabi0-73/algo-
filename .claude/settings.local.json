@@ -2,7 +2,13 @@
   "permissions": {
     "allow": [
       "Bash(python:*)",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(ssh:*)",
+      "Bash(pip install:*)",
+      "Bash(jq:*)",
+      "Bash(kill:*)",
+      "Bash(git checkout:*)",
+      "WebSearch"
     ]
   }
 }

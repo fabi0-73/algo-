@@ -12,7 +12,7 @@ import numpy as np
 import logging
 import uuid
 
-from config import STRATEGY, BACKTEST, VALIDATION, EXECUTION, TIME_CONFIG, SESSION_FILTER
+from config import STRATEGY, BACKTEST, VALIDATION, EXECUTION, TIME_CONFIG, SESSION_FILTER, PHANTOM_FILLS, MARKET_CHASE, RISK_MODEL, validate_config
 from src.strategy.indicators import add_indicators, calculate_atr
 from src.strategy.consolidation import detect_consolidation, ConsolidationResult, detect_equal_levels, score_consolidation_quality
 from src.strategy.manipulation import (
@@ -27,6 +27,7 @@ from src.strategy.distribution import detect_distribution, DistributionResult, v
 from src.strategy.entry import (
     check_entry, check_immediate_entry, EntrySignal,
     check_entry_at_candle, check_premium_discount_filter,
+    calculate_confluence_score,
     ENTRY_MODE_RETEST_ONLY,
 )
 from src.strategy.risk import (
@@ -49,7 +50,7 @@ from src.strategy.key_levels import KeyLevelsEngine
 from src.strategy.htf_bias import HTFBiasEngine
 from src.strategy.volume_filters import VolumeFilterEngine
 from src.strategy.fundamentals import FundamentalsEngine
-from src.backtest.execution import ExecutionEngine, FillResult, ExitDecision
+from src.backtest.execution import ExecutionEngine, FillResult, ExitDecision, CostBreakdown
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +114,7 @@ class TradeRecord:
     # Trailing stop tracking
     best_price_in_favor: float = 0.0  # Best high (LONG) or best low (SHORT) since entry
     trailing_active: bool = False     # Whether trailing stop has activated
+    original_tp: float = 0.0         # Original TP before trailing disables it
 
     # Confidence sizing
     confidence_tier: str = ""        # "high", "medium", "standard", or "base"
@@ -141,7 +143,7 @@ class BacktestState:
     position_entry_idx: int = 0
 
     # Track active patterns being formed
-    active_patterns: List[AMDPattern] = field(default_factory=list)
+    # active_patterns removed — was defined but never populated or cleaned
 
     # Pattern deduplication - track seen patterns by their key features
     seen_patterns: Set[Tuple] = field(default_factory=set)
@@ -179,6 +181,8 @@ class BacktestEngine:
         enable_key_levels: bool = None,
         enable_volume_filter: bool = None,
         enable_fundamentals: bool = None,
+        enable_phantom_fills: bool = None,
+        enable_market_chase: bool = None,
     ):
         self.initial_capital = initial_capital or BACKTEST["initial_capital"]
         self.max_risk_pct = max_risk_pct or STRATEGY["max_risk_pct"]
@@ -220,6 +224,21 @@ class BacktestEngine:
         self.fundamentals = FundamentalsEngine(
             enabled=enable_fundamentals if enable_fundamentals is not None else False
         )
+
+        # Phantom fills analysis
+        self.phantom_fills_enabled = enable_phantom_fills if enable_phantom_fills is not None else PHANTOM_FILLS.get("enabled", False)
+        self.phantom_trades: List[dict] = []
+
+        # Market chase — enter at close for high-quality missed fills
+        self.market_chase_enabled = enable_market_chase if enable_market_chase is not None else MARKET_CHASE.get("enabled", False)
+        self.chase_stats = {
+            "chase_attempts": 0,
+            "chase_executed": 0,
+            "chase_rejected_direction": 0,
+            "chase_rejected_confluence": 0,
+            "chase_rejected_slippage": 0,
+            "chase_rejected_risk_invalid": 0,
+        }
 
         # Rejection tracking for funnel analysis
         self.rejection_stats = {
@@ -288,22 +307,29 @@ class BacktestEngine:
         self.min_lookback = self.lookback + self.atr_period + 20
 
     def _build_midnight_opens(self) -> dict:
-        """Pre-compute midnight (05:00 UTC) open prices keyed by date.
+        """Pre-compute midnight (00:00 EST) open prices keyed by date.
 
         Replaces the per-manipulation 300-bar backward scan with a single
         forward pass over all timestamps, yielding O(1) lookups later.
+        Uses _MIDNIGHT_HOUR from manipulation module to handle non-UTC data.
         """
+        from src.strategy.manipulation import _MIDNIGHT_HOUR
         result = {}
         ts_arr = self._timestamps
         opens_arr = self._opens
         for i in range(len(ts_arr)):
             ts = pd.Timestamp(ts_arr[i])
-            if hasattr(ts, "hour") and ts.hour == 5 and ts.minute == 0:
+            if hasattr(ts, "hour") and ts.hour == _MIDNIGHT_HOUR and ts.minute == 0:
                 result[ts.date()] = float(opens_arr[i])
         return result
 
     def run(self, df: pd.DataFrame, verbose: bool = False) -> Dict[str, Any]:
         """Run backtest on historical data."""
+        # Validate configuration for conflicting settings
+        config_warnings = validate_config()
+        for w in config_warnings:
+            logger.warning(f"Config warning: {w}")
+
         if len(df) < self.min_lookback:
             logger.error(f"Not enough data. Need at least {self.min_lookback} candles.")
             return {"error": "Insufficient data"}
@@ -519,8 +545,8 @@ class BacktestEngine:
         return (
             consol.start_idx,
             consol.end_idx,
-            round(consol.range_high, 2),
-            round(consol.range_low, 2),
+            round(consol.range_high, 4),
+            round(consol.range_low, 4),
             manip.direction,
             manip.return_candle_idx,
         )
@@ -856,35 +882,30 @@ class BacktestEngine:
             )
 
             # Track distributions with BOS + confluence (AMD conformity)
+            # Use ATR-based tolerance to match how equal levels are detected
+            sweep_tolerance = atr * 0.05
             equal_level_swept = False
             if manip.direction == "UP":
                 equal_level_swept = bool(
                     consol.has_equal_highs
                     and consol.equal_high_level > 0
-                    and manip.extreme_price >= consol.equal_high_level - 1e-9
+                    and manip.extreme_price >= consol.equal_high_level - sweep_tolerance
                 )
             elif manip.direction == "DOWN":
                 equal_level_swept = bool(
                     consol.has_equal_lows
                     and consol.equal_low_level > 0
-                    and manip.extreme_price <= consol.equal_low_level + 1e-9
+                    and manip.extreme_price <= consol.equal_low_level + sweep_tolerance
                 )
 
             volume_confirmed = getattr(manip, "volume_confirmed", False)
-            judas_quality = getattr(manip, "judas_quality", 0)
-            confluence_score = 0
-            if bos is not None and bos.valid:
-                confluence_score += 1
-            if fvg_at_level:
-                confluence_score += 1
-            if ob_at_level:
-                confluence_score += 1
-            if equal_level_swept:
-                confluence_score += 1
-            if volume_confirmed:
-                confluence_score += 1
-            if judas_quality >= 2:
-                confluence_score += 1
+            confluence_score = calculate_confluence_score(
+                bos_confirmed=(bos is not None and bos.valid),
+                fvg_at_level=bool(fvg_at_level),
+                ob_at_level=bool(ob_at_level),
+                equal_level_swept=equal_level_swept,
+                volume_confirmed=volume_confirmed,
+            )
 
             min_confluence = STRATEGY.get("min_confluence_score", 0)
             if (bos is not None and bos.valid) and confluence_score >= min_confluence:
@@ -943,6 +964,21 @@ class BacktestEngine:
                 self.rejection_stats["fill_not_triggered"] += 1
                 if verbose:
                     logger.debug(f"Fill not triggered: {fill_result.fill_reason}")
+
+                # Attempt market chase for high-quality missed fills
+                if self.market_chase_enabled:
+                    chased = self._attempt_market_chase(
+                        entry, risk, row, current_idx, df, atr,
+                        confidence_tier, tier_risk_pct, pattern_key, verbose,
+                    )
+                    if chased:
+                        return  # Real trade created — exit scan loop
+
+                if self.phantom_fills_enabled:
+                    self._capture_phantom_trade(
+                        entry, risk, row, current_idx, df, atr,
+                        confidence_tier, tier_risk_pct, verbose,
+                    )
                 continue
 
             # Mark pattern as seen
@@ -1440,6 +1476,8 @@ class BacktestEngine:
 
         # Disable TP when trailing is active — let the trail manage the exit
         if STRATEGY.get("disable_tp_when_trailing", False) and trade.trailing_active:
+            if trade.original_tp == 0.0:
+                trade.original_tp = trade.tp_price  # Save before overwriting
             if trade.direction == "LONG":
                 trade.tp_price = float('inf')
             else:
@@ -1486,20 +1524,28 @@ class BacktestEngine:
         else:
             partial_pnl = (trade.entry_price - exit_decision.exit_price) * partial_size * contract_size
 
+        # Charge proportional costs on the partial close
+        partial_pct = exit_decision.partial_close_pct
+        partial_commission = trade.commission_cost * partial_pct
+        partial_spread = trade.spread_cost * partial_pct
+        partial_slippage = trade.slippage_cost * partial_pct
+        partial_costs = partial_commission + partial_spread + partial_slippage
+        net_partial_pnl = partial_pnl - partial_costs
+
         # Update trade record
         trade.partial_tp_taken = True
         trade.partial_tp_price = exit_decision.exit_price
-        trade.partial_close_pct = exit_decision.partial_close_pct
-        trade.partial_pnl = partial_pnl
-        trade.remaining_size = trade.position_size * (1 - exit_decision.partial_close_pct)
+        trade.partial_close_pct = partial_pct
+        trade.partial_pnl = net_partial_pnl
+        trade.remaining_size = trade.position_size * (1 - partial_pct)
 
         # Move SL to breakeven if configured
         if exit_decision.new_sl_price > 0:
             trade.sl_price = exit_decision.new_sl_price
             trade.sl_moved_to_be = True
 
-        # Credit partial PnL to balance
-        self.current_balance += partial_pnl
+        # Credit net partial PnL to balance
+        self.current_balance += net_partial_pnl
 
         if verbose:
             logger.info(
@@ -1587,6 +1633,404 @@ class BacktestEngine:
         """Force close position at end of data."""
         if self.state.in_position:
             self._exit_position(candle["close"], reason, candle, verbose=True)
+
+    # -------------------------------------------------------------------------
+    # Market Chase — enter at close for high-quality missed fills (real trade)
+    # -------------------------------------------------------------------------
+
+    def _attempt_market_chase(self, entry, risk, candle, current_idx, df, atr,
+                              confidence_tier, tier_risk_pct, pattern_key, verbose):
+        """Attempt to enter at candle close when a high-quality limit order misses.
+
+        Returns True if a real trade was created, False otherwise.
+        """
+        from config import RISK_MODEL
+
+        self.chase_stats["chase_attempts"] += 1
+
+        # Gate 1: Direction filter
+        direction_filter = MARKET_CHASE.get("direction_filter", "LONG")
+        if direction_filter and entry.direction != direction_filter:
+            self.chase_stats["chase_rejected_direction"] += 1
+            return False
+
+        # Gate 2: Confluence score
+        min_score = MARKET_CHASE.get("min_confluence_score", 5)
+        confluence_score = getattr(entry, "confluence_score", 0)
+        if confluence_score < min_score:
+            self.chase_stats["chase_rejected_confluence"] += 1
+            return False
+
+        chase_entry_price = candle["close"]
+        sl_price = risk.stop_loss
+
+        # Gate 3: Stop validity — close must not be past SL
+        if entry.direction == "LONG":
+            stop_distance = chase_entry_price - sl_price
+        else:
+            stop_distance = sl_price - chase_entry_price
+
+        if stop_distance <= 0:
+            self.chase_stats["chase_rejected_risk_invalid"] += 1
+            return False
+
+        # Gate 4: Slippage cap — close must not be too far from limit level
+        original_retest_level = getattr(entry, "desired_entry_price", entry.entry_price)
+        max_slip_atr = MARKET_CHASE.get("max_entry_slippage_atr", 1.5)
+        if entry.direction == "LONG":
+            entry_slip = chase_entry_price - original_retest_level
+        else:
+            entry_slip = original_retest_level - chase_entry_price
+        if entry_slip > max_slip_atr * atr:
+            self.chase_stats["chase_rejected_slippage"] += 1
+            return False
+
+        # All gates passed — recalculate risk for worse entry
+        contract_size = RISK_MODEL["contract_size"]
+        reward_distance = stop_distance * self.min_rr
+        if entry.direction == "LONG":
+            tp_price = chase_entry_price + reward_distance
+        else:
+            tp_price = chase_entry_price - reward_distance
+
+        risk_amount = self.current_balance * tier_risk_pct
+        risk_per_lot = stop_distance * contract_size
+        lots = risk_amount / risk_per_lot
+        lots = round(lots / RISK_MODEL["lot_step"]) * RISK_MODEL["lot_step"]
+        lots = max(RISK_MODEL["min_lot"], min(lots, RISK_MODEL["max_lot"]))
+
+        # Build RiskParams for the chase entry
+        chase_risk = RiskParams(
+            valid=True,
+            stop_loss=sl_price,
+            take_profit=tp_price,
+            stop_distance=stop_distance,
+            reward_distance=reward_distance,
+            risk_reward_ratio=self.min_rr,
+            position_size=lots,
+            risk_amount_usd=risk_amount,
+            risk_per_lot_usd=risk_per_lot,
+            notional_usd=chase_entry_price * contract_size * lots,
+        )
+
+        # Build costs via execution engine
+        spread_cost = self.execution._calculate_spread_cost(lots)
+        slippage_cost = self.execution._calculate_slippage_cost(lots, atr)
+        commission_cost = self.execution._calculate_commission(lots)
+
+        chase_fill = FillResult(
+            filled=True,
+            fill_price=chase_entry_price,
+            fill_model="MARKET_CHASE",
+            fill_reason=f"Chase entry: confluence {confluence_score}, slip {entry_slip:.2f}",
+            costs=CostBreakdown(
+                spread_cost=spread_cost,
+                slippage_cost=slippage_cost,
+                commission_cost=commission_cost,
+            ),
+        )
+
+        # Execute as a real trade — same path as normal fill
+        self.state.seen_patterns.add(pattern_key)
+
+        if entry.fvg_confluence:
+            self.confluence_stats["entries_with_fvg"] += 1
+        if entry.ob_confluence:
+            self.confluence_stats["entries_with_ob"] += 1
+        if entry.bos_confirmed:
+            self.confluence_stats["entries_with_bos"] += 1
+
+        self.rejection_stats["entries_executed"] += 1
+        self.chase_stats["chase_executed"] += 1
+        self._pending_confidence_tier = confidence_tier
+        self._pending_risk_pct = tier_risk_pct
+        self._execute_entry(entry, chase_risk, chase_fill, candle, current_idx, df, verbose)
+
+        ts = candle.get("timestamp")
+        self.time_filter.record_trade(ts)
+
+        if verbose:
+            logger.info(
+                f"CHASE ENTRY: {entry.direction} @ {chase_entry_price:.2f} "
+                f"(limit was {original_retest_level:.2f}, slip ${entry_slip:.2f}) | "
+                f"Confluence: {confluence_score} | Lots: {lots:.2f}"
+            )
+
+        return True
+
+    # -------------------------------------------------------------------------
+    # Phantom Fills — simulate missed limit orders at candle close
+    # -------------------------------------------------------------------------
+
+    def _capture_phantom_trade(self, entry, risk, candle, current_idx, df, atr,
+                               confidence_tier, tier_risk_pct, verbose):
+        """Simulate a missed fill trade entering at candle close."""
+        from config import RISK_MODEL
+
+        phantom_entry_price = candle["close"]
+        original_retest_level = getattr(entry, "desired_entry_price", entry.entry_price)
+        sl_price = risk.stop_loss
+
+        # Entry slippage: how much worse is close vs limit?
+        if entry.direction == "LONG":
+            entry_slippage = phantom_entry_price - original_retest_level
+            stop_distance = phantom_entry_price - sl_price
+        else:
+            entry_slippage = original_retest_level - phantom_entry_price
+            stop_distance = sl_price - phantom_entry_price
+
+        if stop_distance <= 0:
+            return  # Close is past the stop — invalid
+
+        # Recalculate TP with same R:R
+        reward_distance = stop_distance * self.min_rr
+        if entry.direction == "LONG":
+            tp_price = phantom_entry_price + reward_distance
+        else:
+            tp_price = phantom_entry_price - reward_distance
+
+        # Recalculate position size for wider stop
+        contract_size = RISK_MODEL["contract_size"]
+        risk_amount = self.current_balance * tier_risk_pct
+        risk_per_lot = stop_distance * contract_size
+        lots = risk_amount / risk_per_lot
+        lots = round(lots / RISK_MODEL["lot_step"]) * RISK_MODEL["lot_step"]
+        lots = max(RISK_MODEL["min_lot"], min(lots, RISK_MODEL["max_lot"]))
+
+        # Forward-scan to simulate exit
+        exit_result = self._simulate_phantom_exit(
+            direction=entry.direction,
+            entry_price=phantom_entry_price,
+            sl_price=sl_price,
+            tp_price=tp_price,
+            original_sl=sl_price,
+            position_size=lots,
+            entry_idx=current_idx,
+            df=df,
+        )
+        if exit_result is None:
+            return
+
+        phantom = {
+            "entry_time": str(candle.get("timestamp", "")),
+            "exit_time": exit_result["exit_time"],
+            "direction": entry.direction,
+            "entry_price": round(phantom_entry_price, 2),
+            "exit_price": exit_result["exit_price"],
+            "sl_price": round(sl_price, 2),
+            "tp_price": round(tp_price, 2),
+            "position_size": lots,
+            "r_multiple": exit_result["r_multiple"],
+            "exit_reason": exit_result["exit_reason"],
+            "gross_pnl": exit_result["gross_pnl"],
+            "net_pnl": exit_result["net_pnl"],
+            "original_retest_level": round(original_retest_level, 2),
+            "entry_slippage": round(entry_slippage, 2),
+            "bars_to_resolution": exit_result["bars_to_resolution"],
+            "confluence_score": getattr(entry, "confluence_score", 0),
+            "confidence_tier": confidence_tier,
+            "bos_confirmed": getattr(entry, "bos_confirmed", False),
+            "fvg_confluence": getattr(entry, "fvg_confluence", False),
+            "ob_confluence": getattr(entry, "ob_confluence", False),
+            "be_activated": exit_result.get("be_activated", False),
+            "trailing_activated": exit_result.get("trailing_activated", False),
+        }
+        self.phantom_trades.append(phantom)
+
+        if verbose:
+            outcome = "WIN" if exit_result["r_multiple"] > 0 else "LOSS"
+            logger.info(
+                f"PHANTOM ({outcome}): {entry.direction} @ {phantom_entry_price:.2f} "
+                f"(limit was {original_retest_level:.2f}, slip ${entry_slippage:.2f}) | "
+                f"Exit: {exit_result['exit_reason']} | R: {exit_result['r_multiple']:.2f} | "
+                f"Net: ${exit_result['net_pnl']:.2f}"
+            )
+
+    def _simulate_phantom_exit(self, direction, entry_price, sl_price, tp_price,
+                               original_sl, position_size, entry_idx, df):
+        """Forward-scan candles to find phantom trade exit. Stateless — no engine mutation."""
+        from config import RISK_MODEL
+
+        max_bars = min(self.max_trade_duration, len(df) - entry_idx - 1)
+        if max_bars <= 0:
+            return None
+
+        current_sl = sl_price
+        best_price = entry_price
+        trailing_active = False
+        be_activated = False
+        contract_size = RISK_MODEL["contract_size"]
+        be_trigger_r = STRATEGY.get("move_sl_to_be_at_r", 0)
+        trailing_enabled = STRATEGY.get("trailing_stop_enabled", False)
+        disable_tp_trailing = STRATEGY.get("disable_tp_when_trailing", False)
+        stop_distance_ref = entry_price - original_sl if direction == "LONG" else original_sl - entry_price
+
+        for offset in range(1, max_bars + 1):
+            idx = entry_idx + offset
+            if idx >= len(self._highs):
+                break
+
+            h = float(self._highs[idx])
+            l = float(self._lows[idx])
+            atr = float(self._atrs[idx])
+
+            # Update best price in favor
+            if direction == "LONG":
+                best_price = max(best_price, h)
+            else:
+                best_price = min(best_price, l)
+
+            # Apply BE stop
+            if be_trigger_r > 0 and not be_activated and stop_distance_ref > 0:
+                if direction == "LONG":
+                    current_r = (best_price - entry_price) / stop_distance_ref
+                else:
+                    current_r = (entry_price - best_price) / stop_distance_ref
+                if current_r >= be_trigger_r:
+                    be_buffer = atr * 0.1
+                    if direction == "LONG":
+                        new_be = entry_price + be_buffer
+                        if new_be > current_sl:
+                            current_sl = new_be
+                    else:
+                        new_be = entry_price - be_buffer
+                        if new_be < current_sl:
+                            current_sl = new_be
+                    be_activated = True
+
+            # Apply trailing stop
+            if trailing_enabled and atr > 0 and stop_distance_ref > 0:
+                eff_sl, is_trailing = get_effective_stop_with_trailing(
+                    entry_price=entry_price,
+                    current_sl=current_sl,
+                    current_extreme_price=best_price,
+                    stop_distance=stop_distance_ref,
+                    atr=atr,
+                    direction=direction,
+                )
+                if is_trailing and eff_sl != current_sl:
+                    current_sl = eff_sl
+                if is_trailing:
+                    trailing_active = True
+
+            # Effective TP (disable when trailing)
+            check_tp = tp_price
+            if disable_tp_trailing and trailing_active:
+                check_tp = float('inf') if direction == "LONG" else 0.0
+
+            # Check SL/TP hit
+            if direction == "LONG":
+                sl_hit = l <= current_sl
+                tp_hit = h >= check_tp
+            else:
+                sl_hit = h >= current_sl
+                tp_hit = l <= check_tp
+
+            if sl_hit or tp_hit:
+                exit_at_sl = sl_hit if not (sl_hit and tp_hit) else True  # WORST_CASE
+                exit_price = current_sl if exit_at_sl else check_tp
+                exit_reason = "SL" if exit_at_sl else "TP"
+
+                r_multiple = calculate_exit_r_multiple(
+                    entry_price, exit_price, original_sl, direction
+                )
+                price_diff = (exit_price - entry_price) if direction == "LONG" else (entry_price - exit_price)
+                gross_pnl = price_diff * contract_size * position_size
+                costs = self.execution._calculate_commission(position_size)
+                net_pnl = gross_pnl - costs
+
+                ts = df.iloc[idx].get("timestamp", "") if idx < len(df) else ""
+                return {
+                    "exit_price": round(exit_price, 2),
+                    "exit_reason": exit_reason,
+                    "exit_time": str(ts),
+                    "r_multiple": round(r_multiple, 3),
+                    "gross_pnl": round(gross_pnl, 2),
+                    "net_pnl": round(net_pnl, 2),
+                    "bars_to_resolution": offset,
+                    "trailing_activated": trailing_active,
+                    "be_activated": be_activated,
+                }
+
+        # Timeout — exit at last candle close
+        last_idx = min(entry_idx + max_bars, len(self._closes) - 1)
+        exit_price = float(self._closes[last_idx])
+        r_multiple = calculate_exit_r_multiple(entry_price, exit_price, original_sl, direction)
+        price_diff = (exit_price - entry_price) if direction == "LONG" else (entry_price - exit_price)
+        gross_pnl = price_diff * contract_size * position_size
+        costs = self.execution._calculate_commission(position_size)
+        net_pnl = gross_pnl - costs
+        ts = df.iloc[last_idx].get("timestamp", "") if last_idx < len(df) else ""
+
+        return {
+            "exit_price": round(exit_price, 2),
+            "exit_reason": "TIMEOUT",
+            "exit_time": str(ts),
+            "r_multiple": round(r_multiple, 3),
+            "gross_pnl": round(gross_pnl, 2),
+            "net_pnl": round(net_pnl, 2),
+            "bars_to_resolution": max_bars,
+            "trailing_activated": trailing_active,
+            "be_activated": be_activated,
+        }
+
+    def _build_phantom_summary(self) -> dict:
+        """Build phantom fills analysis summary."""
+        if not self.phantom_fills_enabled or not self.phantom_trades:
+            return {}
+
+        pdf = pd.DataFrame(self.phantom_trades)
+        wins = pdf[pdf["r_multiple"] > 0]
+        losses = pdf[pdf["r_multiple"] <= 0]
+        total_loss = abs(losses["net_pnl"].sum()) if len(losses) > 0 else 0
+
+        summary = {
+            "total_phantom": len(pdf),
+            "phantom_wins": len(wins),
+            "phantom_losses": len(losses),
+            "phantom_win_rate": round(len(wins) / len(pdf) * 100, 2),
+            "phantom_avg_r": round(pdf["r_multiple"].mean(), 3),
+            "phantom_median_r": round(pdf["r_multiple"].median(), 3),
+            "phantom_net_pnl": round(pdf["net_pnl"].sum(), 2),
+            "phantom_profit_factor": round(wins["net_pnl"].sum() / total_loss, 2) if total_loss > 0 else float("inf"),
+            "avg_entry_slippage": round(pdf["entry_slippage"].mean(), 2),
+            "avg_bars_to_resolution": round(pdf["bars_to_resolution"].mean(), 1),
+            "by_exit_reason": pdf["exit_reason"].value_counts().to_dict(),
+            "by_confluence_score": {},
+            "by_direction": {},
+            "trades": self.phantom_trades,
+        }
+
+        # Breakdown by confluence score
+        for score in sorted(pdf["confluence_score"].unique()):
+            subset = pdf[pdf["confluence_score"] == score]
+            w = len(subset[subset["r_multiple"] > 0])
+            l_pnl = abs(subset[subset["net_pnl"] <= 0]["net_pnl"].sum())
+            w_pnl = subset[subset["net_pnl"] > 0]["net_pnl"].sum()
+            summary["by_confluence_score"][int(score)] = {
+                "count": len(subset),
+                "wins": w,
+                "win_rate": round(w / len(subset) * 100, 1),
+                "avg_r": round(subset["r_multiple"].mean(), 3),
+                "net_pnl": round(subset["net_pnl"].sum(), 2),
+                "profit_factor": round(w_pnl / l_pnl, 2) if l_pnl > 0 else float("inf"),
+            }
+
+        # Breakdown by direction
+        for d in ["LONG", "SHORT"]:
+            subset = pdf[pdf["direction"] == d]
+            if len(subset) == 0:
+                continue
+            w = len(subset[subset["r_multiple"] > 0])
+            summary["by_direction"][d] = {
+                "count": len(subset),
+                "wins": w,
+                "win_rate": round(w / len(subset) * 100, 1),
+                "avg_r": round(subset["r_multiple"].mean(), 3),
+                "net_pnl": round(subset["net_pnl"].sum(), 2),
+            }
+
+        return summary
 
     def _generate_results(self) -> Dict[str, Any]:
         """Generate backtest results summary."""
@@ -1737,6 +2181,8 @@ class BacktestEngine:
             "cost_stats": self.cost_stats,
             "amd_conformity": amd_conformity,
             "confidence_tier_stats": confidence_tier_stats,
+            "phantom_fills": self._build_phantom_summary(),
+            "chase_stats": self.chase_stats if self.market_chase_enabled else {},
         }
 
     def save_trades_to_db(self, db: Database):

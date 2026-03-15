@@ -110,6 +110,8 @@ def run_backtest(
     enable_key_levels: bool = None,
     enable_volume_filter: bool = None,
     enable_fundamentals: bool = None,
+    enable_phantom_fills: bool = None,
+    enable_market_chase: bool = None,
     split_ratio: float = None,
     train_only: bool = False,
     test_only: bool = False,
@@ -214,6 +216,8 @@ def run_backtest(
             enable_key_levels=enable_key_levels,
             enable_volume_filter=enable_volume_filter,
             enable_fundamentals=enable_fundamentals,
+            enable_phantom_fills=enable_phantom_fills,
+            enable_market_chase=enable_market_chase,
         )
         return engine, engine.run(df_slice, verbose=verbose)
 
@@ -417,6 +421,53 @@ def run_backtest(
             print(f"  Big winners (>=3R):      {big_winners}")
             print("=" * 60)
 
+    # Phantom fills analysis
+    pf = results.get("phantom_fills", {})
+    if pf and pf.get("total_phantom", 0) > 0:
+        print("\n" + "=" * 60)
+        print("PHANTOM FILLS ANALYSIS (Missed Fill Simulation)")
+        print("=" * 60)
+        print(f"  Total Missed Fills:     {pf['total_phantom']}")
+        print(f"  Would-Be Winners:       {pf['phantom_wins']}")
+        print(f"  Would-Be Losers:        {pf['phantom_losses']}")
+        print(f"  Phantom Win Rate:       {pf['phantom_win_rate']:.1f}%")
+        print(f"  Phantom Avg R:          {pf['phantom_avg_r']:+.3f}")
+        print(f"  Phantom Median R:       {pf['phantom_median_r']:+.3f}")
+        print(f"  Phantom Net P&L:        ${pf['phantom_net_pnl']:,.2f}")
+        print(f"  Phantom Profit Factor:  {pf['phantom_profit_factor']:.2f}")
+        print(f"  Avg Entry Slippage:     ${pf['avg_entry_slippage']:.2f}")
+        print(f"  Avg Bars to Exit:       {pf['avg_bars_to_resolution']:.0f}")
+        print(f"\n  Exit Reasons:")
+        for reason, count in sorted(pf.get("by_exit_reason", {}).items()):
+            print(f"    {reason:<20} {count}")
+        print(f"\n  BY CONFLUENCE SCORE:")
+        print(f"  {'Score':<8} {'Count':>6} {'Wins':>6} {'WR%':>7} {'AvgR':>8} {'PF':>6} {'PnL':>10}")
+        print("  " + "-" * 55)
+        for score, stats in sorted(pf.get("by_confluence_score", {}).items()):
+            print(f"  {score:<8} {stats['count']:>6} {stats['wins']:>6} {stats['win_rate']:>6.1f}% {stats['avg_r']:>+7.3f} {stats['profit_factor']:>5.2f} ${stats['net_pnl']:>+9.2f}")
+        print(f"\n  BY DIRECTION:")
+        for d, stats in pf.get("by_direction", {}).items():
+            print(f"    {d:<6} {stats['count']:>4} trades | WR: {stats['win_rate']:.1f}% | Avg R: {stats['avg_r']:+.3f} | PnL: ${stats['net_pnl']:+.2f}")
+        print("=" * 60)
+
+    # Market chase stats
+    cs = results.get("chase_stats", {})
+    if cs and cs.get("chase_attempts", 0) > 0:
+        print("\n" + "=" * 60)
+        print("MARKET CHASE STATS (Real Trades from Missed Fills)")
+        print("=" * 60)
+        print(f"  Chase Attempts:         {cs['chase_attempts']}")
+        print(f"  Chase Executed:         {cs['chase_executed']}")
+        print(f"  Rejected (direction):   {cs['chase_rejected_direction']}")
+        print(f"  Rejected (confluence):  {cs['chase_rejected_confluence']}")
+        print(f"  Rejected (slippage):    {cs['chase_rejected_slippage']}")
+        print(f"  Rejected (risk):        {cs['chase_rejected_risk_invalid']}")
+        print("=" * 60)
+
+    # Add chase entries to funnel display
+    if "funnel_stats" in results and cs and cs.get("chase_executed", 0) > 0:
+        print(f"\n  CHASE ENTRIES:           {cs['chase_executed']}")
+
     run_sets = []
     if engine_train and results_train:
         run_sets.append(("train", engine_train, results_train))
@@ -514,6 +565,10 @@ Examples:
     # Filter toggles (enable)
     parser.add_argument("--enable-fundamentals", action="store_true", help="Enable fundamentals filter (DXY/yields)")
 
+    # Analysis
+    parser.add_argument("--phantom-fills", action="store_true", help="Simulate missed fill trades at candle close (phantom analysis)")
+    parser.add_argument("--market-chase", action="store_true", help="Enter at close for high-quality missed fills (real trades)")
+
     args = parser.parse_args()
 
     start_date = datetime.strptime(args.start, "%Y-%m-%d") if args.start else None
@@ -542,6 +597,8 @@ Examples:
         enable_key_levels=not args.no_keylevel if args.no_keylevel else None,
         enable_volume_filter=not args.no_volume if args.no_volume else None,
         enable_fundamentals=args.enable_fundamentals if args.enable_fundamentals else None,
+        enable_phantom_fills=args.phantom_fills if args.phantom_fills else None,
+        enable_market_chase=args.market_chase if args.market_chase else None,
         split_ratio=args.split,
         train_only=args.train_only,
         test_only=args.test_only,

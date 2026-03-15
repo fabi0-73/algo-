@@ -173,7 +173,14 @@ class ExecutionEngine:
         return spread_usd_per_oz * self.contract_size * position_size
 
     def _calculate_slippage(self, atr: float) -> float:
-        """Calculate slippage in price points."""
+        """Calculate slippage in USD per ounce (price-space).
+
+        Note: Unlike spread_points (MT5 points, 1 pt = $0.01), slippage is
+        returned directly in USD/oz.  For ATR_MULT the value comes from
+        ``atr * mult`` which is already USD/oz.  For FIXED_POINTS the config
+        value ``slippage_points`` is also interpreted as USD/oz (e.g. 0.05
+        means $0.05 per ounce).
+        """
         model = (self.slippage_model or "NONE").upper()
         if model == "NONE":
             return 0.0
@@ -184,9 +191,12 @@ class ExecutionEngine:
         return 0.0
 
     def _calculate_slippage_cost(self, position_size: float, atr: float) -> float:
-        """Calculate slippage cost in USD."""
-        slippage_points = self._calculate_slippage(atr)
-        return slippage_points * self.contract_size * position_size
+        """Calculate slippage cost in USD.
+
+        slippage_usd_per_oz * contract_size * lots
+        """
+        slippage_usd_per_oz = self._calculate_slippage(atr)
+        return slippage_usd_per_oz * self.contract_size * position_size
 
     def _calculate_commission(self, position_size: float) -> float:
         """Calculate commission in USD."""
@@ -317,10 +327,16 @@ class ExecutionEngine:
             exit_at_sl = sl_hit
 
         if exit_at_sl:
+            # Apply unfavorable slippage to SL exits (realistic)
+            sl_slippage = self._calculate_slippage(atr)
+            if direction == "LONG":
+                slipped_sl = sl_price - sl_slippage  # Worse for longs
+            else:
+                slipped_sl = sl_price + sl_slippage  # Worse for shorts
             return ExitDecision(
                 should_exit=True,
                 exit_reason="SL",
-                exit_price=sl_price,
+                exit_price=slipped_sl,
             )
         else:
             return ExitDecision(
@@ -380,12 +396,17 @@ class ExecutionEngine:
             partial_hit = not partial_tp_taken and candle["low"] <= partial_tp
             tp_hit = candle["low"] <= tp_price
 
-        # Priority 1: SL hit = full exit
+        # Priority 1: SL hit = full exit (with slippage)
         if sl_hit:
+            sl_slippage = self._calculate_slippage(atr)
+            if direction == "LONG":
+                slipped_sl = sl_price - sl_slippage
+            else:
+                slipped_sl = sl_price + sl_slippage
             return ExitDecision(
                 should_exit=True,
                 exit_reason="SL",
-                exit_price=sl_price,
+                exit_price=slipped_sl,
                 is_partial=False,
             )
 

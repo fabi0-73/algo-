@@ -63,7 +63,7 @@ def detect_order_block(
     min_body_atr_mult: float = None,
     displacement_mult: float = None,
     atr: float = None,
-    lookback: int = 10,
+    lookback: int = None,
 ) -> Optional[OrderBlock]:
     """
     Detect an Order Block before an impulsive move.
@@ -86,10 +86,11 @@ def detect_order_block(
     """
     min_body_atr_mult = min_body_atr_mult or STRATEGY.get("ob_min_body_atr_mult", 0.15)
     displacement_mult = displacement_mult or STRATEGY.get("ob_displacement_mult", 1.5)
-    
+    lookback = lookback if lookback is not None else STRATEGY.get("ob_lookback", 10)
+
     if impulse_start_idx < 1 or impulse_start_idx >= len(df):
         return None
-    
+
     search_start = max(0, impulse_start_idx - lookback)
     
     # Find the last opposing candle before impulse

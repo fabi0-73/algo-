@@ -7,9 +7,33 @@ from typing import Optional
 import pandas as pd
 import numpy as np
 
-from config import STRATEGY
+from config import STRATEGY, TIME_CONFIG
 from .consolidation import ConsolidationResult
 from .indicators import calculate_atr
+
+
+def _est_midnight_hour_in_data_tz() -> int:
+    """Return the hour in the data timezone that corresponds to 00:00 EST (05:00 UTC).
+
+    For UTC data this returns 5.  For Europe/Athens (UTC+2) this returns 7.
+    Uses a fixed winter-time offset (no DST adjustment) since the trading
+    calendar midnight is conventionally defined as NY 00:00 EST.
+    """
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+
+    data_tz_name = TIME_CONFIG.get("data_timezone", "UTC")
+    if data_tz_name == "UTC":
+        return 5
+
+    # Use a fixed winter date to get a stable offset
+    reference = datetime(2024, 1, 15, 5, 0, tzinfo=timezone.utc)
+    local = reference.astimezone(ZoneInfo(data_tz_name))
+    return local.hour
+
+
+# Cache the result so we only compute once
+_MIDNIGHT_HOUR = _est_midnight_hour_in_data_tz()
 
 
 @dataclass
@@ -353,7 +377,7 @@ def get_midnight_open_fast(
     """O(1) midnight open lookup using pre-computed dict."""
     ts = pd.Timestamp(timestamps_arr[current_idx])
     if hasattr(ts, "hour"):
-        target_date = ts.date() if ts.hour >= 5 else (ts - pd.Timedelta(days=1)).date()
+        target_date = ts.date() if ts.hour >= _MIDNIGHT_HOUR else (ts - pd.Timedelta(days=1)).date()
         return midnight_opens.get(target_date)
     return None
 
@@ -373,7 +397,7 @@ def get_midnight_open(df: pd.DataFrame, current_idx: int) -> Optional[float]:
         return None
 
     if hasattr(current_ts, "hour"):
-        target_hour = 5  # 05:00 UTC = 00:00 EST
+        target_hour = _MIDNIGHT_HOUR  # 00:00 EST mapped to data timezone
         current_date = current_ts.date() if current_ts.hour >= target_hour else (current_ts - pd.Timedelta(days=1)).date()
 
         for i in range(current_idx, max(current_idx - 300, -1), -1):
@@ -415,7 +439,7 @@ def score_judas_quality(
 
     max_quality_candles = STRATEGY.get("judas_max_candles", 5)
     min_velocity_atr = STRATEGY.get("judas_min_velocity_atr", 0.3)
-    atr = manip.atr if manip.atr > 0 else 1.0
+    atr = manip.atr if manip.atr > 0 else (manip.break_distance or 1.0)
 
     # Estimate break candle if not provided
     if break_candle_idx < 0:
@@ -440,11 +464,13 @@ def score_judas_quality(
     if manip.velocity_score >= min_velocity_atr:
         quality += 1
 
-    # Session scoring: London open (07:00-10:00 UTC)
+    # Session scoring: London open window (configurable, default 07:00-10:00 UTC)
+    london_start = STRATEGY.get("judas_london_start_hour", 7)
+    london_end = STRATEGY.get("judas_london_end_hour", 10)
     if STRATEGY.get("judas_london_bonus", True) and "timestamp" in df.columns:
         ts = df.iloc[min(manip.return_candle_idx, len(df) - 1)].get("timestamp")
         if ts is not None and hasattr(ts, "hour"):
-            if 7 <= ts.hour <= 10:
+            if london_start <= ts.hour <= london_end:
                 manip.session_score = 1.0
                 quality += 1
 
@@ -472,7 +498,7 @@ def score_judas_quality_fast(
 
     max_quality_candles = STRATEGY.get("judas_max_candles", 5)
     min_velocity_atr = STRATEGY.get("judas_min_velocity_atr", 0.3)
-    atr = manip.atr if manip.atr > 0 else 1.0
+    atr = manip.atr if manip.atr > 0 else (manip.break_distance or 1.0)
 
     if break_candle_idx < 0:
         return_candles = STRATEGY.get("manipulation_return_candles", 12)

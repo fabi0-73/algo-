@@ -170,7 +170,7 @@ def run_signal_loop(
                     f"SIGNAL: {sig.direction} {sig.symbol} @ {sig.entry_price} | "
                     f"SL: {sig.stop_loss} | TP: {sig.take_profit} | "
                     f"RR: {sig.risk_reward} | Conf: {sig.confluence_score} | "
-                    f"Quality: {sig.confidence}"
+                    f"Tier: {sig.confidence.upper()} ({sig.risk_pct*100:.1f}% risk)"
                 )
         else:
             logger.info("No signals detected")

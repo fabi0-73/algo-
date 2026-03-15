@@ -156,7 +156,7 @@ def calculate_metrics(
 
     metrics.gross_profit = df[df[pnl_col] > 0][pnl_col].sum()
     metrics.gross_loss = abs(df[df[pnl_col] < 0][pnl_col].sum())
-    metrics.profit_factor = metrics.gross_profit / metrics.gross_loss if metrics.gross_loss > 0 else float("inf")
+    metrics.profit_factor = metrics.gross_profit / metrics.gross_loss if metrics.gross_loss > 0 else 999.0
     metrics.avg_pnl_per_trade = metrics.net_pnl / metrics.total_trades if metrics.total_trades > 0 else 0
 
     # Execution costs
@@ -184,6 +184,12 @@ def calculate_metrics(
 
     metrics.cost_per_trade = metrics.total_costs / metrics.total_trades if metrics.total_trades > 0 else 0
 
+    # Compute trading days for ratio annualization
+    if 'timestamp' in df.columns and len(df) > 1:
+        trading_days = (df["timestamp"].iloc[-1] - df["timestamp"].iloc[0]).days or 1
+    else:
+        trading_days = max(len(df), 1)
+
     # Drawdown - prefer MTM equity curve
     dd_curve = mtm_equity_curve if mtm_equity_curve else equity_curve
     if dd_curve:
@@ -195,15 +201,21 @@ def calculate_metrics(
         metrics.max_drawdown_pct = drawdown_pct.max()
         metrics.max_drawdown_usd = drawdown_usd.max()
 
-        # Calmar ratio (annual return / max drawdown)
+        # Calmar ratio (annualized return / max drawdown)
         total_return = (equity.iloc[-1] - equity.iloc[0]) / equity.iloc[0]
-        metrics.calmar_ratio = total_return / metrics.max_drawdown_pct if metrics.max_drawdown_pct > 0 else 0
+        annualized_return = (1 + total_return) ** (252 / trading_days) - 1
+        metrics.calmar_ratio = annualized_return / metrics.max_drawdown_pct if metrics.max_drawdown_pct > 0 else 0
 
-    # Sharpe ratio (simplified, using R-multiples)
-    if len(r_multiples) > 1:
-        avg_r = r_multiples.mean()
-        std_r = r_multiples.std()
-        metrics.sharpe_ratio = avg_r / std_r if std_r > 0 else 0
+    # Sharpe ratio from per-trade USD returns (annualized)
+    if dd_curve and pnl_col in df.columns and len(df) > 1:
+        trade_returns = df[pnl_col] / equity.iloc[0]
+        avg_ret = trade_returns.mean()
+        std_ret = trade_returns.std()
+        if std_ret > 0:
+            trades_per_year = len(df) / max(trading_days / 252, 1/252)
+            metrics.sharpe_ratio = (avg_ret / std_ret) * (trades_per_year ** 0.5)
+        else:
+            metrics.sharpe_ratio = 0
 
     # Consecutive wins/losses
     metrics.max_consecutive_wins, metrics.max_consecutive_losses = _calculate_consecutive(df, pnl_col)

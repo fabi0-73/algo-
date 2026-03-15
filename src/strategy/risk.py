@@ -126,8 +126,16 @@ def calculate_risk(
 
     # Get ATR from entry or use provided
     if atr is None:
-        # Try to get from entry context if available
-        atr = getattr(entry, 'atr', None) or 1.0  # Default 1.0 to avoid division by zero
+        atr = getattr(entry, 'atr', None)
+        if atr is None or atr <= 0:
+            import logging
+            logging.getLogger(__name__).warning(
+                "ATR not provided to calculate_risk(); using fallback based on "
+                "entry/SL distance. Provide ATR for accurate stop placement."
+            )
+            # Derive a reasonable ATR from the manipulation range
+            manip_range = abs(entry.entry_price - entry.manipulation_extreme)
+            atr = manip_range if manip_range > 0 else entry.entry_price * 0.002
 
     # Calculate stop loss with buffer
     if use_risk_model:

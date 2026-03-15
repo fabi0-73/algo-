@@ -4,6 +4,7 @@ Confirms the real move after the manipulation fakeout.
 """
 from dataclasses import dataclass
 from typing import Optional
+import math
 import pandas as pd
 import numpy as np
 
@@ -161,7 +162,7 @@ def validate_distribution_strength(
     if distribution.direction == "UP":
         # Check if subsequent candles maintain bullish bias
         bullish_count = (follow_through["close"] > follow_through["open"]).sum()
-        if bullish_count < min_follow_through_candles / 2:
+        if bullish_count < math.ceil(min_follow_through_candles / 2):
             return False
         # Check for new high extension beyond break price
         if require_extension and follow_through["high"].max() <= distribution.break_price:
@@ -170,7 +171,7 @@ def validate_distribution_strength(
     else:
         # Check if subsequent candles maintain bearish bias
         bearish_count = (follow_through["close"] < follow_through["open"]).sum()
-        if bearish_count < min_follow_through_candles / 2:
+        if bearish_count < math.ceil(min_follow_through_candles / 2):
             return False
         # Check for new low extension beyond break price
         if require_extension and follow_through["low"].min() >= distribution.break_price:

@@ -12,7 +12,7 @@ from typing import List, Optional, Dict, Any
 import pandas as pd
 import numpy as np
 
-from config import STRATEGY, RISK_MODEL, SESSION_FILTER
+from config import STRATEGY, RISK_MODEL, SESSION_FILTER, CONFIDENCE_SIZING
 from src.strategy.indicators import add_indicators, calculate_atr
 from src.strategy.consolidation import ConsolidationResult, detect_equal_levels
 from src.strategy.manipulation import (
@@ -55,6 +55,8 @@ class LiveSignal:
     judas_quality: int
     confidence: str
 
+    risk_pct: float = 0.0
+
     consolidation_high: float = 0.0
     consolidation_low: float = 0.0
     manipulation_extreme: float = 0.0
@@ -95,6 +97,10 @@ class LiveSignalScanner:
         self.news_filter = NewsFilterEngine()
         self.htf_bias = HTFBiasEngine()
         self.volume_filter = VolumeFilterEngine()
+
+        # Deduplication: track recently emitted signals by pattern key
+        self._recent_signals: dict[str, datetime] = {}
+        self._signal_expiry_minutes = 30  # Ignore duplicate within this window
 
     def scan(self, df: pd.DataFrame) -> List[LiveSignal]:
         """
@@ -220,12 +226,11 @@ class LiveSignalScanner:
 
             confluence = getattr(entry, "confluence_score", 0)
             judas_q = getattr(manip, "judas_quality", 0)
-            if confluence >= 3 and judas_q >= 2:
-                confidence = "HIGH"
-            elif confluence >= 2:
-                confidence = "MEDIUM"
-            else:
-                confidence = "LOW"
+
+            # Match backtest CONFIDENCE_SIZING tiers
+            confidence, risk_pct = self._classify_confidence_tier(
+                confluence, ts,
+            )
 
             signal = LiveSignal(
                 timestamp=ts,
@@ -239,6 +244,7 @@ class LiveSignalScanner:
                 confluence_score=confluence,
                 judas_quality=judas_q,
                 confidence=confidence,
+                risk_pct=risk_pct,
                 consolidation_high=consol.range_high,
                 consolidation_low=consol.range_low,
                 manipulation_extreme=manip.extreme_price,
@@ -249,10 +255,54 @@ class LiveSignalScanner:
                 volume_confirmed=getattr(manip, "volume_confirmed", False),
                 midnight_price_swept=getattr(manip, "midnight_price_swept", False),
             )
+            # Deduplication: skip if same pattern seen recently
+            sig_key = f"{signal.direction}_{signal.entry_price:.2f}_{consol.range_high:.2f}_{consol.range_low:.2f}"
+            now = datetime.now()
+            if sig_key in self._recent_signals:
+                age = (now - self._recent_signals[sig_key]).total_seconds() / 60
+                if age < self._signal_expiry_minutes:
+                    logger.debug(f"Skipping duplicate signal {sig_key} (age {age:.0f}m)")
+                    break
+
+            self._recent_signals[sig_key] = now
+            # Prune expired entries
+            self._recent_signals = {
+                k: v for k, v in self._recent_signals.items()
+                if (now - v).total_seconds() / 60 < self._signal_expiry_minutes
+            }
+
             signals.append(signal)
             break  # One signal per scan
 
         return signals
+
+    @staticmethod
+    def _classify_confidence_tier(confluence_score: int, ts) -> tuple:
+        """Classify trade into confidence tier using CONFIDENCE_SIZING config.
+
+        Returns (tier_name, risk_pct).
+        """
+        if not CONFIDENCE_SIZING.get("enabled", False):
+            base = RISK_MODEL.get("risk_pct_per_trade_default", 0.005)
+            return "base", base
+
+        # Determine if current hour is within prime hours
+        prime_start = CONFIDENCE_SIZING.get("prime_hours_start", 13)
+        prime_end = CONFIDENCE_SIZING.get("prime_hours_end", 17)
+        hour = ts.hour if hasattr(ts, "hour") else 0
+        is_prime = prime_start <= hour <= prime_end
+
+        # Check tiers top-down, first match wins
+        for tier in CONFIDENCE_SIZING.get("tiers", []):
+            min_score = tier.get("min_confluence_score", 0)
+            prime_only = tier.get("prime_hours_only", False)
+
+            if confluence_score >= min_score:
+                if prime_only and not is_prime:
+                    continue
+                return tier["name"], tier["risk_pct"]
+
+        return "base", CONFIDENCE_SIZING.get("base_risk_pct", 0.003)
 
     def _is_consolidation(
         self, h: np.ndarray, l: np.ndarray, c: np.ndarray, atr: float,

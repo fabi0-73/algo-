@@ -8,7 +8,7 @@ from typing import Optional
 import pandas as pd
 import numpy as np
 
-from config import HTF_BIAS
+from config import HTF_BIAS, TIME_CONFIG
 
 
 class Bias(Enum):
@@ -108,7 +108,15 @@ class HTFBiasEngine:
         # Set timestamp as index
         df_temp = df.set_index(timestamp_col)
 
-        # Resample OHLC
+        # Convert to UTC for consistent bar boundaries, then convert back
+        data_tz = TIME_CONFIG.get("data_timezone", "UTC")
+        needs_conversion = data_tz != "UTC"
+        if needs_conversion and df_temp.index.tz is None:
+            df_temp.index = df_temp.index.tz_localize(data_tz).tz_convert("UTC")
+        elif needs_conversion and df_temp.index.tz is not None:
+            df_temp.index = df_temp.index.tz_convert("UTC")
+
+        # Resample OHLC on UTC-aligned boundaries
         htf = df_temp.resample(rule).agg({
             "open": "first",
             "high": "max",
@@ -116,6 +124,10 @@ class HTFBiasEngine:
             "close": "last",
             "volume": "sum" if "volume" in df_temp.columns else "first",
         }).dropna()
+
+        # Convert back to data timezone
+        if needs_conversion:
+            htf.index = htf.index.tz_convert(data_tz).tz_localize(None)
 
         htf = htf.reset_index()
         return htf

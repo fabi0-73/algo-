@@ -32,12 +32,23 @@ class MT5Client:
     def __init__(self):
         self._connected = False
     
+    def _check_connection(self) -> bool:
+        """Verify MT5 connection is still alive. Reset flag if dead."""
+        if not self._connected:
+            return False
+        info = mt5.terminal_info()
+        if info is None:
+            logger.warning("MT5 connection lost — resetting")
+            self._connected = False
+            return False
+        return True
+
     def connect(self) -> bool:
         """
         Initialize connection to MT5 terminal.
         Returns True if successful.
         """
-        if self._connected:
+        if self._check_connection():
             return True
         
         # Initialize MT5
@@ -134,15 +145,16 @@ class MT5Client:
         df["time"] = pd.to_datetime(df["time"], unit="s")
         df = df.rename(columns={
             "time": "timestamp",
-            "tick_volume": "volume",
         })
+        # Keep tick_volume (used by engine/strategy) and add volume alias
+        df["volume"] = df["tick_volume"]
         
         # Add symbol and timeframe columns
         df["symbol"] = symbol
         df["timeframe"] = timeframe
         
-        # Reorder columns
-        df = df[["symbol", "timeframe", "timestamp", "open", "high", "low", "close", "volume"]]
+        # Reorder columns (keep tick_volume for engine compatibility)
+        df = df[["symbol", "timeframe", "timestamp", "open", "high", "low", "close", "tick_volume", "volume"]]
         
         logger.info(f"Fetched {len(df)} candles for {symbol} {timeframe}")
         return df
