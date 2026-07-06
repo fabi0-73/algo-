@@ -12,7 +12,7 @@ from typing import List, Optional, Dict, Any
 import pandas as pd
 import numpy as np
 
-from config import STRATEGY, RISK_MODEL, SESSION_FILTER, CONFIDENCE_SIZING
+from config import STRATEGY, RISK_MODEL, SESSION_FILTER, CONFIDENCE_SIZING, ADAPTIVE_EXITS, SIGNAL_CONFIDENCE
 from src.strategy.indicators import add_indicators, calculate_atr
 from src.strategy.consolidation import ConsolidationResult, detect_equal_levels
 from src.strategy.manipulation import (
@@ -25,9 +25,12 @@ from src.strategy.distribution import DistributionResult, validate_distribution_
 from src.strategy.entry import (
     check_entry_at_candle,
     check_premium_discount_filter,
+    calculate_move_potential,
+    calculate_signal_confidence,
     EntrySignal,
     ENTRY_MODE_RETEST_ONLY,
 )
+from src.strategy.consolidation import score_consolidation_quality
 from src.strategy.risk import calculate_risk, RiskParams
 from src.strategy.fvg import find_fvg_at_retest_level
 from src.strategy.order_blocks import find_ob_at_retest_level
@@ -56,6 +59,20 @@ class LiveSignal:
     confidence: str
 
     risk_pct: float = 0.0
+
+    # Empirical signal confidence (0-4 + LOW/MODERATE/GOOD/HIGH label)
+    signal_confidence: int = 0
+    confidence_label: str = ""
+
+    # Adaptive exit guidance
+    move_potential: int = 0          # 0-5: how far the setup may run
+    exit_tier: str = ""              # "runner", "standard", or "" (default)
+    suggested_tp: float = 0.0       # Tier-adjusted TP (0 = trail only)
+    trailing_activation_r: float = 0.0
+    trailing_atr_mult: float = 0.0
+    be_trigger_r: float = 0.0
+    partial_tp_at_r: float = 0.0
+    partial_close_pct: float = 0.0
 
     consolidation_high: float = 0.0
     consolidation_low: float = 0.0
@@ -101,6 +118,10 @@ class LiveSignalScanner:
         # Deduplication: track recently emitted signals by pattern key
         self._recent_signals: dict[str, datetime] = {}
         self._signal_expiry_minutes = 30  # Ignore duplicate within this window
+
+        # NY_IB stream: day-scoped dedup (one attempt per broker day — the
+        # 30-min price-keyed AMD dedup is unsuitable for a daily setup)
+        self._nyib_signaled_days: set = set()
 
     def scan(self, df: pd.DataFrame) -> List[LiveSignal]:
         """
@@ -232,6 +253,49 @@ class LiveSignalScanner:
                 confluence, ts,
             )
 
+            # Compute move potential and resolve exit tier
+            entry_hour = ts.hour if hasattr(ts, "hour") else 0
+            equal_level_swept = getattr(entry, "equal_level_swept", False)
+            mp = calculate_move_potential(
+                velocity_score=getattr(manip, "velocity_score", 0.0),
+                session_hour=entry_hour,
+                body_expansion=getattr(dist, "body_expansion", 0.0),
+                consolidation_quality=score_consolidation_quality(consol),
+                equal_level_swept=equal_level_swept,
+            )
+            exit_tier_name = ""
+            tier_cfg = {}
+            for tier in ADAPTIVE_EXITS.get("tiers", []):
+                if mp >= tier.get("min_move_potential", 999):
+                    exit_tier_name = tier["name"]
+                    tier_cfg = tier
+                    break
+
+            # Empirical signal confidence (same function as backtest) + HIGH up-sizing
+            signal_conf, conf_label = calculate_signal_confidence(confluence, mp, entry_hour)
+            if (SIGNAL_CONFIDENCE.get("enabled", False)
+                    and SIGNAL_CONFIDENCE.get("size_by_confidence", False)):
+                extra = 0.0
+                if conf_label == "HIGH":
+                    extra = SIGNAL_CONFIDENCE.get("high_extra_lots", 0.0)
+                elif conf_label == "GOOD":
+                    extra = SIGNAL_CONFIDENCE.get("good_extra_lots", 0.0)
+                if extra > 0:
+                    risk.position_size = min(
+                        risk.position_size + extra, RISK_MODEL.get("max_lot", 50.0)
+                    )
+
+            # Compute tier-adjusted TP
+            stop_dist = abs(risk.entry_price - risk.stop_loss) if hasattr(risk, "entry_price") else abs(entry.entry_price - risk.stop_loss)
+            suggested_tp = risk.take_profit
+            if tier_cfg.get("tp_rr", 0) > 0 and stop_dist > 0:
+                if entry.direction == "LONG":
+                    suggested_tp = entry.entry_price + stop_dist * tier_cfg["tp_rr"]
+                else:
+                    suggested_tp = entry.entry_price - stop_dist * tier_cfg["tp_rr"]
+            elif tier_cfg.get("tp_rr", -1) == 0:
+                suggested_tp = 0.0  # No static TP — trail only
+
             signal = LiveSignal(
                 timestamp=ts,
                 symbol=self.symbol,
@@ -245,6 +309,18 @@ class LiveSignalScanner:
                 judas_quality=judas_q,
                 confidence=confidence,
                 risk_pct=risk_pct,
+                signal_confidence=signal_conf,
+                confidence_label=conf_label,
+                # Adaptive exit guidance
+                move_potential=mp,
+                exit_tier=exit_tier_name,
+                suggested_tp=round(suggested_tp, 2),
+                trailing_activation_r=tier_cfg.get("trailing_activation_r", 0),
+                trailing_atr_mult=tier_cfg.get("trailing_atr_mult", 0),
+                be_trigger_r=tier_cfg.get("be_trigger_r", 0),
+                partial_tp_at_r=tier_cfg.get("partial_tp_at_r", 0),
+                partial_close_pct=tier_cfg.get("partial_close_pct", 0),
+                # Pattern context
                 consolidation_high=consol.range_high,
                 consolidation_low=consol.range_low,
                 manipulation_extreme=manip.extreme_price,
@@ -272,9 +348,130 @@ class LiveSignalScanner:
             }
 
             signals.append(signal)
-            break  # One signal per scan
+            break  # One AMD signal per scan
+
+        # NY_IB stream runs beside AMD — both may emit in the same scan
+        try:
+            signals.extend(self.scan_ny_ib(df))
+        except Exception as e:  # a broken second stream must never kill AMD
+            logger.error(f"NY_IB scan failed: {e}")
 
         return signals
+
+    def scan_ny_ib(self, df: pd.DataFrame) -> List[LiveSignal]:
+        """NY Initial Balance pullback signals (NY_IB_MODEL; engine-validated
+        runs 19af4776/12a01408: 77% WR, PF 1.8, +0.10R after news filter).
+
+        IB = 16:30-17:30 broker high/low from CLOSED bars (run_live drops the
+        forming bar). After a bar closes beyond the IB within 17:30-22:00, emit
+        ONE signal per day: a LIMIT back inside the range, SL across the range,
+        small TP past the edge, force-flat 23:00. The breakout close must be on
+        one of the last few bars — stale breakouts (scanner offline) are skipped.
+        """
+        from config import NY_IB_MODEL
+
+        if not NY_IB_MODEL.get("enabled", False):
+            return []
+
+        def _mins(s):
+            hh, mm = (int(x) for x in str(s).split(":"))
+            return hh * 60 + mm
+
+        ib_start = _mins(NY_IB_MODEL.get("ib_start", "16:30"))
+        ib_end = _mins(NY_IB_MODEL.get("ib_end", "17:30"))
+        scan_end = _mins(NY_IB_MODEL.get("scan_end", "22:00"))
+
+        ts_last = df["timestamp"].iloc[-1]
+        day = pd.Timestamp(ts_last).normalize()
+        if day in self._nyib_signaled_days:
+            return []
+
+        mod = df["timestamp"].dt.hour * 60 + df["timestamp"].dt.minute
+        today = df["timestamp"].dt.normalize() == day
+        ib_bars = df[today & (mod >= ib_start) & (mod < ib_end)]
+        if len(ib_bars) < int(NY_IB_MODEL.get("min_ib_bars", 10)):
+            return []
+        ib_hi = float(ib_bars["high"].max())
+        ib_lo = float(ib_bars["low"].min())
+        size = ib_hi - ib_lo
+        ref = float(ib_bars["close"].iloc[-1])
+        if not (NY_IB_MODEL.get("ib_min_pct", 0.004) * ref
+                <= size <= NY_IB_MODEL.get("ib_max_pct", 0.02) * ref):
+            return []
+
+        window = df[today & (mod >= ib_end) & (mod < scan_end)]
+        if window.empty:
+            return []
+        long_only = NY_IB_MODEL.get("long_only", False)
+        breaks = window[(window["close"] > ib_hi)
+                        | ((window["close"] < ib_lo) if not long_only else False)]
+        if breaks.empty:
+            return []
+        first = breaks.iloc[0]
+        # The FIRST confirming close consumes the day's attempt (engine/lab
+        # parity) — mark the day even if the signal below is rejected.
+        self._nyib_signaled_days.add(day)
+        if len(self._nyib_signaled_days) > 10:
+            self._nyib_signaled_days = set(sorted(self._nyib_signaled_days)[-10:])
+
+        # Act only on FRESH breakouts (within the last 3 closed bars) — a stale
+        # limit price from hours ago is not a tradeable signal.
+        if first.name < len(df) - 3:
+            logger.info("NY_IB: breakout close is stale (scanner gap?) — skipped")
+            return []
+
+        # News blackout still applies; killzone gate deliberately does not
+        can_enter, reason = self.news_filter.can_enter_trade(first["timestamp"])
+        if not can_enter:
+            logger.info(f"NY_IB: breakout filtered by news blackout ({reason})")
+            return []
+
+        direction = "LONG" if float(first["close"]) > ib_hi else "SHORT"
+        rf = NY_IB_MODEL.get("retrace_frac", 0.10)
+        slm = NY_IB_MODEL.get("sl_range_mult", 1.0)
+        tpm = NY_IB_MODEL.get("tp_range_mult", 0.20)
+        if direction == "LONG":
+            limit = ib_hi - rf * size
+            sl = limit - slm * size
+            tp = ib_hi + tpm * size
+        else:
+            limit = ib_lo + rf * size
+            sl = limit + slm * size
+            tp = ib_lo - tpm * size
+
+        # Flat base-tier sizing (no AMD confluence), engine parity
+        base_risk = CONFIDENCE_SIZING.get("base_risk_pct",
+                                          RISK_MODEL.get("risk_pct_per_trade_default", 0.005))
+        stop_dist = abs(limit - sl)
+        contract = RISK_MODEL.get("contract_size", 100)
+        step = RISK_MODEL.get("lot_step", 0.01)
+        lots = (self.account_balance * base_risk) / (stop_dist * contract)
+        lots = round(lots / step) * step
+        lots = min(max(lots, RISK_MODEL.get("min_lot", 0.01)),
+                   RISK_MODEL.get("max_lot", 1.0))
+
+        signal = LiveSignal(
+            timestamp=first["timestamp"],
+            symbol=self.symbol,
+            direction=direction,
+            entry_price=round(limit, 2),
+            stop_loss=round(sl, 2),
+            take_profit=round(tp, 2),
+            position_size_lots=lots,
+            risk_reward=round(abs(tp - limit) / stop_dist, 2) if stop_dist > 0 else 0.0,
+            confluence_score=0,
+            judas_quality=0,
+            confidence="base",
+            risk_pct=base_risk,
+            entry_mode="NY_IB",
+            consolidation_high=ib_hi,
+            consolidation_low=ib_lo,
+        )
+        logger.info(
+            f"NY_IB SIGNAL: {direction} limit {limit:.2f} "
+            f"(IB {ib_lo:.2f}-{ib_hi:.2f}, SL {sl:.2f}, TP {tp:.2f}, {lots:.2f} lots)"
+        )
+        return [signal]
 
     @staticmethod
     def _classify_confidence_tier(confluence_score: int, ts) -> tuple:

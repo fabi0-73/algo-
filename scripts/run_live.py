@@ -52,7 +52,13 @@ def fetch_latest_candles(symbol: str, timeframe: str, count: int = 500):
             client = MT5Client()
             df = client.get_candles(symbol, timeframe, count=count)
             if df is not None and not df.empty:
-                logger.info(f"MT5: fetched {len(df)} candles for {symbol} {timeframe}")
+                # Closed-candle guard: MT5 position-0 bar is the currently
+                # FORMING bar. Drop it unconditionally so every downstream
+                # consumer (AMD scan-back and NY_IB close-confirmation) sees
+                # completed bars only. Robust to local-vs-broker clock skew;
+                # costs at most one bar of latency.
+                df = df.iloc[:-1].reset_index(drop=True)
+                logger.info(f"MT5: fetched {len(df)} closed candles for {symbol} {timeframe}")
                 return df
         except Exception as e:
             logger.warning(f"MT5 fetch failed: {e}")
@@ -166,11 +172,16 @@ def run_signal_loop(
                 if telegram_notifier:
                     telegram_notifier.send_signal(sig)
 
+                exit_info = ""
+                if sig.exit_tier:
+                    tp_str = f"TP:{sig.suggested_tp}" if sig.suggested_tp > 0 else "TRAIL"
+                    exit_info = f" | Exit:{sig.exit_tier}({tp_str}) MP:{sig.move_potential}"
                 logger.info(
                     f"SIGNAL: {sig.direction} {sig.symbol} @ {sig.entry_price} | "
                     f"SL: {sig.stop_loss} | TP: {sig.take_profit} | "
                     f"RR: {sig.risk_reward} | Conf: {sig.confluence_score} | "
                     f"Tier: {sig.confidence.upper()} ({sig.risk_pct*100:.1f}% risk)"
+                    f"{exit_info}"
                 )
         else:
             logger.info("No signals detected")

@@ -51,6 +51,23 @@ class TelegramNotifier:
         ts = signal.timestamp
         ts_str = ts.strftime("%Y-%m-%d %H:%M:%S UTC") if ts else "—"
 
+        # NY_IB stream: compact bracket-order message (no AMD confluence/stars)
+        if getattr(signal, "entry_mode", "") == "NY_IB":
+            header = f"🗽 NY-IB {signal.direction} {self._esc(signal.symbol)}"
+            block = (
+                f"Entry:  {signal.entry_price:,.2f}  (LIMIT, inside IB)\n"
+                f"SL:     {signal.stop_loss:,.2f}\n"
+                f"TP:     {signal.take_profit:,.2f}\n"
+                f"R:R:    {signal.risk_reward:.2f}  (high win-rate design)\n"
+                f"Size:   {signal.position_size_lots:.2f} lots"
+            )
+            ib_line = (f"IB range: {signal.consolidation_low:,.2f} - "
+                       f"{signal.consolidation_high:,.2f}")
+            rules = ("Pure bracket: no BE, no trailing, no partial.\n"
+                     "Cancel unfilled order and FLAT ALL by 23:00 broker time.")
+            return (f"<b>{header}</b>\n\n<pre>{block}</pre>\n\n{ib_line}\n"
+                    f"{rules}\n\n<code>{ts_str}</code>")
+
         # Confluence tags: BOS, VOL, FVG, OB, etc.
         tags = []
         if signal.bos_confirmed:
@@ -68,6 +85,12 @@ class TelegramNotifier:
         tier_label = signal.confidence.upper()
         risk_pct_str = f"{signal.risk_pct * 100:.1f}%" if signal.risk_pct else ""
         header = f"{signal.direction} {self._esc(signal.symbol)}  |  {tier_label} tier  ({risk_pct_str} risk)"
+
+        # Empirical confidence line: stars (0-4 score) + label, e.g. "★★★★ HIGH"
+        conf_line = ""
+        if getattr(signal, "confidence_label", ""):
+            stars = "★" * signal.signal_confidence + "☆" * (4 - signal.signal_confidence)
+            conf_line = f"Confidence: {stars}  {signal.confidence_label}"
         block1 = (
             f"Entry:  {signal.entry_price:,.2f}  (LIMIT)\n"
             f"SL:     {signal.stop_loss:,.2f}\n"
@@ -80,9 +103,34 @@ class TelegramNotifier:
             f"Judas Quality: {signal.judas_quality}\n"
             f"Range: {signal.consolidation_low:,.2f} - {signal.consolidation_high:,.2f}"
         )
+
+        # Adaptive exit guidance
+        exit_lines = []
+        if signal.move_potential > 0 or signal.exit_tier:
+            tier_label = signal.exit_tier.upper() if signal.exit_tier else "DEFAULT"
+            exit_lines.append(f"Move Potential: {signal.move_potential}/5  |  Exit: {tier_label}")
+            if signal.suggested_tp > 0:
+                exit_lines.append(f"Suggested TP: {signal.suggested_tp:,.2f}")
+            elif signal.exit_tier:
+                exit_lines.append("Suggested TP: TRAIL ONLY")
+            if signal.trailing_activation_r > 0:
+                exit_lines.append(f"Trail: activate {signal.trailing_activation_r}R, {signal.trailing_atr_mult} ATR")
+            if signal.be_trigger_r > 0:
+                exit_lines.append(f"BE: at {signal.be_trigger_r}R")
+            if signal.partial_tp_at_r > 0:
+                exit_lines.append(f"Partial: close {signal.partial_close_pct*100:.0f}% at {signal.partial_tp_at_r}R")
+        block3 = "\n".join(exit_lines) if exit_lines else ""
+
         footer = ts_str
 
-        return f"<b>{header}</b>\n\n<pre>{block1}</pre>\n\n{block2}\n\n<code>{footer}</code>"
+        msg = f"<b>{header}</b>"
+        if conf_line:
+            msg += f"\n<b>{conf_line}</b>"
+        msg += f"\n\n<pre>{block1}</pre>\n\n{block2}"
+        if block3:
+            msg += f"\n\n<b>Exit Plan:</b>\n{block3}"
+        msg += f"\n\n<code>{footer}</code>"
+        return msg
 
     @staticmethod
     def _esc(s: str) -> str:
