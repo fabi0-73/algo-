@@ -54,6 +54,17 @@ def extract_r_multiples(trades: List[Dict[str, Any]]) -> np.ndarray:
     return np.array(r_values, dtype=np.float64)
 
 
+def extract_risk_pcts(trades: List[Dict[str, Any]]) -> np.ndarray:
+    """Extract per-trade risk fraction (risk_pct_used) if recorded, else None.
+
+    Lets the simulation reflect the actual confidence-tier sizing rather than a
+    single flat risk. Returns None if the field is missing/zero for all trades.
+    """
+    vals = [t.get("risk_pct_used", 0.0) or 0.0 for t in trades]
+    arr = np.array(vals, dtype=np.float64)
+    return arr if np.any(arr > 0) else None
+
+
 def run_simulation(
     r_multiples: np.ndarray,
     risk_pct: float,
@@ -61,17 +72,32 @@ def run_simulation(
     num_simulations: int = 10000,
     ruin_thresholds: List[float] = None,
     seed: int = 42,
+    risk_pcts: np.ndarray = None,
+    method: str = "bootstrap",
 ) -> Dict[str, Any]:
     """
-    Run Monte Carlo simulation by reshuffling trade sequence.
+    Monte Carlo simulation of the trade distribution.
+
+    method:
+      - "bootstrap": resample trades WITH replacement (models sampling variability
+        and fat tails — the honest basis for risk-of-ruin).
+      - "permutation": reshuffle the exact trade set (pure sequence/path risk).
+
+    If ``risk_pcts`` (per-trade risk fractions, e.g. each trade's recorded
+    risk_pct_used) is given, each resampled trade uses its own risk — capturing
+    confidence-tier sizing — instead of the flat ``risk_pct``. NOTE: this does not
+    replay the engine's dynamic drawdown risk-scaling, so ruin estimates are
+    CONSERVATIVE (real de-risking in drawdowns would push them lower).
 
     Args:
         r_multiples: Array of R-multiples from actual trades
-        risk_pct: Risk per trade as decimal (e.g. 0.005 for 0.5%)
+        risk_pct: Flat fallback risk per trade as decimal (e.g. 0.005 for 0.5%)
         initial_capital: Starting account balance
-        num_simulations: Number of reshuffled runs
+        num_simulations: Number of resampled runs
         ruin_thresholds: Drawdown thresholds to check ruin probability
         seed: Random seed for reproducibility
+        risk_pcts: Optional per-trade risk fractions (paired with r_multiples)
+        method: "bootstrap" (with replacement) or "permutation" (reshuffle)
 
     Returns:
         Dictionary with simulation results
@@ -81,6 +107,8 @@ def run_simulation(
 
     rng = np.random.default_rng(seed)
     n_trades = len(r_multiples)
+    method = (method or "bootstrap").lower()
+    use_per_trade_risk = risk_pcts is not None and len(risk_pcts) == n_trades
 
     max_drawdowns = np.zeros(num_simulations)
     final_capitals = np.zeros(num_simulations)
@@ -94,16 +122,24 @@ def run_simulation(
     max_consec_losses_all = np.zeros(num_simulations, dtype=int)
 
     for sim in range(num_simulations):
-        shuffled = rng.permutation(r_multiples)
+        if method == "permutation":
+            idx = rng.permutation(n_trades)
+        else:  # bootstrap: resample WITH replacement
+            idx = rng.integers(0, n_trades, size=n_trades)
+        r_seq = r_multiples[idx]
+        risk_seq = risk_pcts[idx] if use_per_trade_risk else None
+
         equity = initial_capital
         peak = initial_capital
         max_dd = 0.0
         doubled = False
         consec_losses = 0
         max_consec = 0
+        ruined_at = {t: None for t in ruin_thresholds}
 
-        for j, r in enumerate(shuffled):
-            pnl = equity * risk_pct * r
+        for j, r in enumerate(r_seq):
+            per_risk = risk_seq[j] if risk_seq is not None else risk_pct
+            pnl = equity * per_risk * r
             equity += pnl
             all_equity_curves[sim, j + 1] = equity
 
@@ -125,16 +161,17 @@ def run_simulation(
                 time_to_double.append(j + 1)
 
             for threshold in ruin_thresholds:
-                if dd >= threshold and len(time_to_ruin[threshold]) < sim + 1:
-                    time_to_ruin[threshold].append(j + 1)
+                if ruined_at[threshold] is None and dd >= threshold:
+                    ruined_at[threshold] = j + 1
 
         max_drawdowns[sim] = max_dd
         final_capitals[sim] = equity
         max_consec_losses_all[sim] = max_consec
 
         for threshold in ruin_thresholds:
-            if max_dd >= threshold:
+            if ruined_at[threshold] is not None:
                 ruin_counts[threshold] += 1
+                time_to_ruin[threshold].append(ruined_at[threshold])
 
     dd_percentiles = {
         "P5": float(np.percentile(max_drawdowns, 5)),
@@ -170,6 +207,8 @@ def run_simulation(
     return {
         "num_simulations": num_simulations,
         "num_trades": n_trades,
+        "method": method,
+        "per_trade_risk": bool(use_per_trade_risk),
         "risk_pct": risk_pct,
         "initial_capital": initial_capital,
         "drawdown_distribution": dd_percentiles,
@@ -199,7 +238,10 @@ def print_results(results: Dict[str, Any]) -> None:
     print("=" * 60)
     print(f"Simulations:      {results['num_simulations']:,}")
     print(f"Trades per sim:   {results['num_trades']}")
-    print(f"Risk per trade:   {results['risk_pct'] * 100:.1f}%")
+    print(f"Method:           {results.get('method', 'bootstrap')}"
+          f"{' (per-trade risk)' if results.get('per_trade_risk') else ''}")
+    if not results.get('per_trade_risk'):
+        print(f"Risk per trade:   {results['risk_pct'] * 100:.1f}%")
     print(f"Initial capital:  ${results['initial_capital']:,.2f}")
 
     print("\nDRAWDOWN DISTRIBUTION:")
@@ -244,7 +286,11 @@ def main():
         help="Path to backtest report directory (e.g. reports/backtest_aae991eb)",
     )
     parser.add_argument("--simulations", type=int, default=10000, help="Number of simulations")
-    parser.add_argument("--risk-pct", type=float, default=None, help="Risk per trade (default from config)")
+    parser.add_argument("--method", type=str, default="bootstrap", choices=["bootstrap", "permutation"],
+                        help="Resampling method (default: bootstrap = with replacement)")
+    parser.add_argument("--flat-risk", action="store_true",
+                        help="Use one flat risk_pct instead of each trade's recorded risk_pct_used")
+    parser.add_argument("--risk-pct", type=float, default=None, help="Flat risk per trade (default from config)")
     parser.add_argument("--capital", type=float, default=None, help="Initial capital (default from config)")
     parser.add_argument("--charts", action="store_true", help="Generate chart images")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -260,7 +306,9 @@ def main():
     logger.info(f"Loading trades from {args.report}")
     trades = load_trades_from_report(args.report)
     r_multiples = extract_r_multiples(trades)
+    risk_pcts = None if args.flat_risk else extract_risk_pcts(trades)
     logger.info(f"Loaded {len(r_multiples)} trades, avg R = {r_multiples.mean():.3f}")
+    logger.info(f"Method: {args.method} | per-trade risk: {risk_pcts is not None}")
 
     logger.info(f"Running {args.simulations:,} simulations...")
     results = run_simulation(
@@ -269,6 +317,8 @@ def main():
         initial_capital=capital,
         num_simulations=args.simulations,
         seed=args.seed,
+        risk_pcts=risk_pcts,
+        method=args.method,
     )
 
     print_results(results)

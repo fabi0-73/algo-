@@ -168,14 +168,17 @@ def is_rejection_candle(
         True if rejection pattern detected
     """
     body = calculate_body_size(candle)
-    
+
     if body == 0:
-        # Doji - check wicks
-        if direction == "UP":
-            return calculate_lower_wick(candle) > calculate_upper_wick(candle)
-        else:
-            return calculate_upper_wick(candle) > calculate_lower_wick(candle)
-    
+        # Doji: require a GENUINE, dominant rejection wick — not merely a hair's
+        # difference. (Bug fix: previously any doji with rejection_wick > opposite_wick
+        # by even one tick counted as a rejection, so flat / near-symmetric dojis on
+        # M5 gold were wrongly treated as valid retest rejections.)
+        lower_wick = calculate_lower_wick(candle)
+        upper_wick = calculate_upper_wick(candle)
+        rej_wick, opp_wick = (lower_wick, upper_wick) if direction == "UP" else (upper_wick, lower_wick)
+        return rej_wick > 0 and rej_wick >= 2.0 * opp_wick
+
     if direction == "UP":
         # Bullish rejection - long lower wick
         lower_wick = calculate_lower_wick(candle)

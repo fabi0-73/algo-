@@ -115,6 +115,7 @@ def run_backtest(
     split_ratio: float = None,
     train_only: bool = False,
     test_only: bool = False,
+    run_timeframe: str = None,
 ):
     """
     Run backtest on historical data from database.
@@ -160,6 +161,15 @@ def run_backtest(
 
     logger.info(f"Loaded {len(df)} candles")
     logger.info(f"Date range: {df['timestamp'].min()} to {df['timestamp'].max()}")
+
+    # Higher-TF run: resample base M5 bars and scale wall-clock plumbing.
+    # Pattern params intentionally stay in bars (bigger structures on higher TFs).
+    if run_timeframe and run_timeframe != timeframe:
+        from src.data.resample import resample_ohlcv
+        from config import apply_run_timeframe
+        df = resample_ohlcv(df, run_timeframe)
+        apply_run_timeframe(run_timeframe)
+        logger.info(f"Resampled to {run_timeframe}: {len(df)} candles")
 
     # Calculate months of data
     days = (df["timestamp"].max() - df["timestamp"].min()).days
@@ -274,6 +284,7 @@ def run_backtest(
             print(f"  Spread:         ${cost_stats.get('total_spread_cost', 0):,.2f}")
             print(f"  Slippage:       ${cost_stats.get('total_slippage_cost', 0):,.2f}")
             print(f"  Commission:     ${cost_stats.get('total_commission_cost', 0):,.2f}")
+            print(f"  Swap:           ${cost_stats.get('total_swap_cost', 0):,.2f}")
             print(f"  Total Costs:    ${cost_stats.get('total_costs', 0):,.2f}")
         print("=" * 60)
 
@@ -315,12 +326,14 @@ def run_backtest(
     if "error" in results:
         return results
 
-    # Exit reason breakdown
+    # Exit reason breakdown (honest taxonomy: true losses vs protected/profit stops)
     print("\nEXIT REASONS:")
-    print(f"  Stop Loss:      {results.get('sl_exits', 0)}")
-    print(f"  Take Profit:    {results.get('tp_exits', 0)}")
-    print(f"  Timeout:        {results.get('timeout_exits', 0)}")
-    print(f"  Rollover:       {results.get('rollover_exits', 0)}")
+    print(f"  Stop Loss (loss): {results.get('sl_exits', 0)}")
+    print(f"  Breakeven Stop:   {results.get('be_exits', 0)}")
+    print(f"  Trailing Stop:    {results.get('trail_exits', 0)}")
+    print(f"  Take Profit:      {results.get('tp_exits', 0)}")
+    print(f"  Timeout:          {results.get('timeout_exits', 0)}")
+    print(f"  Rollover:         {results.get('rollover_exits', 0)}")
     print("=" * 60)
 
     # Validation
@@ -379,9 +392,17 @@ def run_backtest(
         print(f"  -> Volume:               {funnel.get('filtered_volume', 0)}")
         print(f"  -> Fundamentals:         {funnel.get('filtered_fundamentals', 0)}")
         print(f"  -> Daily limit:          {funnel.get('filtered_daily_limit', 0)}")
+        print(f"  -> Monthly limit:        {funnel.get('filtered_monthly_limit', 0)}")
+        print(f"  -> Drawdown halt:        {funnel.get('filtered_drawdown_halt', 0)}")
         print(f"  -> Cooldown:             {funnel.get('filtered_cooldown', 0)}")
         print(f"  -> Near rollover:        {funnel.get('filtered_rollover', 0)}")
         print(f"  -> Fill not triggered:   {funnel.get('fill_not_triggered', 0)}")
+        if funnel.get("sweep_signals", 0) > 0 or funnel.get("sweep_entries", 0) > 0:
+            print("\n  SWEEP MODEL:")
+            print(f"  -> Sweep signals:        {funnel.get('sweep_signals', 0)}")
+            print(f"  -> Sweep filtered:       {funnel.get('sweep_filtered', 0)}")
+            print(f"  -> Sweep risk invalid:   {funnel.get('sweep_risk_invalid', 0)}")
+            print(f"  -> Sweep entries:        {funnel.get('sweep_entries', 0)}")
         print(f"\n  ENTRIES EXECUTED:        {funnel.get('entries_executed', 0)}")
         print("=" * 60)
 
@@ -407,6 +428,49 @@ def run_backtest(
                 print(f"  {tier_name:<12} {ts['count']:>6} {ts['wins']:>6} {ts['win_rate']:>7.1f}% ${ts['pnl']:>9.2f}")
         print("=" * 60)
 
+    # Entry model breakdown (AMD vs SWEEP)
+    if results.get("trades"):
+        import pandas as _pd
+        _mdf = _pd.DataFrame(results["trades"])
+        if "entry_model" in _mdf.columns and _mdf["entry_model"].nunique() > 1:
+            print("\nENTRY MODEL BREAKDOWN:")
+            print(f"  {'Model':<8} {'Count':>6} {'Wins':>6} {'WR%':>8} {'AvgR':>8} {'MaxDDCtb':>9} {'PnL':>10}")
+            print("  " + "-" * 60)
+            for model in ["AMD", "SWEEP"]:
+                subset = _mdf[_mdf["entry_model"] == model]
+                if len(subset) == 0:
+                    continue
+                wins = len(subset[subset["net_pnl"] > 0])
+                wr = wins / len(subset) * 100
+                worst = subset["net_pnl"].min()
+                print(f"  {model:<8} {len(subset):>6} {wins:>6} {wr:>7.1f}% {subset['r_multiple'].mean():>7.3f}R {worst:>9.2f} ${subset['net_pnl'].sum():>9.2f}")
+            # Sweep level-kind detail
+            _sdf = _mdf[_mdf["entry_model"] == "SWEEP"]
+            if len(_sdf) > 0 and "sweep_level_kind" in _sdf.columns:
+                print("\n  SWEEP BY LEVEL KIND:")
+                for kind, grp in _sdf.groupby("sweep_level_kind"):
+                    w = len(grp[grp["net_pnl"] > 0])
+                    print(f"    {str(kind):<16} n={len(grp):<4} WR {w/len(grp)*100:5.1f}%  avgR {grp['r_multiple'].mean():+.3f}  PnL ${grp['net_pnl'].sum():+.2f}")
+            print("=" * 60)
+
+    # Signal confidence breakdown (empirical LOW/MODERATE/GOOD/HIGH)
+    if results.get("trades"):
+        import pandas as _pd
+        _cdf = _pd.DataFrame(results["trades"])
+        if "confidence_label" in _cdf.columns and _cdf["confidence_label"].any():
+            print("\nSIGNAL CONFIDENCE BREAKDOWN:")
+            print(f"  {'Level':<10} {'Count':>6} {'Wins':>6} {'WR%':>8} {'AvgR':>8} {'AvgLots':>8} {'PnL':>10}")
+            print("  " + "-" * 60)
+            for label in ["HIGH", "GOOD", "MODERATE", "LOW"]:
+                subset = _cdf[_cdf["confidence_label"] == label]
+                if len(subset) == 0:
+                    continue
+                wins = len(subset[subset["net_pnl"] > 0])
+                wr = wins / len(subset) * 100
+                lots = subset["position_size"].mean() if "position_size" in subset.columns else 0
+                print(f"  {label:<10} {len(subset):>6} {wins:>6} {wr:>7.1f}% {subset['r_multiple'].mean():>7.3f}R {lots:>8.3f} ${subset['net_pnl'].sum():>9.2f}")
+            print("=" * 60)
+
     # Trailing stop stats
     if results.get("trades"):
         import pandas as _pd
@@ -419,7 +483,49 @@ def run_backtest(
             print(f"  BE activations:          {be_count}")
             print(f"  Trailing activations:    {trail_count}")
             print(f"  Big winners (>=3R):      {big_winners}")
+            # Adaptive exit tier breakdown
+            if "exit_tier" in _tdf.columns and _tdf["exit_tier"].any():
+                print(f"\n  EXIT TIER BREAKDOWN:")
+                print(f"  {'Tier':<12} {'Count':>6} {'Wins':>6} {'WR%':>8} {'AvgR':>8} {'AvgMFE':>8} {'PnL':>10}")
+                print("  " + "-" * 62)
+                for tier_name in _tdf["exit_tier"].unique():
+                    if not tier_name:
+                        tier_name_display = "(default)"
+                    else:
+                        tier_name_display = tier_name
+                    subset = _tdf[_tdf["exit_tier"] == tier_name]
+                    t_wins = len(subset[subset["r_multiple"] > 0])
+                    t_wr = t_wins / len(subset) * 100 if len(subset) > 0 else 0
+                    t_mfe = subset["mfe_r"].mean() if "mfe_r" in subset.columns else 0
+                    print(f"  {tier_name_display:<12} {len(subset):>6} {t_wins:>6} {t_wr:>7.1f}% {subset['r_multiple'].mean():>7.3f}R {t_mfe:>7.2f}R ${subset['net_pnl'].sum():>9.2f}")
             print("=" * 60)
+
+    # MFE/MAE analysis
+    mfe = results.get("mfe_stats", {})
+    if mfe:
+        print(f"\nMFE/MAE ANALYSIS:")
+        print(f"  Avg MFE:                 {mfe.get('avg_mfe_r', 0):.2f}R")
+        print(f"  Median MFE:              {mfe.get('median_mfe_r', 0):.2f}R")
+        print(f"  Avg MAE:                 {mfe.get('avg_mae_r', 0):.2f}R")
+        print(f"  Winners Avg MFE:         {mfe.get('winners_avg_mfe_r', 0):.2f}R")
+        print(f"  MFE Capture:             {mfe.get('mfe_capture_pct', 0):.1f}%")
+        if "by_confluence" in mfe:
+            print(f"\n  MFE BY CONFLUENCE SCORE:")
+            print(f"  {'Score':<8} {'Count':>6} {'AvgMFE':>8} {'AvgR':>8} {'Capture%':>10}")
+            print("  " + "-" * 44)
+            for score, data in sorted(mfe["by_confluence"].items(), key=lambda x: int(x[0])):
+                print(f"  {score:<8} {data['count']:>6} {data['avg_mfe_r']:>7.2f}R {data['avg_r']:>7.2f}R {data['capture_pct']:>9.1f}%")
+        print("=" * 60)
+
+    # Move potential analysis
+    mp_stats = results.get("move_potential_stats", {})
+    if mp_stats:
+        print(f"\nMOVE POTENTIAL ANALYSIS:")
+        print(f"  {'Score':<8} {'Count':>6} {'Wins':>6} {'WR%':>8} {'AvgR':>8} {'AvgMFE':>8} {'PnL':>10}")
+        print("  " + "-" * 60)
+        for score, data in sorted(mp_stats.items(), key=lambda x: int(x[0])):
+            print(f"  {score:<8} {data['count']:>6} {data['wins']:>6} {data['win_rate']:>7.1f}% {data['avg_r']:>7.3f}R {data['avg_mfe_r']:>7.2f}R ${data['pnl']:>9.2f}")
+        print("=" * 60)
 
     # Phantom fills analysis
     pf = results.get("phantom_fills", {})
@@ -568,8 +674,70 @@ Examples:
     # Analysis
     parser.add_argument("--phantom-fills", action="store_true", help="Simulate missed fill trades at candle close (phantom analysis)")
     parser.add_argument("--market-chase", action="store_true", help="Enter at close for high-quality missed fills (real trades)")
+    parser.add_argument("--adaptive-exits", action="store_true", help="Enable adaptive exit tiers by move potential score")
+    parser.add_argument("--no-drawdown-controls", action="store_true", help="Disable Phase-2 drawdown controls (circuit breaker, risk scaling, loss brake)")
+    parser.add_argument("--strategy-mode", type=str, choices=["AMD", "SWEEP", "BOTH"],
+                        help="Entry model(s) to run (default from SWEEP_MODEL config)")
+    parser.add_argument("--sweep-exit", type=str, choices=["FIXED_RR", "HYBRID"],
+                        help="Exit style for SWEEP trades (default from SWEEP_MODEL config)")
+    parser.add_argument("--enable-ny-ib", action="store_true",
+                        help="Run the NY_IB stream alongside AMD (NY_IB_MODEL)")
+    parser.add_argument("--ny-ib-only", action="store_true",
+                        help="Run ONLY the NY_IB stream (suppresses AMD scanning)")
+    parser.add_argument("--min-confidence", type=int, choices=[0, 1, 2, 3, 4],
+                        help="Skip entries with signal confidence below this score (0 = off)")
+    parser.add_argument("--run-timeframe", type=str, choices=["M5", "M15", "M30", "H1", "H4"],
+                        help="Resample base M5 data to this timeframe for the run")
+    parser.add_argument("--long-runner-duration", type=int,
+                        help="Max bars for LONG trades with active trailing stop (E4 overlay, 0 = off)")
+    parser.add_argument("--entry-price-mode", type=str, choices=["RETEST", "OTE"],
+                        help="Entry limit placement: RETEST level or OTE deep-pullback band (E3)")
+    parser.add_argument("--adaptive-confidence", action="store_true",
+                        help="Enable rolling confidence-bucket recalibration (E-adaptive)")
 
     args = parser.parse_args()
+
+    # Confidence entry gate override (E-conf-gate experiment)
+    if args.min_confidence is not None:
+        from config import SIGNAL_CONFIDENCE
+        SIGNAL_CONFIDENCE["min_confidence_to_trade"] = args.min_confidence
+
+    # E4 overnight-drift overlay override
+    if args.long_runner_duration is not None:
+        STRATEGY["long_runner_max_duration"] = args.long_runner_duration
+
+    # E3 OTE entry-price mode override
+    if args.entry_price_mode:
+        STRATEGY["entry_price_mode"] = args.entry_price_mode
+
+    # E-adaptive override
+    if args.adaptive_confidence:
+        from config import CONFIDENCE_SIZING
+        CONFIDENCE_SIZING["adaptive"]["enabled"] = True
+
+    # Enable adaptive exits if requested
+    if args.adaptive_exits:
+        from config import ADAPTIVE_EXITS
+        ADAPTIVE_EXITS["enabled"] = True
+
+    # Disable Phase-2 drawdown controls if requested (for isolating their effect)
+    if args.no_drawdown_controls:
+        from config import DRAWDOWN_CONTROLS
+        DRAWDOWN_CONTROLS["enabled"] = False
+
+    # Strategy mode / sweep exit style overrides
+    if args.strategy_mode or args.sweep_exit:
+        from config import SWEEP_MODEL
+        if args.strategy_mode:
+            SWEEP_MODEL["strategy_mode"] = args.strategy_mode
+        if args.sweep_exit:
+            SWEEP_MODEL["exit_style"] = args.sweep_exit
+
+    # NY_IB stream overrides
+    if args.enable_ny_ib or args.ny_ib_only:
+        from config import NY_IB_MODEL
+        NY_IB_MODEL["enabled"] = True
+        NY_IB_MODEL["only"] = bool(args.ny_ib_only)
 
     start_date = datetime.strptime(args.start, "%Y-%m-%d") if args.start else None
     end_date = datetime.strptime(args.end, "%Y-%m-%d") if args.end else None
@@ -602,6 +770,7 @@ Examples:
         split_ratio=args.split,
         train_only=args.train_only,
         test_only=args.test_only,
+        run_timeframe=args.run_timeframe,
     )
 
 

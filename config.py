@@ -10,7 +10,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 # Load .env from project root (directory containing config.py) so it works regardless of cwd
-_env_path = Path(__file__).resolve().parent / ".env"
+_PROJECT_ROOT = Path(__file__).resolve().parent
+_env_path = _PROJECT_ROOT / ".env"
 load_dotenv(dotenv_path=_env_path)
 
 # =============================================================================
@@ -56,8 +57,15 @@ DATABASE_URL = (
 # Set data_timezone to match your broker's server timezone.
 # If broker uses UTC, leave as "UTC". If broker uses GMT+2 (e.g., Europe/Athens), set accordingly.
 TIME_CONFIG = {
-    # Timezone for interpreting MT5 OHLC timestamps
-    # Common values: "UTC", "Europe/Athens", "America/New_York"
+    # Timezone for interpreting MT5 OHLC timestamps.
+    # IMPORTANT (verified empirically): MT5 (via src/data/mt5_client.py) stores bar
+    # times as the BROKER SERVER wall-clock (IC Markets ≈ GMT+2/+3, i.e. New York +7h;
+    # the daily data gap at hour 00 == 17:00 New York settlement confirms this). We keep
+    # this labeled "UTC" on purpose: the backtest AND the live scanner both read candles
+    # through the same MT5Client with no conversion, so they share one consistent frame.
+    # => All SESSION_FILTER/blackout/kill-zone hours below are in BROKER time, not true
+    #    UTC. US news events must likewise be expressed in broker time (NY+7): NFP 08:30
+    #    ET -> 15:30 here, FOMC 14:00 ET -> 21:00 here (DST-proof, constant +7 from NY).
     "data_timezone": os.getenv("DATA_TIMEZONE", "UTC"),
 
     # Timezone for session filter evaluation (kill zone, Asian session, etc.)
@@ -76,7 +84,11 @@ EXECUTION = {
     # OHLC data from MT5 is typically BID prices
     "assume_ohlc_is_bid": True,
     "spread_model": "FIXED",  # "FIXED" or "COLUMN" (if df has 'spread' column)
-    "fixed_spread_points": 0.25,  # $0.25 typical baseline for XAUUSD
+    # Value is in MT5 POINTS (1 pt = $0.01/oz). Cost = points * 0.01 * contract_size(100) * lots.
+    # Realistic XAUUSD spread ~25-30 cents/oz => ~$25-30 per 1.0 lot.
+    # (The old value 0.25 modeled only $0.0025/oz ≈ $0.25/lot — ~100x too tight, which
+    #  materially overstated backtest P&L. 30 matches the code's own fallback default.)
+    "fixed_spread_points": 30.0,  # ~30 cents/oz spread (crossed once at entry)
 
     # Commission (round-turn, i.e., open + close)
     "commission_per_lot_round_turn": 7.0,  # USD per lot round-turn
@@ -106,9 +118,12 @@ EXECUTION = {
     # Exit Fill Model
     "exit_fill_model": "TOUCH",  # Touch-based with bid/ask adjustment
 
-    # Swap Fees (overnight holding costs)
+    # Swap Fees (overnight holding costs) — now actually applied in engine._exit_position.
+    # Cost magnitude in USD per 1.0 lot per night held (positive = you pay). Charged once
+    # per rollover crossing between entry and exit. PLACEHOLDER — replace with your broker's
+    # actual XAUUSD swap (gold swaps are typically negative, i.e. a cost).
     "enable_swap_fees": True,
-    "swap_fee_per_lot_per_day": 0.0,  # Set based on broker; 0 = disabled
+    "swap_fee_per_lot_per_day": 5.0,
 
     # Rollover time (when swaps are charged)
     # Typically 21:59 or 22:00 UTC for most brokers
@@ -145,6 +160,13 @@ SESSION_FILTER = {
     # Daily loss limit - stop new entries if daily drawdown exceeds this
     "daily_loss_limit_pct": 0.008,  # 0.8% daily loss limit — stops trading earlier on bad days
 
+    # Monthly loss limit - stop new entries for the rest of the month once monthly loss
+    # exceeds this. Activates the previously-dormant circuit breaker in time_filters.py
+    # (the key was missing from config, so it defaulted to 0.0 = disabled).
+    # 5% was tested (run 70c1d5f1) and hurt: 415 blocked entries vs 141, deeper DD
+    # (blocked recovery). 6% is the validated value.
+    "monthly_loss_limit_pct": 0.06,  # 6% monthly loss limit
+
     # Cooldown after trade (reduce overtrading in chop)
     "cooldown_minutes_after_trade": 15,
 
@@ -180,7 +202,15 @@ SESSION_FILTER = {
 # Disabled by default; enable and provide news CSV to use
 NEWS_FILTER = {
     "enabled": True,  # Avoid high-impact event volatility
-    "csv_path": "Market/data/news_events.csv",
+    # Absolute path from project root. (Was "Market/data/news_events.csv" — a
+    # non-existent nested Market/ dir — which made the filter silently self-disable.)
+    # Event timestamps in this CSV must be in BROKER time (NY+7) to match the candle
+    # frame; generate with: python scripts/generate_news_events.py
+    "csv_path": str(_PROJECT_ROOT / "data" / "news_events.csv"),
+
+    # If True, an ENABLED filter with a missing/unreadable CSV raises instead of
+    # silently disabling — so a run never trades "unprotected" without you knowing.
+    "require_csv": True,
 
     # Blackout window around news events
     "pre_minutes": 5,   # No entries from T-5 minutes
@@ -273,9 +303,9 @@ VOLUME_FILTER = {
 FUNDAMENTALS = {
     "enabled": False,
 
-    # Data file paths (CSV format)
-    "dxy_csv_path": "Market/data/dxy.csv",
-    "real_yields_csv_path": "Market/data/real_yields.csv",
+    # Data file paths (CSV format) — absolute from project root (see NEWS_FILTER note).
+    "dxy_csv_path": str(_PROJECT_ROOT / "data" / "dxy.csv"),
+    "real_yields_csv_path": str(_PROJECT_ROOT / "data" / "real_yields.csv"),
 
     # Resample rule (align to M5)
     "resample_rule": "5min",
@@ -315,12 +345,20 @@ RISK_MODEL = {
     # Buffer beyond manipulation extreme
     "stop_buffer_atr_mult": 1.0,   # More buffer to avoid noise hits
 
-    # Leverage/notional guard
-    # notional = entry_price * contract_size * lots
-    # Guard: notional <= balance * max_position_notional_multiple
-    "max_position_notional_multiple": 300.0,  # 1:300 leverage
+    # Leverage/notional guard (a hard ceiling, NOT the primary risk control).
+    # notional = entry_price * contract_size * lots; guard: notional <= balance * mult.
+    # Actual per-trade risk is governed by risk_pct + the Phase-2 drawdown controls;
+    # with 0.3-0.8% risk and the min_lot floor, real leverage used sits far below this.
+    # Kept generous per the "$500, allow higher leverage" choice — lower to 100.0 to
+    # hard-cap at 1:100. (Higher leverage on a small account raises risk of ruin.)
+    "max_position_notional_multiple": 300.0,
 
     # Lot size constraints
+    # 0.10 floor was tested at user request (run 75542d59): account DESTROYED — 5 trades,
+    # final capital -$287 (negative), one wide-stop trade lost $620, breaker latched for
+    # the entire test (19,266 blocked entries). At $500, min_lot 0.10 risks 25-120% per
+    # trade. Reverted to the validated 0.01 (run 124d15ef). Aggressive-but-survivable
+    # option: 0.02 (bootstrap: 1.9% ruin, ~2x trajectory). 0.10 becomes sane ~$5,000 equity.
     "min_lot": 0.01,
     "max_lot": 50.0,
     "lot_step": 0.01,
@@ -328,8 +366,11 @@ RISK_MODEL = {
     # ==========================================================================
     # Partial Take Profit Settings (SMC Improvement)
     # ==========================================================================
-    # Disabled to eliminate 0R cluster from partial TP + BE stop
-    "partial_tp_enabled": False,         # Was True - simplified exit
+    # RE-TESTED 2026-07-02 with honest costs (train run a8fd25ca) and REJECTED again:
+    # WR jumped 39%->55% but expectancy fell 0.248R->0.152R, PF 1.47->1.32, max DD
+    # 19.9%->24.1%, net -38%. Banking half at 1R halves the trailing runners that pay
+    # for the drawdowns. Win rate here is cosmetic; do not re-enable to chase it.
+    "partial_tp_enabled": False,
     "partial_tp_at_1r": 0.5,              # Close 50% of position at 1R (unused when disabled)
     "move_sl_to_be_after_partial": True,  # Move SL to breakeven after partial
     "final_tp_rr": 3.0,                   # Let remaining position run to 3R
@@ -424,7 +465,7 @@ STRATEGY = {
     "detect_equal_levels": True,
     "equal_level_tolerance_atr_mult": 0.05,
     "equal_level_min_touches": 2,
-    "prefer_equal_level_sweep": True,      # Prefer setups that sweep equal highs/lows
+    "prefer_equal_level_sweep": True,      # UNUSED — no consumers in code (kept for compat; see SWEEP_MODEL for the real sweep logic)
 
     # Breaker Blocks - Broken OBs become breakers for opposite direction
     "use_breaker_blocks": True,             # Was False - enable breaker block confluence
@@ -471,13 +512,38 @@ STRATEGY = {
 
     # Max trade duration in bars (M5 candles)
     "max_trade_duration": 240,  # 240 bars = 20h on M5 (compromise: less MTM DD than 300, more room than 200)
+
+    # E3 OTE refinement: "RETEST" places the entry limit at the consolidation edge
+    # (validated behavior); "OTE" moves it to the 61.8-79% deep-pullback band of the
+    # manipulation->distribution leg when that is a strictly better price.
+    # EXPERIMENT KILLED 2026-07-04 (train run bqtakw5ls): 2,353 limits placed,
+    # ZERO filled in 12.6 months. A 61.8% retrace of the manip->distribution leg
+    # sits inside the consolidation range — reaching it invalidates the AMD
+    # pattern itself. Deep pullbacks and valid retests are structurally mutually
+    # exclusive here; the consolidation edge IS the optimal fillable entry.
+    # E2 (OB+OTE standalone) skipped per pre-registered condition. KEEP "RETEST".
+    "entry_price_mode": "RETEST",
+
+    # E3 companion: count "retest level in OTE band" as a +1 confluence factor.
+    # OFF by default — enabling shifts scores/tiers on the validated champion.
+    "use_ote_confluence": False,
+
+    # E4 overnight-drift overlay: LONG trades with an ACTIVE trailing stop may run
+    # up to this many bars instead of max_trade_duration (0 = disabled). Basis:
+    # gold overnight returns are positive at peer-reviewed significance
+    # (J Econ Finance 2017); risk is trailing-protected and swap is modeled.
+    # EXPERIMENT RESULT 2026-07-04 (run 695b6ece vs 53d5bfc4): NO-OP — results
+    # byte-identical to baseline. The 2-ATR trail always exits runners before the
+    # 240-bar timeout, so the extension never engages. Harvesting overnight drift
+    # would require loosening the validated trail itself — not attempted. KEEP 0.
+    "long_runner_max_duration": 0,
 }
 
 # =============================================================================
 # Backtesting Configuration
 # =============================================================================
 BACKTEST = {
-    "initial_capital": 100.0,
+    "initial_capital": 500.0,
     "commission_per_lot": 7.0,              # Commission in USD per lot (legacy)
     "pip_value": 0.01,                      # XAU pip value (legacy, prefer RISK_MODEL)
     "lot_size": 100,                        # 1 lot = 100 oz for XAU (legacy)
@@ -505,26 +571,47 @@ CONFIDENCE_SIZING = {
             "min_confluence_score": 5,
             "prime_hours_only": True,     # H13-17 UTC
             "risk_pct": 0.008,            # 0.8% — elite setups only
+            "lot_bonus": 0.02,            # +0.02 lots on top of calculated size
         },
         {
             "name": "standard",
             "min_confluence_score": 3,
             "prime_hours_only": True,
             "risk_pct": 0.005,            # 0.5% — prime hours, score 3+
+            "lot_bonus": 0.01,            # +0.01 lots on top of calculated size
         },
         {
             "name": "off_hours",
             "min_confluence_score": 5,
             "prime_hours_only": False,
             "risk_pct": 0.005,            # 0.5% — high-confluence off-hours (not punished)
+            "lot_bonus": 0.01,            # +0.01 lots on top of calculated size
         },
         # Fallthrough: base_risk_pct (0.3%) for everything else
-        # MEDIUM tier removed — 48.4% loss rate, -$245 damage
     ],
 
     # Prime hours definition (UTC)
     "prime_hours_start": 13,
     "prime_hours_end": 17,    # inclusive: H13, H14, H15, H16, H17
+
+    # E-adaptive: rolling self-recalibration of confidence buckets. Every
+    # recalib_every closed trades, each bucket's trailing WR (last window_trades)
+    # is compared to the breakeven WR implied by its own realized win/loss sizes;
+    # below-breakeven buckets stop trading and are re-tested after
+    # gate_timeout_trades. Walk-forward safe: only closed trades feed it.
+    # EXPERIMENT RESULT 2026-07-04 (run 991eeaf5 vs champion 124d15ef): the
+    # mechanism WORKED (gated LOW at trade 60 when trailing WR hit 15%, re-tested
+    # at 100) and raised WR 39.4->44.5% with expectancy nearly intact (0.391R vs
+    # 0.402R) — the only WR lever that didn't wreck expectancy. But final capital
+    # $2,044 vs $2,125 and DD 23.6% vs 20.2% -> does not beat champion. KEEP
+    # DISABLED; a near-neutral option if higher WR ever matters more than P&L.
+    "adaptive": {
+        "enabled": False,
+        "window_trades": 60,
+        "recalib_every": 20,
+        "min_bucket_n": 10,
+        "gate_timeout_trades": 40,
+    },
 }
 
 # =============================================================================
@@ -542,11 +629,185 @@ PHANTOM_FILLS = {
 # =============================================================================
 # Market Chase — Enter at close when limit misses on high-quality setups
 # =============================================================================
+# VALIDATION FAILED 2026-07-02 (run c19e123e): despite phantom trades showing LONG
+# misses at +0.369R, REAL chase trades collapsed the system — 142 -> 76 total trades,
+# expectancy 0.402R -> 0.097R, DD 25.7%, equity hit the 20% circuit breaker and halted.
+# Cause: phantoms ignore position exclusivity (chase trades displace better organic
+# setups) and enter at worse prices with min-lot-pinned dollar risk. KEEP DISABLED.
 MARKET_CHASE = {
-    "enabled": False,               # Must explicitly enable via --market-chase
-    "direction_filter": "LONG",     # Only chase LONGs (60.2% WR vs 50% SHORT)
-    "min_confluence_score": 5,      # Score 5: 67.6% WR, PF 2.12
-    "max_entry_slippage_atr": 1.5,  # Reject if close is > 1.5 ATR worse than limit
+    "enabled": False,               # Failed validation — see note above
+    "direction_filter": "LONG",
+    "min_confluence_score": 3,
+    "max_entry_slippage_atr": 1.5,
+}
+
+# =============================================================================
+# Adaptive Exits (stub — not yet implemented)
+# =============================================================================
+ADAPTIVE_EXITS = {
+    "enabled": False,
+    "tiers": [],
+    "extend_duration_for_runners": False,
+    "runner_max_duration": 300,
+}
+
+# =============================================================================
+# DRAWDOWN CONTROLS (Phase 2) — the core "lower drawdown" machinery
+# =============================================================================
+# These run INSIDE the backtest engine (previously such controls existed only in
+# src/live/monitor.py and were never wired into backtests). Three layers:
+#   1) Account circuit breaker — halt NEW entries when equity drawdown from peak is
+#      severe, resume after it recovers (hysteresis). Mirrors the live kill switch.
+#   2) Consecutive-loss brake — cut risk after a losing streak until the next win.
+#   3) Equity-based risk scaling — smoothly de-risk the deeper the drawdown, so the
+#      equity curve is smoother and bad runs shrink position size automatically.
+# Toggle the whole system with "enabled" (or CLI --no-drawdown-controls).
+DRAWDOWN_CONTROLS = {
+    "enabled": True,
+
+    # 1) Account-level circuit breaker (peak->current realized-equity drawdown)
+    "circuit_breaker_enabled": True,
+    "max_account_dd_pct": 0.20,      # halt new entries once DD from peak >= 20%
+    "resume_dd_pct": 0.10,           # resume once DD recovers to <= 10% (hysteresis)
+    # Deadlock fix: with entries halted and no open position, equity can never recover,
+    # so a pure DD-recovery resume would latch forever (seen in run c19e123e: 7,503
+    # blocked entries). After this many bars halted, resume anyway — the risk-scaling
+    # floor keeps size halved while still in deep drawdown. Mirrors the live monitor's
+    # "manual review then resume smaller". 1440 bars = ~5 trading days on M5.
+    "halt_max_bars": 1440,
+
+    # 2) Consecutive-loss brake
+    "consec_loss_enabled": True,
+    "max_consecutive_losses": 4,     # after 4 losses in a row...
+    "consec_loss_risk_factor": 0.5,  # ...trade at 50% risk until the next win
+
+    # 3) Equity-based (drawdown) risk scaling — linear from full risk to the floor
+    # NOTE: tightening these (4%/12%) was tested (run 70c1d5f1) and made DD WORSE
+    # (23.4% vs 20.2%) — on a min-lot-pinned small account, %-de-risking can't shrink
+    # positions, so tighter limits only block the recovery trades. Keep 6%/15%.
+    "risk_scaling_enabled": True,
+    "risk_scale_start_dd": 0.06,     # start scaling risk down once DD > 6%
+    "risk_scale_full_dd": 0.15,      # reach the floor factor at 15% DD
+    "risk_scale_min_factor": 0.5,    # never size below 50% of the tier's base risk
+    "suppress_lot_bonus_when_scaling": True,  # don't add fixed lot_bonus while de-risking
+}
+
+# =============================================================================
+# SIGNAL CONFIDENCE — empirical per-trade confidence + optional HIGH up-sizing
+# =============================================================================
+# Score/label come from entry.calculate_signal_confidence (calibrated on 280
+# honest-cost trades; GOOD/HIGH buckets verified on the latest 30% window).
+# Every trade gets the label (backtest record + live Telegram signal).
+# Sizing: on a $500 account positions are pinned to the 0.01 min-lot floor, so
+# risk-% multipliers do nothing — the effective lever is extra lots on the best
+# bucket. Sequence simulation of "HIGH +0.01 lot" on run f99ef66e: +300%→+353%
+# return, est. max DD 17%→22%. Needs full-backtest validation (controls interact).
+SIGNAL_CONFIDENCE = {
+    "enabled": True,                 # compute + display confidence on every trade/signal
+    "size_by_confidence": True,      # up-size HIGH-confidence trades (moderate policy)
+    "high_extra_lots": 0.01,         # extra lots on HIGH (score 4) — 0.01→0.02 on $500
+    "good_extra_lots": 0.0,          # extra lots on GOOD (score 3) — off by default (DD cost)
+    # Entry gate: skip trades with confidence score below this (0 = disabled).
+    # E-conf-gate EXPERIMENT KILLED 2026-07-04 (train runs 53d5bfc4 vs 5d5091be):
+    # blocking LOW (scores 0-1) cut trades 102->81 but WR FELL 39.2->38.3%, DD
+    # worsened 20.2->23.6%, final capital dropped $892->$864. Expectancy gain
+    # (0.248->0.265R) doesn't pay for lost recovery trades. Confidence is a
+    # SIZING signal, not an entry gate — consistent with every prior "fewer
+    # trades" experiment on this account size. KEEP 0.
+    "min_confidence_to_trade": 0,
+
+}
+
+# =============================================================================
+# SWEEP MODEL — liquidity-sweep reversal entries ("liquidation point" strategy)
+# =============================================================================
+# Second entry model alongside AMD: fade a sweep of an OHLCV-derived stop-cluster
+# level (equal highs/lows, PDH/PDL, prior-week H/L, Asian range, $-round numbers).
+# Evidence basis & caveats in src/strategy/liquidity_levels.py / sweep_entry.py.
+#
+# EXPERIMENT OUTCOME (2026-07-02, train split Sep24-Sep25, honest costs):
+#   FIXED_RR 0.030R PF 0.99 | HYBRID 0.084R PF 0.90 | LONG-only+HYBRID 0.132R PF 1.09
+#   All FAIL the kill bar (train expectancy >= 0.15R) -> stays DISABLED (mode "AMD").
+#   The edge exists but is too thin after realistic spread/slippage — exactly what the
+#   Turtle-Soup literature predicted. Positive pockets for future work (do NOT cherry-
+#   pick without fresh OOS): Asian-low sweeps LONG (+0.6-0.7R both styles, n=14),
+#   prime hours 13-17. Runs: 3095645a / 44ae42aa / bfb9e9e0.
+SWEEP_MODEL = {
+    "enabled": True,
+    # "AMD" = current behavior only; "SWEEP" = sweep entries only; "BOTH" = combined.
+    "strategy_mode": "AMD",          # default unchanged until validation passes
+
+    # --- Liquidity level sources (see liquidity_levels.get_active_levels) ---
+    "use_pdh_pdl": True,
+    "use_weekly": True,
+    "use_asian_range": True,
+    "use_round_numbers": True,
+    "round_step": 25.0,              # gold psychological increments ($25)
+    "use_equal_levels": True,
+    "equal_tolerance_atr_mult": 0.10,
+    "equal_min_touches": 2,
+    "level_lookback": 200,           # bars of swing history for equal levels
+    "swing_strength": 3,
+
+    # --- Sweep trigger ---
+    # LONG-only: fade sell-side sweeps (below lows) only. SHORT fades were negative in
+    # BOTH exit styles on the train split (-0.47R/-0.55R) AND in the phantom-fill data
+    # (-0.13R, n=275) — consistent with gold's long-side bias in this period.
+    "long_only": True,
+    "min_poke_atr_mult": 0.10,       # wick must exceed level by >= 0.10 ATR
+    "max_candles_back_inside": 3,    # close back inside within 3 bars of the poke
+    "require_rejection": True,       # trigger bar must reject (wick-through or counter body)
+    "max_level_distance_atr": 1.5,   # trigger close must be within 1.5 ATR of the level
+    "volume_bonus": True,            # soft flag only (tick volume is a proxy) — never gates
+    "volume_bonus_ratio": 1.5,
+
+    # --- Exits (A/B under test; per-trade via TradeRecord.exit_style) ---
+    # "FIXED_RR": TP at tp_rr, BE at STRATEGY move_sl_to_be_at_r, NO trailing.
+    # "HYBRID":   close hybrid_partial_pct at hybrid_partial_at_r, BE, trail rest.
+    "exit_style": "FIXED_RR",
+    "tp_rr": 2.5,
+    "hybrid_partial_at_r": 1.0,
+    "hybrid_partial_pct": 0.5,
+}
+
+# =============================================================================
+# NY Initial Balance pullback model (second live stream candidate)
+# =============================================================================
+# Lab-validated (runs 65fecd3b/6ef3f2fb, src/research/strategies/ny_ib.py):
+# train 103tr 72.8% WR +0.057R PF 1.45 | OOS 71tr 83.1% WR +0.121R PF 2.15,
+# robust to $0.45/oz spread. IB = first NY hour range (16:30-17:30 broker,
+# = 9:30-10:30 ET); after a close beyond the IB within the scan window, a
+# LIMIT order rests back inside the range; small TP beyond the edge, wide SL
+# across the range (gold usually breaks only ONE side of its IB per day).
+# Engine validation pending — keep disabled until it passes (see plan).
+NY_IB_MODEL = {
+    "enabled": False,                # flip only after full-engine validation
+    "only": False,                   # True = suppress AMD (validation runs)
+
+    "ib_start": "16:30",             # broker time (= 09:30 ET, DST-locked)
+    "ib_end": "17:30",
+    "scan_end": "22:00",             # breakout close must occur before this
+    "eod_flat": "23:00",             # force-flat and pending-order expiry
+    "min_ib_bars": 10,               # of 12 possible M5 bars in the IB hour
+    "ib_min_pct": 0.004,             # IB size as fraction of price
+    "ib_max_pct": 0.02,
+
+    "retrace_frac": 0.10,            # LIMIT this far back inside the range
+    "sl_range_mult": 1.00,           # SL 1.0x IB from entry (the wide stop IS
+    "tp_range_mult": 0.20,           #   the design; RR ~0.2 with ~73-83% WR)
+    "max_trades_day": 1,
+    "long_only": False,              # both sides validated
+
+    # Pure bracket: no BE, no trailing, no partial — engine exit_style BRACKET.
+    "exit_style": "BRACKET",
+    # Its 17:30-22:00 window sits outside AMD killzones; skip ONLY the
+    # killzone/asian session gate. News blackout, loss limits, cooldown,
+    # rollover and the drawdown breaker still apply.
+    "bypass_session_window": True,
+    # The lab-validated spec has no HTF-bias gate (it is an AMD-frame concept);
+    # with it, engine run 0f778191 rejected 82 of 172 breakouts and halved the
+    # stream's frequency. Bypass to match the validated design.
+    "bypass_htf_bias": True,
 }
 
 # =============================================================================
@@ -558,6 +819,48 @@ VALIDATION = {
     "max_drawdown_pct": 0.20,               # Max drawdown < 20%
     "min_months": 3,                        # Minimum months of data
 }
+
+
+# =============================================================================
+# RUN TIMEFRAME — run the whole pipeline on resampled higher-TF bars
+# =============================================================================
+# Philosophy: pattern parameters stay in BARS on purpose — a 12-bar consolidation
+# on M15 is a 3-hour accumulation, i.e. a structurally BIGGER setup than on M5,
+# which is the whole point of a higher-TF run. Only wall-clock plumbing scales:
+#   - halt_max_bars (circuit-breaker deadlock timeout ~= 5 trading days)
+#   - minute-width windows (news pre-blackout, rollover no-entry window) are
+#     floored to one bar interval so they can't fall between bars.
+# M5 remains the default and is completely unchanged by this layer.
+RUN_TIMEFRAME = {
+    "timeframe": "M5",
+    "bar_minutes": 5,
+}
+
+_HALT_MAX_BARS_M5 = 1440  # canonical M5 value; scaled per timeframe below
+
+
+def apply_run_timeframe(timeframe: str) -> None:
+    """Mutate config dicts for a resampled higher-TF run. Call before engine init."""
+    from src.data.resample import TIMEFRAME_MINUTES  # local import: avoid cycle
+
+    minutes = TIMEFRAME_MINUTES[timeframe]
+    RUN_TIMEFRAME["timeframe"] = timeframe
+    RUN_TIMEFRAME["bar_minutes"] = minutes
+    if minutes == 5:
+        return
+
+    # Keep the deadlock timeout at ~5 trading days of wall-clock
+    DRAWDOWN_CONTROLS["halt_max_bars"] = max(1, int(_HALT_MAX_BARS_M5 * 5 / minutes))
+
+    # Floor sub-bar windows to one bar so they cannot fall between bar timestamps
+    NEWS_FILTER["pre_minutes"] = max(NEWS_FILTER.get("pre_minutes", 5), minutes)
+    NEWS_FILTER["post_minutes"] = max(NEWS_FILTER.get("post_minutes", 15), minutes)
+    SESSION_FILTER["no_new_entries_before_rollover_minutes"] = max(
+        SESSION_FILTER.get("no_new_entries_before_rollover_minutes", 15), minutes)
+    SESSION_FILTER["close_before_rollover_minutes"] = max(
+        SESSION_FILTER.get("close_before_rollover_minutes", 5), minutes)
+    SESSION_FILTER["cooldown_minutes_after_trade"] = max(
+        SESSION_FILTER.get("cooldown_minutes_after_trade", 15), minutes)
 
 
 # =============================================================================

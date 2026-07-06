@@ -84,6 +84,8 @@ class TimeFilterEngine:
         self.close_before_rollover_minutes = close_before_rollover_minutes if close_before_rollover_minutes is not None else SESSION_FILTER["close_before_rollover_minutes"]
         self.no_new_entries_before_rollover_minutes = no_new_entries_before_rollover_minutes if no_new_entries_before_rollover_minutes is not None else SESSION_FILTER["no_new_entries_before_rollover_minutes"]
 
+        self.monthly_loss_limit_pct = SESSION_FILTER.get("monthly_loss_limit_pct", 0.0)
+
         self.blackout_hours = SESSION_FILTER.get("blackout_hours_utc", [])
         self.blackout_weekdays = SESSION_FILTER.get("blackout_weekdays", [])
 
@@ -96,6 +98,9 @@ class TimeFilterEngine:
 
         # State tracking per trading day
         self.session_states: Dict[str, SessionState] = {}
+
+        # Monthly P&L tracking for circuit breaker
+        self._monthly_pnl: Dict[str, float] = {}
 
     def _parse_time(self, time_str: str) -> time:
         """Parse time string HH:MM to time object."""
@@ -382,6 +387,30 @@ class TimeFilterEngine:
         loss_pct = abs(state.daily_pnl) / starting_capital if state.daily_pnl < 0 else 0
         return loss_pct >= self.daily_loss_limit_pct
 
+    def _get_month_key(self, ts: datetime) -> str:
+        """Get month key (YYYY-MM) from timestamp in session timezone."""
+        session_ts = self.convert_to_session_tz(ts)
+        return session_ts.strftime("%Y-%m")
+
+    def has_exceeded_monthly_loss_limit(self, ts: datetime, starting_capital: float) -> bool:
+        """
+        Check if monthly loss limit exceeded.
+
+        Args:
+            ts: Current timestamp
+            starting_capital: Starting capital for percentage calculation
+
+        Returns:
+            True if monthly loss limit exceeded
+        """
+        if not self.enabled or self.monthly_loss_limit_pct <= 0:
+            return False
+
+        month_key = self._get_month_key(ts)
+        monthly_pnl = self._monthly_pnl.get(month_key, 0.0)
+        loss_pct = abs(monthly_pnl) / starting_capital if monthly_pnl < 0 else 0
+        return loss_pct >= self.monthly_loss_limit_pct
+
     def can_enter_trade(
         self,
         ts: datetime,
@@ -449,6 +478,10 @@ class TimeFilterEngine:
         if self.has_exceeded_daily_loss_limit(ts, starting_capital):
             return False, "daily_loss_limit"
 
+        # Check monthly loss limit
+        if self.has_exceeded_monthly_loss_limit(ts, starting_capital):
+            return False, "monthly_loss_limit"
+
         return True, ""
 
     def record_trade(self, ts: datetime, pnl: float = 0.0):
@@ -474,6 +507,10 @@ class TimeFilterEngine:
         """
         state = self.get_session_state(ts)
         state.daily_pnl += pnl
+
+        # Track monthly P&L for circuit breaker
+        month_key = self._get_month_key(ts)
+        self._monthly_pnl[month_key] = self._monthly_pnl.get(month_key, 0.0) + pnl
 
     def reset_daily_state(self, trading_day: str = None):
         """

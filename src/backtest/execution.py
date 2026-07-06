@@ -350,6 +350,9 @@ class ExecutionEngine:
         trade,  # TradeRecord object
         candle: pd.Series,
         atr: float,
+        partial_at_r: float = None,
+        partial_pct: float = None,
+        be_buffer_atr: float = None,
     ) -> ExitDecision:
         """
         Check for exit including partial TP logic.
@@ -363,6 +366,9 @@ class ExecutionEngine:
             trade: TradeRecord with position details
             candle: Current candle OHLC
             atr: Current ATR value
+            partial_at_r: Override partial TP R-level (default: 1R from RISK_MODEL)
+            partial_pct: Override partial close percentage
+            be_buffer_atr: ATR multiplier for cushioned BE after partial (None = entry flat)
 
         Returns:
             ExitDecision with exit or partial exit details
@@ -372,25 +378,26 @@ class ExecutionEngine:
         tp_price = trade.tp_price
         entry_price = trade.entry_price
 
-        partial_enabled = RISK_MODEL.get("partial_tp_enabled", False)
+        partial_enabled = RISK_MODEL.get("partial_tp_enabled", False) or (partial_at_r is not None)
         move_sl_to_be = RISK_MODEL.get("move_sl_to_be_after_partial", True)
-        partial_pct = RISK_MODEL.get("partial_tp_at_1r", 0.5)
+        close_pct = partial_pct if partial_pct is not None else RISK_MODEL.get("partial_tp_at_1r", 0.5)
+        partial_r = partial_at_r if partial_at_r is not None else 1.0
 
-        # Calculate partial TP level (1R)
+        # Calculate partial TP level
         # Use original_sl if available (SL before any BE move)
         original_sl = getattr(trade, 'original_sl', 0.0) or sl_price
         partial_tp_taken = getattr(trade, 'partial_tp_taken', False)
 
         if direction == "LONG":
             risk = entry_price - original_sl
-            partial_tp = entry_price + risk  # 1R target
+            partial_tp = entry_price + risk * partial_r
 
             sl_hit = candle["low"] <= sl_price
             partial_hit = not partial_tp_taken and candle["high"] >= partial_tp
             tp_hit = candle["high"] >= tp_price
         else:
             risk = original_sl - entry_price
-            partial_tp = entry_price - risk  # 1R target
+            partial_tp = entry_price - risk * partial_r
 
             sl_hit = candle["high"] >= sl_price
             partial_hit = not partial_tp_taken and candle["low"] <= partial_tp
@@ -412,13 +419,21 @@ class ExecutionEngine:
 
         # Priority 2: Partial TP (if enabled and not taken)
         if partial_enabled and partial_hit:
-            new_sl = entry_price if move_sl_to_be else sl_price
+            # Cushioned BE: entry + buffer, not flat entry
+            if be_buffer_atr is not None and atr > 0:
+                buffer = atr * be_buffer_atr
+                if direction == "LONG":
+                    new_sl = entry_price + buffer
+                else:
+                    new_sl = entry_price - buffer
+            else:
+                new_sl = entry_price if move_sl_to_be else sl_price
             return ExitDecision(
                 should_exit=False,  # Not a full exit
                 exit_reason="PARTIAL_TP",
                 exit_price=partial_tp,
                 is_partial=True,
-                partial_close_pct=partial_pct,
+                partial_close_pct=close_pct,
                 new_sl_price=new_sl,
             )
 

@@ -524,14 +524,24 @@ class TestNewsFilter:
     """Tests for news blackout filtering."""
 
     def test_news_filter_disabled_without_file(self):
-        """Test that news filter disables itself without CSV file."""
-        engine = NewsFilterEngine(enabled=True, csv_path="nonexistent.csv")
+        """Non-strict: news filter disables itself gracefully when CSV is missing."""
+        engine = NewsFilterEngine(enabled=True, csv_path="nonexistent.csv", require_csv=False)
 
         ts = datetime(2024, 1, 15, 14, 0, 0, tzinfo=pytz.UTC)
         can_trade, reason = engine.can_enter_trade(ts)
 
-        # Should allow trading when no news file exists
+        # Should allow trading when no news file exists (filter self-disabled)
         assert can_trade
+        assert not engine.enabled
+
+    def test_news_filter_require_csv_raises(self):
+        """Strict: an enabled filter with require_csv=True raises if the CSV is missing."""
+        raised = False
+        try:
+            NewsFilterEngine(enabled=True, csv_path="nonexistent.csv", require_csv=True)
+        except RuntimeError:
+            raised = True
+        assert raised, "require_csv=True should raise when the CSV is missing"
 
     def test_news_filter_explicitly_disabled(self):
         """Test explicitly disabled news filter."""

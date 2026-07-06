@@ -42,6 +42,7 @@ class NewsFilterEngine:
         pre_minutes: int = None,
         post_minutes: int = None,
         impact_filter: List[str] = None,
+        require_csv: bool = None,
     ):
         """
         Initialize news filter.
@@ -58,6 +59,7 @@ class NewsFilterEngine:
         self.pre_minutes = pre_minutes if pre_minutes is not None else NEWS_FILTER["pre_minutes"]
         self.post_minutes = post_minutes if post_minutes is not None else NEWS_FILTER["post_minutes"]
         self.impact_filter = impact_filter or NEWS_FILTER.get("impact_filter", ["HIGH"])
+        self.require_csv = require_csv if require_csv is not None else NEWS_FILTER.get("require_csv", False)
 
         self.events: List[NewsEvent] = []
         self._loaded = False
@@ -69,7 +71,16 @@ class NewsFilterEngine:
     def _try_load_events(self):
         """Try to load news events from CSV."""
         if not os.path.exists(self.csv_path):
-            logger.warning(f"News CSV not found: {self.csv_path}. News filter disabled.")
+            msg = (
+                f"News CSV not found: {self.csv_path}. "
+                f"Generate it with: python scripts/generate_news_events.py"
+            )
+            if self.require_csv:
+                raise RuntimeError(
+                    msg + " (NEWS_FILTER['require_csv']=True — refusing to run with news "
+                    "filtering silently disabled.)"
+                )
+            logger.error(msg + " News filter DISABLED.")
             self.enabled = False
             return
 
@@ -78,7 +89,9 @@ class NewsFilterEngine:
             self._loaded = True
             logger.info(f"Loaded {len(self.events)} news events from {self.csv_path}")
         except Exception as e:
-            logger.warning(f"Failed to load news CSV: {e}. News filter disabled.")
+            if self.require_csv:
+                raise RuntimeError(f"Failed to load news CSV {self.csv_path}: {e}")
+            logger.error(f"Failed to load news CSV: {e}. News filter DISABLED.")
             self.enabled = False
 
     def _load_events(self):

@@ -26,6 +26,7 @@ from .order_blocks import (
     find_order_blocks_in_range,
 )
 from .market_structure import StructureBreak, find_bos_after_manipulation
+from .fib import is_in_ote, ote_entry_price
 
 
 # Entry mode constants
@@ -108,12 +109,13 @@ def calculate_confluence_score(
     equal_level_swept: bool,
     volume_confirmed: bool,
     breaker_confluence: bool = False,
+    ote_confluence: bool = False,
 ) -> int:
     """Calculate institutional confluence score from SMC factors.
 
-    Returns a score 0-6 based on how many factors are present:
+    Returns a score 0-7 based on how many factors are present:
     BOS (+1), FVG (+1), OB (+1), equal level swept (+1),
-    volume confirmed (+1), breaker block (+1).
+    volume confirmed (+1), breaker block (+1), retest in OTE zone (+1).
     """
     score = 0
     if bos_confirmed:
@@ -128,7 +130,78 @@ def calculate_confluence_score(
         score += 1
     if breaker_confluence:
         score += 1
+    if ote_confluence:
+        score += 1
     return score
+
+
+def calculate_move_potential(
+    velocity_score: float = 0.0,
+    session_hour: int = -1,
+    body_expansion: float = 0.0,
+    consolidation_quality: int = 0,
+    equal_level_swept: bool = False,
+) -> int:
+    """Score move potential 0-5. Higher = pattern predicts bigger price move.
+
+    Separate from confluence_score (which measures entry validity).
+    This measures exit expectation — how far the setup is likely to run.
+
+    Factors:
+    - velocity_score >= 0.5: strong institutional sweep (+1)
+    - London 07-10 or NY 13-15 kill zone: institutional volume hours (+1)
+    - body_expansion >= 1.5x: strong distribution follow-through (+1)
+    - consolidation_quality >= 2: tight, clean accumulation (+1)
+    - equal_level_swept: liquidity pool run (+1)
+    """
+    score = 0
+    if velocity_score >= 0.5:
+        score += 1
+    if 7 <= session_hour <= 10 or 13 <= session_hour <= 15:
+        score += 1
+    if body_expansion >= 1.5:
+        score += 1
+    if consolidation_quality >= 2:
+        score += 1
+    if equal_level_swept:
+        score += 1
+    return score
+
+
+# Confidence-label thresholds for calculate_signal_confidence's 0-4 score
+CONFIDENCE_LABELS = [(4, "HIGH"), (3, "GOOD"), (2, "MODERATE"), (0, "LOW")]
+
+
+def calculate_signal_confidence(
+    confluence_score: int,
+    move_potential: int,
+    entry_hour: int,
+) -> tuple:
+    """Empirical per-trade confidence score (0-4) and label.
+
+    Calibrated on 280 honest-cost backtest trades (runs ff8c3c7e + f99ef66e,
+    2024-09..2026-02) and verified to hold on the most recent 30% window:
+      LOW (0-1): 36.8% WR, 0.106R | MODERATE (2): 46.7%, 0.304R
+      GOOD (3):  46.8% WR, 0.543R | HIGH (4):     53.5%, 0.581R
+    Factors (weights from that data, largest effect first):
+      +2 prime hours 13-17 (broker frame; avg 0.55R vs 0.19R off-hours)
+      +1 confluence_score >= 4  (score 5 showed NO extra edge — capped)
+      +1 move_potential >= 3
+
+    Returns (score, label). Display/sizing aid only — never a hard entry gate
+    (LOW trades are net-positive and cushion the equity curve; do not skip them).
+    """
+    score = 0
+    if 13 <= entry_hour <= 17:
+        score += 2
+    if confluence_score >= 4:
+        score += 1
+    if move_potential >= 3:
+        score += 1
+    for threshold, label in CONFIDENCE_LABELS:
+        if score >= threshold:
+            return score, label
+    return score, "LOW"
 
 
 def check_premium_discount_filter(
@@ -188,7 +261,8 @@ class EntrySignal:
     bos_confirmed: bool = False    # Break of Structure confirmed
     equal_level_swept: bool = False  # Manipulation swept equal highs/lows
     volume_confirmed: bool = False   # Volume spike during manipulation
-    confluence_score: int = 0      # Number of confluence factors (0-6)
+    ote_confluence: bool = False   # Retest level sits in the OTE (deep pullback) band
+    confluence_score: int = 0      # Number of confluence factors (0-7)
 
     # Limit fill parameters
     desired_entry_price: float = 0.0  # Limit order price for fill simulation
@@ -807,6 +881,18 @@ def check_entry_at_candle(
     equal_level_swept = _equal_level_swept(consolidation, manipulation, atr=atr)
     volume_confirmed = getattr(manipulation, "volume_confirmed", False)
 
+    # OTE geometry: is the retest level a deep pullback (61.8-79%) of the
+    # manipulation-extreme -> distribution-break leg? Pure geometry, no fib
+    # mysticism — deep pullbacks shorten the stop and widen realized R.
+    # Gated off by default: turning this on changes confluence scores and thus
+    # sizing tiers on the validated champion config — experiment-only.
+    ote_conf = False
+    _leg_end = getattr(distribution, "break_price", 0.0) or 0.0
+    _leg_start = getattr(manipulation, "extreme_price", 0.0) or 0.0
+    if (STRATEGY.get("use_ote_confluence", False)
+            and _leg_end and _leg_start and _leg_end != _leg_start):
+        ote_conf = is_in_ote(retest_level, _leg_start, _leg_end)
+
     # Calculate confluence score using shared function
     # Note: Judas quality is a pattern quality metric, not an institutional confluence
     # factor. It is enforced separately via min_judas_quality hard gate.
@@ -817,6 +903,7 @@ def check_entry_at_candle(
         equal_level_swept=equal_level_swept,
         volume_confirmed=volume_confirmed,
         breaker_confluence=breaker_confluence,
+        ote_confluence=ote_conf,
     )
 
     # Apply direction-specific confluence minimums
@@ -831,6 +918,13 @@ def check_entry_at_candle(
     entry_execution = STRATEGY.get("entry_execution", "LIMIT").upper()
     desired_price = candle["close"] if entry_execution == "MARKET" else retest_level
     desired_type = "MARKET" if entry_execution == "MARKET" else "LIMIT"
+
+    # E3 refinement: with entry_price_mode=OTE, place the limit at the OTE band
+    # edge when it is a strictly better price than the plain retest level.
+    # Trade-off measured by the experiment: wider R per fill vs fewer fills.
+    if (desired_type == "LIMIT" and _leg_end and _leg_start
+            and STRATEGY.get("entry_price_mode", "RETEST").upper() == "OTE"):
+        desired_price = ote_entry_price(direction, _leg_start, _leg_end, retest_level)
 
     return EntrySignal(
         valid=True,
@@ -851,6 +945,7 @@ def check_entry_at_candle(
         bos_confirmed=bos_confirmed,
         equal_level_swept=equal_level_swept,
         volume_confirmed=volume_confirmed,
+        ote_confluence=ote_conf,
         confluence_score=confluence_score,
         desired_entry_price=desired_price,
         desired_entry_type=desired_type,

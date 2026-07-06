@@ -49,6 +49,7 @@ class BacktestMetrics:
     total_spread_cost: float = 0.0
     total_slippage_cost: float = 0.0
     total_commission_cost: float = 0.0
+    total_swap_cost: float = 0.0
     total_costs: float = 0.0
     cost_per_trade: float = 0.0
 
@@ -57,6 +58,8 @@ class BacktestMetrics:
     max_drawdown_usd: float = 0.0
     calmar_ratio: float = 0.0
     sharpe_ratio: float = 0.0
+    sortino_ratio: float = 0.0       # like Sharpe but penalizes only downside deviation
+    recovery_factor: float = 0.0     # net profit / max drawdown (USD) — higher = recovers DD faster
 
     # Consecutive trades
     max_consecutive_wins: int = 0
@@ -73,8 +76,10 @@ class BacktestMetrics:
     long_win_rate: float = 0.0
     short_win_rate: float = 0.0
 
-    # By exit reason
-    sl_exits: int = 0
+    # By exit reason (honest taxonomy)
+    sl_exits: int = 0        # true stop-loss losses
+    be_exits: int = 0        # exited at a breakeven-moved stop (~0R)
+    trail_exits: int = 0     # exited at a trailing stop (locked-in profit)
     tp_exits: int = 0
     timeout_exits: int = 0
     rollover_exits: int = 0
@@ -84,6 +89,18 @@ class BacktestMetrics:
     trades_with_fvg: int = 0
     trades_with_ob: int = 0
     trades_with_bos: int = 0
+
+    # MFE/MAE (Maximum Favorable/Adverse Excursion)
+    avg_mfe_r: float = 0.0
+    median_mfe_r: float = 0.0
+    avg_mae_r: float = 0.0
+    mfe_capture_pct: float = 0.0  # What % of peak move winners actually capture
+
+    # Monthly consistency (directly targets the "consistent profit" objective)
+    num_months: int = 0
+    profitable_months_pct: float = 0.0   # % of calendar months with positive net P&L
+    worst_month_return_pct: float = 0.0
+    best_month_return_pct: float = 0.0
 
     # Validation
     passes_validation: bool = False
@@ -166,16 +183,20 @@ def calculate_metrics(
         metrics.total_slippage_cost = df["slippage_cost"].sum()
     if "commission_cost" in df.columns:
         metrics.total_commission_cost = df["commission_cost"].sum()
+    if "swap_cost" in df.columns:
+        metrics.total_swap_cost = df["swap_cost"].sum()
     if "total_costs" in df.columns:
         metrics.total_costs = df["total_costs"].sum()
     else:
-        metrics.total_costs = metrics.total_spread_cost + metrics.total_slippage_cost + metrics.total_commission_cost
+        metrics.total_costs = (metrics.total_spread_cost + metrics.total_slippage_cost
+                               + metrics.total_commission_cost + metrics.total_swap_cost)
 
     # Override with cost_stats if provided (more accurate)
     if cost_stats:
         metrics.total_spread_cost = cost_stats.get("total_spread_cost", metrics.total_spread_cost)
         metrics.total_slippage_cost = cost_stats.get("total_slippage_cost", metrics.total_slippage_cost)
         metrics.total_commission_cost = cost_stats.get("total_commission_cost", metrics.total_commission_cost)
+        metrics.total_swap_cost = cost_stats.get("total_swap_cost", metrics.total_swap_cost)
         metrics.total_costs = cost_stats.get("total_costs", metrics.total_costs)
         if "gross_pnl" in cost_stats:
             metrics.gross_pnl = cost_stats["gross_pnl"]
@@ -206,16 +227,24 @@ def calculate_metrics(
         annualized_return = (1 + total_return) ** (252 / trading_days) - 1
         metrics.calmar_ratio = annualized_return / metrics.max_drawdown_pct if metrics.max_drawdown_pct > 0 else 0
 
-    # Sharpe ratio from per-trade USD returns (annualized)
+        # Recovery factor: net profit relative to worst peak-to-trough drawdown (USD)
+        metrics.recovery_factor = metrics.net_pnl / metrics.max_drawdown_usd if metrics.max_drawdown_usd > 0 else 0.0
+
+    # Sharpe & Sortino from per-trade returns (annualized by trades/year).
+    # NOTE: per-trade, non-compounding, risk-free=0 — a rough gauge, not a fund-grade
+    # ratio; it tends to run high. Sortino penalizes only downside deviation.
     if dd_curve and pnl_col in df.columns and len(df) > 1:
         trade_returns = df[pnl_col] / equity.iloc[0]
         avg_ret = trade_returns.mean()
         std_ret = trade_returns.std()
+        trades_per_year = len(df) / max(trading_days / 252, 1 / 252)
         if std_ret > 0:
-            trades_per_year = len(df) / max(trading_days / 252, 1/252)
             metrics.sharpe_ratio = (avg_ret / std_ret) * (trades_per_year ** 0.5)
-        else:
-            metrics.sharpe_ratio = 0
+        downside = trade_returns[trade_returns < 0]
+        if len(downside) > 0:
+            downside_dev = (downside.pow(2).mean()) ** 0.5
+            if downside_dev > 0:
+                metrics.sortino_ratio = (avg_ret / downside_dev) * (trades_per_year ** 0.5)
 
     # Consecutive wins/losses
     metrics.max_consecutive_wins, metrics.max_consecutive_losses = _calculate_consecutive(df, pnl_col)
@@ -232,12 +261,15 @@ def calculate_metrics(
     if len(short_trades) > 0:
         metrics.short_win_rate = len(short_trades[short_trades[pnl_col] > 0]) / len(short_trades)
 
-    # By exit reason
+    # By exit reason (honest taxonomy; SL_LOSS = true loss, legacy "SL" folded in)
     if "exit_reason" in df.columns:
-        metrics.sl_exits = len(df[df["exit_reason"] == "SL"])
-        metrics.tp_exits = len(df[df["exit_reason"] == "TP"])
-        metrics.timeout_exits = len(df[df["exit_reason"] == "TIMEOUT"])
-        metrics.rollover_exits = len(df[df["exit_reason"] == "ROLLOVER"])
+        er = df["exit_reason"]
+        metrics.sl_exits = int((er == "SL_LOSS").sum() + (er == "SL").sum())
+        metrics.be_exits = int((er == "BE_STOP").sum())
+        metrics.trail_exits = int((er == "TRAIL_STOP").sum())
+        metrics.tp_exits = int((er == "TP").sum())
+        metrics.timeout_exits = int((er == "TIMEOUT").sum())
+        metrics.rollover_exits = int((er == "ROLLOVER").sum())
 
     # By confluence
     if "confluence_score" in df.columns:
@@ -248,6 +280,40 @@ def calculate_metrics(
         metrics.trades_with_ob = df["ob_confluence"].sum()
     if "bos_confirmed" in df.columns:
         metrics.trades_with_bos = df["bos_confirmed"].sum()
+
+    # MFE/MAE analysis
+    if "mfe_r" in df.columns:
+        metrics.avg_mfe_r = df["mfe_r"].mean()
+        metrics.median_mfe_r = df["mfe_r"].median()
+        if "mae_r" in df.columns:
+            metrics.avg_mae_r = df["mae_r"].mean()
+        winners_mfe = winners["mfe_r"].mean() if len(winners) > 0 else 0
+        if winners_mfe > 0:
+            metrics.mfe_capture_pct = metrics.avg_win_r / winners_mfe * 100
+
+    # Trade durations in M5 bars (fields were declared but never assigned before)
+    if "entry_time" in df.columns and "exit_time" in df.columns:
+        et = pd.to_datetime(df["entry_time"])
+        xt = pd.to_datetime(df["exit_time"])
+        dur_bars = ((xt - et).dt.total_seconds() / 300.0).replace([np.inf, -np.inf], np.nan)
+        wmask = df["r_multiple"] > 0
+        if dur_bars.dropna().shape[0] > 0:
+            metrics.avg_trade_duration = float(dur_bars.dropna().mean())
+        if dur_bars[wmask].dropna().shape[0] > 0:
+            metrics.avg_win_duration = float(dur_bars[wmask].dropna().mean())
+        if dur_bars[~wmask].dropna().shape[0] > 0:
+            metrics.avg_loss_duration = float(dur_bars[~wmask].dropna().mean())
+
+    # Monthly consistency (targets the "consistent profit" objective directly)
+    if "entry_time" in df.columns:
+        month = pd.to_datetime(df["entry_time"]).dt.to_period("M")
+        monthly_pnl = df.groupby(month)[pnl_col].sum()
+        metrics.num_months = int(len(monthly_pnl))
+        if metrics.num_months > 0:
+            metrics.profitable_months_pct = float((monthly_pnl > 0).sum() / metrics.num_months * 100)
+            monthly_ret_pct = monthly_pnl / initial_capital * 100.0
+            metrics.worst_month_return_pct = float(monthly_ret_pct.min())
+            metrics.best_month_return_pct = float(monthly_ret_pct.max())
 
     # Validation
     metrics.passes_validation = (
@@ -467,6 +533,7 @@ def generate_report(metrics: BacktestMetrics) -> str:
         f"Total Spread:     ${metrics.total_spread_cost:,.2f}",
         f"Total Slippage:   ${metrics.total_slippage_cost:,.2f}",
         f"Total Commission: ${metrics.total_commission_cost:,.2f}",
+        f"Total Swap:       ${metrics.total_swap_cost:,.2f}",
         f"Total Costs:      ${metrics.total_costs:,.2f}",
         f"Cost/Trade:       ${metrics.cost_per_trade:.2f}",
         "",
@@ -474,7 +541,10 @@ def generate_report(metrics: BacktestMetrics) -> str:
         "-" * 40,
         f"Max Drawdown:     {metrics.max_drawdown_pct:.2%}",
         f"Max DD (USD):     ${metrics.max_drawdown_usd:,.2f}",
-        f"Sharpe Ratio:     {metrics.sharpe_ratio:.2f}",
+        f"Recovery Factor:  {metrics.recovery_factor:.2f}  (net profit / max DD)",
+        f"Calmar Ratio:     {metrics.calmar_ratio:.2f}",
+        f"Sharpe Ratio:     {metrics.sharpe_ratio:.2f}  (per-trade, rough)",
+        f"Sortino Ratio:    {metrics.sortino_ratio:.2f}",
         "",
         "STREAKS",
         "-" * 40,
@@ -488,7 +558,9 @@ def generate_report(metrics: BacktestMetrics) -> str:
         "",
         "EXIT REASONS",
         "-" * 40,
-        f"Stop Loss:        {metrics.sl_exits}",
+        f"Stop Loss (loss): {metrics.sl_exits}",
+        f"Breakeven Stop:   {metrics.be_exits}",
+        f"Trailing Stop:    {metrics.trail_exits}",
         f"Take Profit:      {metrics.tp_exits}",
         f"Timeout:          {metrics.timeout_exits}",
         f"Rollover:         {metrics.rollover_exits}",
@@ -500,11 +572,26 @@ def generate_report(metrics: BacktestMetrics) -> str:
         f"With OB:          {metrics.trades_with_ob}",
         f"With BOS:         {metrics.trades_with_bos}",
         "",
+        "MFE/MAE ANALYSIS",
+        "-" * 40,
+        f"Avg MFE:          {metrics.avg_mfe_r:.2f}R",
+        f"Median MFE:       {metrics.median_mfe_r:.2f}R",
+        f"Avg MAE:          {metrics.avg_mae_r:.2f}R",
+        f"MFE Capture:      {metrics.mfe_capture_pct:.1f}% (of peak move captured by winners)",
+        "",
+        "CONSISTENCY",
+        "-" * 40,
+        f"Months:           {metrics.num_months}",
+        f"Profitable Months:{metrics.profitable_months_pct:.0f}%",
+        f"Best Month:       {metrics.best_month_return_pct:+.1f}% of start capital",
+        f"Worst Month:      {metrics.worst_month_return_pct:+.1f}% of start capital",
+        f"Avg Trade Dur:    {metrics.avg_trade_duration:.0f} bars",
+        "",
         "VALIDATION",
         "-" * 40,
-        f"Min Trades (500): {'PASS' if metrics.total_trades >= 500 else 'FAIL'}",
-        f"Expectancy (0.2R):{'PASS' if metrics.expectancy >= 0.2 else 'FAIL'}",
-        f"Max DD (15%):     {'PASS' if metrics.max_drawdown_pct <= 0.15 else 'FAIL'}",
+        f"Min Trades ({VALIDATION['min_trades']}):  {'PASS' if metrics.total_trades >= VALIDATION['min_trades'] else 'FAIL'}",
+        f"Expectancy ({VALIDATION['min_expectancy_r']}R):  {'PASS' if metrics.expectancy >= VALIDATION['min_expectancy_r'] else 'FAIL'}",
+        f"Max DD ({VALIDATION['max_drawdown_pct']*100:.0f}%):  {'PASS' if metrics.max_drawdown_pct <= VALIDATION['max_drawdown_pct'] else 'FAIL'}",
         "",
         f"OVERALL: {'PASS' if metrics.passes_validation else 'FAIL'}",
         "=" * 60,
@@ -544,6 +631,8 @@ def generate_funnel_report(funnel_stats: Dict[str, int]) -> str:
         f"  -> Volume:             {funnel_stats.get('filtered_volume', 0)}",
         f"  -> Fundamentals:       {funnel_stats.get('filtered_fundamentals', 0)}",
         f"  -> Daily Limit:        {funnel_stats.get('filtered_daily_limit', 0)}",
+        f"  -> Monthly Limit:      {funnel_stats.get('filtered_monthly_limit', 0)}",
+        f"  -> Drawdown Halt:      {funnel_stats.get('filtered_drawdown_halt', 0)}",
         f"  -> Cooldown:           {funnel_stats.get('filtered_cooldown', 0)}",
         f"  -> Near Rollover:      {funnel_stats.get('filtered_rollover', 0)}",
         f"  -> Fill Not Triggered: {funnel_stats.get('fill_not_triggered', 0)}",

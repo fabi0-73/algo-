@@ -31,7 +31,10 @@ logger = logging.getLogger(__name__)
 
 def run_engine(df, initial_capital: float, verbose: bool = False) -> Dict[str, Any]:
     """Run backtest engine on a DataFrame slice."""
-    engine = BacktestEngine(initial_capital=initial_capital, max_trade_duration=200)
+    # Use the configured trade duration (was hardcoded to 200, which disagreed with
+    # STRATEGY["max_trade_duration"] and made walk-forward inconsistent with run_backtest).
+    engine = BacktestEngine(initial_capital=initial_capital,
+                            max_trade_duration=STRATEGY.get("max_trade_duration", 240))
     return engine.run(df, verbose=verbose)
 
 
@@ -163,14 +166,15 @@ def main():
 
     if args.monte_carlo and "error" not in test_res:
         logger.info("Running Monte Carlo on test set...")
-        from scripts.monte_carlo import extract_r_multiples, run_simulation, print_results
+        from scripts.monte_carlo import extract_r_multiples, extract_risk_pcts, run_simulation, print_results
 
         trades = test_res.get("trades", [])
         if trades:
-            import numpy as np
-            r_vals = np.array([t.get("r_multiple", 0) for t in trades], dtype=np.float64)
+            r_vals = extract_r_multiples(trades)
+            risk_pcts = extract_risk_pcts(trades)  # per-trade confidence-tier sizing if recorded
             risk_pct = RISK_MODEL.get("risk_pct_per_trade_default", 0.005)
-            mc_results = run_simulation(r_vals, risk_pct, capital, args.mc_simulations)
+            mc_results = run_simulation(r_vals, risk_pct, capital, args.mc_simulations,
+                                        risk_pcts=risk_pcts, method="bootstrap")
             print_results(mc_results)
         else:
             logger.warning("No test trades for Monte Carlo analysis")
