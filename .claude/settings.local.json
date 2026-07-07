@@ -8,7 +8,13 @@
       "Bash(jq:*)",
       "Bash(kill:*)",
       "Bash(git checkout:*)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(timeout:*)",
+      "Bash(while:*)",
+      "Bash(tasklist:*)",
+      "Bash(taskkill:*)",
+      "Bash(wmic process:*)",
+      "Bash(ls:*)"
     ]
   }
 }
