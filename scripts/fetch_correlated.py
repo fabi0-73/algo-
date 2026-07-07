@@ -41,16 +41,26 @@ for concept, names in CANDIDATES.items():
     else:
         print(f"  {concept:8s} -> NOT available (tried {names})")
 
+import time
 start = datetime(g0.year, g0.month, g0.day)
-end = datetime(g1.year, g1.month, g1.day, 23, 59)
+end = pd.Timestamp(g1)
 data_dir = Path(__file__).resolve().parents[1] / "data"
 
 for concept, sym in found.items():
-    df = client.get_candles(sym, "M5", start_date=start, end_date=end)
-    if df is None or df.empty:
-        print(f"  {concept}: fetch returned nothing")
+    # Ensure symbol is in Market Watch and give history a moment to load
+    mt5.symbol_select(sym, True)
+    time.sleep(1.0)
+    # copy_rates_from: `count` bars starting AT start going forward — reliably
+    # reaches back to 2024-09 (count-from-pos anchors at "now" and misses it).
+    rates = mt5.copy_rates_from(sym, mt5.TIMEFRAME_M5, start, 160000)
+    if rates is None or len(rates) == 0:
+        print(f"  {concept}: copy_rates_from returned nothing ({mt5.last_error()})")
         continue
+    df = pd.DataFrame(rates)
+    df["timestamp"] = pd.to_datetime(df["time"], unit="s")
+    df["volume"] = df.get("tick_volume", 0)
     df = df[["timestamp", "open", "high", "low", "close", "volume"]].copy()
+    df = df[df["timestamp"] <= end]
     df = df.sort_values("timestamp").reset_index(drop=True)
     path = data_dir / f"lab_{concept.lower()}_cache.csv"
     df.to_csv(path, index=False)
