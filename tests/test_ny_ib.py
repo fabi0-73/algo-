@@ -183,10 +183,15 @@ def test_live_nyib_ib_size_gate(nyib_enabled):
     assert sc.scan_ny_ib(_live_day_df(ib_range_pct=0.0005)) == []
 
 
-def test_live_nyib_disabled_by_default():
+def test_live_nyib_respects_disable_flag():
+    """When explicitly disabled, the producer emits nothing regardless of setup."""
     sc = _scanner()
-    assert NY_IB_MODEL.get("enabled") is False
-    assert sc.scan_ny_ib(_live_day_df()) == []
+    saved = NY_IB_MODEL.get("enabled")
+    NY_IB_MODEL["enabled"] = False
+    try:
+        assert sc.scan_ny_ib(_live_day_df()) == []
+    finally:
+        NY_IB_MODEL["enabled"] = saved
 
 
 def test_live_nyib_telegram_format(nyib_enabled):

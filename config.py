@@ -779,9 +779,14 @@ SWEEP_MODEL = {
 # = 9:30-10:30 ET); after a close beyond the IB within the scan window, a
 # LIMIT order rests back inside the range; small TP beyond the edge, wide SL
 # across the range (gold usually breaks only ONE side of its IB per day).
-# Engine validation pending — keep disabled until it passes (see plan).
+# ENGINE-VALIDATED & ENABLED (2026-07-06):
+#   NY_IB-only  run 19af4776: 157tr 77.1% WR +0.096R PF 1.78 DD 7.6%
+#   NY_IB OOS   run 12a01408:  66tr 78.8% WR +0.108R PF 1.82 DD 9.0%
+#   BOTH (AMD+NY_IB) run 3f3ea9d1: 256tr 60.2% WR +0.266R PF 2.06 DD 19.5%,
+#     final $2,342 vs champion 124d15ef $2,125 — MORE profit, LOWER DD, +80%
+#     trades. Passes the pre-registered accept bar (beats champion, DD<25%).
 NY_IB_MODEL = {
-    "enabled": False,                # flip only after full-engine validation
+    "enabled": True,                 # engine-validated; runs beside AMD (BOTH)
     "only": False,                   # True = suppress AMD (validation runs)
 
     "ib_start": "16:30",             # broker time (= 09:30 ET, DST-locked)
