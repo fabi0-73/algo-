@@ -49,18 +49,30 @@ data_dir = Path(__file__).resolve().parents[1] / "data"
 for concept, sym in found.items():
     # Ensure symbol is in Market Watch and give history a moment to load
     mt5.symbol_select(sym, True)
-    time.sleep(1.0)
-    # copy_rates_from: `count` bars starting AT start going forward — reliably
-    # reaches back to 2024-09 (count-from-pos anchors at "now" and misses it).
-    rates = mt5.copy_rates_from(sym, mt5.TIMEFRAME_M5, start, 160000)
-    if rates is None or len(rates) == 0:
-        print(f"  {concept}: copy_rates_from returned nothing ({mt5.last_error()})")
+    time.sleep(2.0)
+    # This terminal caps copy_rates at ~50k bars/call, and 50k only reaches
+    # ~8mo back. Paginate with an increasing start_pos (0 = most recent) until
+    # we've covered past the gold start, then filter. Datetime-based calls
+    # return invalid-params here, so position paging is the only path.
+    PAGE = 45000
+    parts = []
+    for page in range(6):  # up to 270k bars
+        rates = mt5.copy_rates_from_pos(sym, mt5.TIMEFRAME_M5, page * PAGE, PAGE)
+        if rates is None or len(rates) == 0:
+            break
+        p = pd.DataFrame(rates)
+        p["timestamp"] = pd.to_datetime(p["time"], unit="s")
+        parts.append(p)
+        if p["timestamp"].min() <= pd.Timestamp(start):
+            break
+    if not parts:
+        print(f"  {concept}: paged fetch returned nothing ({mt5.last_error()})")
         continue
-    df = pd.DataFrame(rates)
-    df["timestamp"] = pd.to_datetime(df["time"], unit="s")
+    df = pd.concat(parts, ignore_index=True)
     df["volume"] = df.get("tick_volume", 0)
     df = df[["timestamp", "open", "high", "low", "close", "volume"]].copy()
-    df = df[df["timestamp"] <= end]
+    df = df.drop_duplicates("timestamp")
+    df = df[(df["timestamp"] >= pd.Timestamp(start)) & (df["timestamp"] <= end)]
     df = df.sort_values("timestamp").reset_index(drop=True)
     path = data_dir / f"lab_{concept.lower()}_cache.csv"
     df.to_csv(path, index=False)
