@@ -49,7 +49,7 @@ def extract_r_multiples(trades: List[Dict[str, Any]]) -> np.ndarray:
     """Extract R-multiple array from trade list."""
     r_values = []
     for t in trades:
-        r = t.get("r_multiple", 0.0)
+        r = t.get("r_multiple", t.get("r_net", 0.0))  # lab results.json uses r_net
         r_values.append(r)
     return np.array(r_values, dtype=np.float64)
 

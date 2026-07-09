@@ -1,0 +1,162 @@
+"""Planted patterns fire exactly at the planted bar; prefix-invariance
+(detect(df[:i+1]) row i == detect(df) row i) mechanically forbids lookahead
+for every registered detector."""
+import numpy as np
+import pandas as pd
+
+from src.research.events import (
+    EVENT_REGISTRY, detect_bos_up, detect_fvg_bull, detect_fvg_fill_bull,
+    detect_range_break, detect_session_open_london, detect_sweep_high,
+    detect_vwap_stretch, run_all,
+)
+from src.strategy.fvg import detect_fvg as oracle_detect_fvg
+
+
+def frame(bars, start="2025-01-06 09:00", atr=1.0, volume=100):
+    """bars = list of (open, high, low, close)."""
+    ts = pd.date_range(start, periods=len(bars), freq="5min")
+    df = pd.DataFrame(bars, columns=["open", "high", "low", "close"])
+    df.insert(0, "timestamp", ts)
+    df["volume"] = volume
+    df["atr"] = atr
+    return df
+
+
+def flat_bars(n, px=100.0):
+    return [(px, px + 0.2, px - 0.2, px)] * n
+
+
+def random_frame(n=400, seed=11):
+    rng = np.random.default_rng(seed)
+    steps = rng.normal(0, 0.5, n).cumsum()
+    close = 100 + steps
+    open_ = np.roll(close, 1)
+    open_[0] = 100
+    high = np.maximum(open_, close) + rng.uniform(0, 0.4, n)
+    low = np.minimum(open_, close) - rng.uniform(0, 0.4, n)
+    df = pd.DataFrame({
+        "timestamp": pd.date_range("2025-01-06 02:00", periods=n, freq="5min"),
+        "open": open_, "high": high, "low": low, "close": close,
+        "volume": rng.integers(50, 500, n),
+    })
+    df["atr"] = 1.0
+    return df
+
+
+def test_fvg_bull_fires_at_third_bar():
+    bars = flat_bars(5) + [
+        (100.0, 100.3, 99.8, 100.2),   # bar 5: high 100.3
+        (100.3, 101.5, 100.2, 101.4),  # bar 6: impulse
+        (101.4, 101.8, 100.9, 101.6),  # bar 7: low 100.9 > 100.3 -> gap 0.6
+    ] + flat_bars(2, 101.5)
+    df = frame(bars)
+    r = detect_fvg_bull(df)
+    assert r.loc[7, "fired"] and r.loc[7, "direction"] == 1
+    assert np.isclose(r.loc[7, "strength"], 0.6)
+    assert r["fired"].sum() == 1  # nowhere else
+
+
+def test_fvg_matches_oracle():
+    df = random_frame(300)
+    ours = detect_fvg_bull(df)
+    for i in range(2, len(df)):
+        o = oracle_detect_fvg(df, i, min_size_atr_mult=0.10, atr=1.0)
+        expected = o is not None and o.valid and o.direction == "BULLISH"
+        assert bool(ours.loc[i, "fired"]) == expected, f"mismatch at {i}"
+
+
+def test_sweep_high_fires_on_poke_and_reject():
+    bars = flat_bars(30)  # prior max 100.2
+    bars += [(100.0, 100.6, 99.9, 100.1)]  # poke 0.4 above, close back below
+    df = frame(bars)
+    r = detect_sweep_high(df)
+    i = len(bars) - 1
+    assert r.loc[i, "fired"] and r.loc[i, "direction"] == -1
+    assert np.isclose(r.loc[i, "strength"], 0.4)
+    # a poke that CLOSES above is not a sweep
+    bars2 = flat_bars(30) + [(100.0, 100.6, 99.9, 100.5)]
+    assert not detect_sweep_high(frame(bars2))["fired"].iloc[-1]
+
+
+def test_bos_up_fires_at_break_not_pivot():
+    px = 100.0
+    bars = flat_bars(10, px)
+    bars += [(px, 102.0, px - 0.2, px + 0.5)]   # bar 10: swing high 102
+    bars += flat_bars(5, px)                    # bars 11-15 below (confirm at 13)
+    bars += [(px, 103.0, px - 0.1, 102.5)]      # bar 16: close above 102 -> BOS
+    df = frame(bars)
+    r = detect_bos_up(df)
+    assert r.loc[16, "fired"] and r.loc[16, "direction"] == 1
+    assert not r.loc[10, "fired"]  # never at the pivot
+    assert r["fired"].sum() == 1
+
+
+def test_range_break_needs_compression():
+    px = 100.0
+    bars = flat_bars(40, px)                    # tight 0.4-wide range
+    bars += [(px, 101.5, px - 0.1, 101.4)]      # close above range hi
+    df = frame(bars)
+    r = detect_range_break(df)
+    assert r["fired"].iloc[-1] and r["direction"].iloc[-1] == 1
+    # same break after a WIDE range does not fire
+    wide = [(px, px + 3.0, px - 3.0, px)] * 40 + [(px, 104.0, px - 0.1, 103.8)]
+    assert not detect_range_break(frame(wide))["fired"].iloc[-1]
+
+
+def test_fvg_fill_first_touch_only():
+    bars = flat_bars(5) + [
+        (100.0, 100.3, 99.8, 100.2),
+        (100.3, 101.5, 100.2, 101.4),
+        (101.4, 101.8, 100.9, 101.6),  # bull FVG zone [100.3, 100.9] at bar 7
+        (101.6, 101.7, 101.2, 101.5),  # no touch
+        (101.5, 101.6, 100.7, 101.0),  # bar 9: low 100.7 <= 100.9 -> fill
+        (101.0, 101.2, 100.5, 100.8),  # dips again -> must NOT fire
+    ]
+    df = frame(bars)
+    r = detect_fvg_fill_bull(df)
+    assert r.loc[9, "fired"] and r.loc[9, "direction"] == 1
+    assert r["fired"].sum() == 1
+
+
+def test_session_open_london_once_per_day():
+    n = 288 * 2  # two full days of M5
+    df = random_frame(n)
+    df["timestamp"] = pd.date_range("2025-01-06 00:00", periods=n, freq="5min")
+    r = detect_session_open_london(df)
+    fired_ts = df.loc[r["fired"], "timestamp"]
+    assert len(fired_ts) == 2
+    assert all(t.hour == 10 and t.minute == 0 for t in fired_ts)
+
+
+def test_vwap_stretch_direction_is_mean_reverting():
+    df = random_frame(200)
+    r = detect_vwap_stretch(df, {"min_stretch_atr": 0.5})
+    if r["fired"].any():
+        from src.research.strategies.base import anchored_vwap
+        vwap = anchored_vwap(df)
+        stretched = df["close"] - vwap
+        for i in r.index[r["fired"]]:
+            assert np.sign(r.loc[i, "direction"]) == -np.sign(stretched[i])
+
+
+def test_all_detectors_prefix_invariant():
+    df = random_frame(400)
+    full = run_all(df)
+    for cut in (150, 275, 399):
+        prefix = df.iloc[: cut + 1].reset_index(drop=True)
+        part = run_all(prefix)
+        for name in EVENT_REGISTRY:
+            f_row = full[name].loc[cut]
+            p_row = part[name].loc[cut]
+            assert f_row["fired"] == p_row["fired"], f"{name} lookahead at {cut}"
+            assert f_row["direction"] == p_row["direction"], name
+            assert np.isclose(f_row["strength"], p_row["strength"]), name
+
+
+def test_detectors_return_aligned_schema():
+    df = random_frame(120)
+    for name, res in run_all(df).items():
+        assert list(res.columns) == ["fired", "direction", "strength"], name
+        assert len(res) == len(df), name
+        assert res["fired"].dtype == bool, name
+        assert (res.loc[~res["fired"], "direction"] == 0).all(), name

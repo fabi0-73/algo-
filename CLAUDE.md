@@ -91,6 +91,50 @@ Uses contract size of 100 oz/lot (XAUUSD). Position size = Risk Amount / (Entry 
 
 Reports saved to `reports/backtest_{id}/` with equity curves, R-distribution, monthly P&L, cost breakdown PNGs, plus report.txt and results.json.
 
+## Data-First Research Pipeline
+
+Statistical research layer in `src/research/` for finding small, frequently-repeating edges (thousands of occurrences) before any strategy is written. Separate from the AMD engine — the engine is never used for research.
+
+### Workflow (in order; each stage gates the next)
+
+```bash
+# 1. Fetch deep history on the MT5 machine (multi-year: prefer explicit --start)
+python scripts/fetch_data.py --start 2021-01-01
+
+# 2. Export DB -> portable cache (research runs anywhere from this file)
+python scripts/export_cache.py --gzip        # data/lab_m5_cache.csv.gz
+
+# 3. Audit the cache (gaps, duplicates, OHLC sanity, coverage) — fix before proceeding
+python scripts/audit_data.py --cache data/lab_m5_cache.csv.gz
+
+# 4. Event study: standalone edge of each AMD atom (train window only)
+python scripts/event_study.py --events all
+python scripts/event_study.py --oos          # SINGLE look at OOS
+
+# 5. Conditional mining: event x context grid, TRAIN ONLY, guardrails in code
+python scripts/mine_patterns.py
+
+# 6. Promote survivors by hand to src/research/strategies/<name>.py, then the
+#    existing gauntlet: mtf_lab.py -> --oos once -> monte_carlo.py
+python scripts/mtf_lab.py --strategies <name>
+```
+
+### Key Research Modules
+
+- `src/research/events.py` — 23 vectorized per-bar event detectors (sweeps, FVGs, BOS, OB retests, Judas, session opens, PDH/PDL, VWAP stretch). Contract: `detect_<name>(df, params) -> [fired, direction, strength]` aligned to df; event knowable at bar-i close. `HORIZONS = (1,3,6,12,24,48)` is fixed upfront — never add horizons per-event.
+- `src/research/forward.py` — forward returns/MFE/MAE from `open[i+1]` in ATR units; `cost_in_atr()` is the effect-size floor (spread+commission+slippage ≈ 0.10–0.17 ATR on real gold M5).
+- `src/research/stats.py` — numpy-only: day-block bootstrap CI, time-of-day-matched permutation p (normal-tail extension beyond permutation resolution), BH-FDR, `decluster()`.
+- `src/research/context.py` — categorical conditioning features (session, dow, ATR regime, H1 trend, PD levels, VWAP side), ≤5 levels each, lookahead-safe.
+- `src/research/audit.py` — cache data-quality audit (`audit_m5`).
+- `src/research/study.py` — shared cell evaluation for the two study CLIs.
+
+### Research Discipline (enforced in code, don't relax casually)
+
+- Mining is TRAIN-ONLY (`mine_patterns.py` never loads OOS bars). OOS is one look, at promotion time.
+- Candidates must pass ALL of: BH-FDR (q=0.10) over the full grid, n ≥ 300 after horizon-declustering, mean net-R ≥ +0.05 after costs, gross excess ≥ 1.5× per-event cost, same-sign mean in both train halves.
+- Events are compared against a time-of-day-matched baseline, never the all-day mean.
+- New detectors must pass the prefix-invariance test in `tests/test_events.py` (mechanical no-lookahead check) — add planted-pattern tests for the specific geometry.
+
 ## Environment Setup
 
 Requires `.env` file (see `env.example.txt`) with MT5 credentials and PostgreSQL connection details.
@@ -99,4 +143,4 @@ Requires `.env` file (see `env.example.txt`) with MT5 credentials and PostgreSQL
 
 - Parameters interact multiplicatively — tightening multiple gates simultaneously can reduce trades to zero. When tuning, change one category at a time and check the rejection funnel stats.
 - The rejection funnel in backtest output shows where trades are filtered at each stage. Custom rejection stats (e.g., `low_consolidation_quality`, `no_judas_quality`) use `setdefault` and may not appear in the standard funnel display.
-- One pre-existing test failure: `TestDistributionFollowThrough::test_distribution_follow_through_rejection` fails because it calls `_scan_for_patterns` directly without `run()` which initializes `_atrs`.
+- Full test suite passes (one legitimate skip: `test_lab_costs.py` parity check when the champion report isn't in the checkout). `tests/test_strategy.py` needs `data/news_events.csv` — generate with `python scripts/generate_news_events.py` on a fresh clone.
