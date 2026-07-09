@@ -123,8 +123,12 @@ class Database:
         """
         if df.empty:
             return 0
-        
-        records = df.to_dict("records")
+
+        # Insert only model columns — MT5 frames carry extras (tick_volume,
+        # spread, real_volume) that the Candle model doesn't store.
+        cols = ["symbol", "timeframe", "timestamp",
+                "open", "high", "low", "close", "volume"]
+        records = df[[c for c in cols if c in df.columns]].to_dict("records")
         
         with self.get_session() as session:
             stmt = insert(Candle).values(records)
