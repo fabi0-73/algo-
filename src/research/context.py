@@ -18,28 +18,30 @@ ATR_REGIME_WINDOW = 20 * 288
 
 CONTEXT_COLUMNS = [
     "session", "dow", "atr_regime", "h1_trend", "pd_side",
-    "pdh_dist", "pdl_dist", "vwap_side", "xag_mom",
+    "pdh_dist", "pdl_dist", "vwap_side", "xag_mom", "eur_mom",
 ]
 
-# xag_mom: silver's trailing momentum as context for gold. Silver's own M5
-# edge is real but untradeable at its cost floor (see memory/PR notes) — its
-# value is as a leading context. Conservative one-bar lag: a silver bar
-# stamped s is usable from s+5min (its close), so a gold bar at t only sees
-# silver bars stamped <= t-5min even though both close simultaneously.
+# Cross-asset momentum context: a correlated asset's trailing momentum as
+# context for gold (xag = silver, eur = EURUSD). Silver's own M5 edge is real
+# but untradeable at its cost floor (see memory/PR notes) — its value is as a
+# leading context. Conservative one-bar lag: a bar stamped s is usable from
+# s+5min (its close), so a gold bar at t only sees correlated bars stamped
+# <= t-5min even though both close simultaneously.
 XAG_MOM_BARS = 12          # trailing 1h on M5
-XAG_MOM_THRESH_ATR = 0.5   # |momentum| >= 0.5 silver-ATR -> up/dn
-XAG_MOM_TOLERANCE_MIN = 30  # stale silver (gap/halt) -> na, never carried
+XAG_MOM_THRESH_ATR = 0.5   # |momentum| >= 0.5 asset-ATR -> up/dn
+XAG_MOM_TOLERANCE_MIN = 30  # stale feed (gap/halt) -> na, never carried
 
 
-def _xag_mom(ts: pd.Series, corr: pd.DataFrame = None) -> np.ndarray:
-    """Bucket {up, flat, dn, na} of silver's last-1h return in silver-ATR
-    units at each gold bar. corr=None auto-loads data/lab_xagusd_cache.csv;
-    missing/short/empty silver -> all 'na' (tests and fresh clones pass).
-    Train-isolation note: values at gold bar t read only silver bars closed
-    before t, so mining on a truncated gold frame never sees post-boundary
-    information even when the silver file spans further."""
+def _corr_mom(ts: pd.Series, corr: pd.DataFrame = None,
+              cache_name: str = "xagusd") -> np.ndarray:
+    """Bucket {up, flat, dn, na} of a correlated asset's last-1h return in
+    its own ATR units at each gold bar. corr=None auto-loads
+    data/lab_<cache_name>_cache.csv; missing/short/empty -> all 'na' (tests
+    and fresh clones pass). Train-isolation note: values at gold bar t read
+    only correlated bars closed before t, so mining on a truncated gold frame
+    never sees post-boundary information even when the file spans further."""
     if corr is None:
-        corr = load_corr("xagusd")
+        corr = load_corr(cache_name)
     if corr is None or len(corr) < XAG_MOM_BARS + 20:
         return np.full(len(ts), "na", dtype=object)
     c = prepare_frame(corr.copy(), "M5")
@@ -68,10 +70,12 @@ def _h1_ema(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def context_frame(df: pd.DataFrame, m5: pd.DataFrame,
-                  xag: pd.DataFrame = None) -> pd.DataFrame:
+                  xag: pd.DataFrame = None,
+                  eur: pd.DataFrame = None) -> pd.DataFrame:
     """Per-bar context labels for the entry frame `df` (a prepare_frame
-    output). `m5` is the raw M5 frame used to build HTF context. `xag` is
-    an optional raw silver M5 frame (tests); default auto-loads the cache."""
+    output). `m5` is the raw M5 frame used to build HTF context. `xag`/`eur`
+    are optional raw correlated M5 frames (tests); default auto-loads the
+    caches."""
     ts = df["timestamp"]
     out = pd.DataFrame(index=df.index)
 
@@ -108,5 +112,6 @@ def context_frame(df: pd.DataFrame, m5: pd.DataFrame,
     out["vwap_side"] = np.where(vwap.isna(), "na",
                                 np.where(df["close"] > vwap, "above", "below"))
 
-    out["xag_mom"] = _xag_mom(df["timestamp"], xag)
+    out["xag_mom"] = _corr_mom(df["timestamp"], xag, "xagusd")
+    out["eur_mom"] = _corr_mom(df["timestamp"], eur, "eurusd")
     return out

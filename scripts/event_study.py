@@ -48,6 +48,9 @@ def session_split(df, idx, vals):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--events", default="all")
+    ap.add_argument("--timeframe", default="M5",
+                    help="entry TF (M5/M15/M30/H1/D1); HORIZONS stay in bars "
+                         "of this TF — declare the TF upfront, never per-event")
     ap.add_argument("--cache", default=None)
     ap.add_argument("--start", default=None)
     ap.add_argument("--end", default=None)
@@ -73,7 +76,7 @@ def main():
         sys.exit(1)
 
     m5 = mtf.load_m5(args.start, args.end, cache_path=args.cache)
-    df = mtf.prepare_frame(m5, "M5")
+    df = mtf.prepare_frame(m5, args.timeframe)
     boundary = mtf.split_boundary(m5, args.split)
     costs = CostModel.from_config(spread_points=args.spread_points,
                                   commission_usd_oz=args.commission_usd_oz)
@@ -90,8 +93,8 @@ def main():
     if args.oos:
         splits.append(("oos", ~train_mask))
 
-    print(f"Event study {run_id}: {len(df)} M5 bars, boundary {boundary}, "
-          f"{len(names)} events x {len(HORIZONS)} horizons")
+    print(f"Event study {run_id}: {len(df)} {args.timeframe} bars, "
+          f"boundary {boundary}, {len(names)} events x {len(HORIZONS)} horizons")
     rows = []
     for split_name, mask in splits:
         pools = {h: baseline_pool(fwd[mask], tod_bucket(df.loc[mask, 'timestamp']), h)
