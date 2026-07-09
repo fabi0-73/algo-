@@ -395,7 +395,7 @@ def _session_open(df: pd.DataFrame, session: str) -> pd.DataFrame:
     day = df["timestamp"].dt.normalize()
     # first bar of the session each day: in-session and previous bar of the
     # same day was not yet in-session
-    prev_in = in_sess.shift(1).fillna(False) & (day == day.shift(1))
+    prev_in = in_sess.shift(1, fill_value=False) & (day == day.shift(1))
     first = in_sess & ~prev_in
     out.loc[first, "fired"] = True
     return out
@@ -495,7 +495,7 @@ def detect_pdh_break(df: pd.DataFrame, params: dict = None) -> pd.DataFrame:
     lvl = pd_stats["d_high"]
     above = (df["close"] > lvl) & lvl.notna() & df["atr"].notna()
     day = df["timestamp"].dt.normalize()
-    first = above & ~above.groupby(day).cummax().shift(1).where(day == day.shift(1), False).fillna(False)
+    first = above & ~above.groupby(day).cummax().shift(1, fill_value=False).where(day == day.shift(1), False)
     out.loc[first, "fired"] = True
     out.loc[first, "direction"] = 1
     out.loc[first, "strength"] = ((df["close"] - lvl) / df["atr"])[first]
@@ -509,7 +509,7 @@ def detect_pdl_break(df: pd.DataFrame, params: dict = None) -> pd.DataFrame:
     lvl = pd_stats["d_low"]
     below = (df["close"] < lvl) & lvl.notna() & df["atr"].notna()
     day = df["timestamp"].dt.normalize()
-    first = below & ~below.groupby(day).cummax().shift(1).where(day == day.shift(1), False).fillna(False)
+    first = below & ~below.groupby(day).cummax().shift(1, fill_value=False).where(day == day.shift(1), False)
     out.loc[first, "fired"] = True
     out.loc[first, "direction"] = -1
     out.loc[first, "strength"] = ((lvl - df["close"]) / df["atr"])[first]
