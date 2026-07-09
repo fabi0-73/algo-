@@ -7,6 +7,7 @@ logger = logging.getLogger(__name__)
 
 STRATEGY_MODULES = [
     "asian_breakout",
+    "displacement_pd",
     "ny_ib",
     "noise_area",
     "intraday_momentum",

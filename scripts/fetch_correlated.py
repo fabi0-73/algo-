@@ -73,8 +73,13 @@ for concept, sym in found.items():
     df = df[["timestamp", "open", "high", "low", "close", "volume"]].copy()
     df = df.drop_duplicates("timestamp")
     df = df[(df["timestamp"] >= pd.Timestamp(start)) & (df["timestamp"] <= end)]
-    df = df.sort_values("timestamp").reset_index(drop=True)
     path = data_dir / f"lab_{concept.lower()}_cache.csv"
+    # Merge with any existing cache: broker retention (~15mo) slides, so old
+    # bars are irreplaceable — accumulate like the DB upsert, never overwrite.
+    if path.exists():
+        old = pd.read_csv(path, parse_dates=["timestamp"])
+        df = pd.concat([old, df], ignore_index=True).drop_duplicates("timestamp")
+    df = df.sort_values("timestamp").reset_index(drop=True)
     df.to_csv(path, index=False)
     # alignment check vs gold
     merged = pd.merge(gold[["timestamp"]], df[["timestamp"]], on="timestamp", how="inner")

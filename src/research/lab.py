@@ -41,8 +41,14 @@ class CostModel:
     contract_size: float = 100.0
 
     @classmethod
-    def from_config(cls, spread_points: float = None) -> "CostModel":
-        contract = float(RISK_MODEL.get("contract_size", 100))
+    def from_config(cls, spread_points: float = None,
+                    commission_usd_oz: float = None,
+                    contract_size: float = None) -> "CostModel":
+        """Config defaults are XAUUSD; pass overrides for other symbols
+        (e.g. XAGUSD: spread_points 7 = $0.07/oz, commission $7/1000oz lot
+        = 0.007, contract_size 1000)."""
+        contract = float(contract_size if contract_size is not None
+                         else RISK_MODEL.get("contract_size", 100))
         pts = spread_points if spread_points is not None else float(
             EXECUTION.get("fixed_spread_points", 30.0))
         swap = 0.0
@@ -54,7 +60,8 @@ class CostModel:
             hh, mm = 21, 59
         return cls(
             spread_usd_oz=pts * 0.01,
-            commission_usd_oz=float(EXECUTION.get("commission_per_lot_round_turn", 7.0)) / contract,
+            commission_usd_oz=(commission_usd_oz if commission_usd_oz is not None
+                               else float(EXECUTION.get("commission_per_lot_round_turn", 7.0)) / contract),
             slippage_atr_mult=float(EXECUTION.get("slippage_atr_mult", 0.02)),
             swap_usd_oz_per_night=swap,
             rollover_hh=hh,

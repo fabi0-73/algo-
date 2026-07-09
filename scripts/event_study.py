@@ -60,6 +60,8 @@ def main():
     ap.add_argument("--oos", action="store_true",
                     help="ALSO evaluate the OOS window (single look!)")
     ap.add_argument("--spread-points", type=float, default=None)
+    ap.add_argument("--commission-usd-oz", type=float, default=None,
+                    help="override $/oz commission (XAGUSD: 0.007)")
     ap.add_argument("--out", default="reports/research")
     ap.add_argument("--no-json", action="store_true")
     args = ap.parse_args()
@@ -73,7 +75,8 @@ def main():
     m5 = mtf.load_m5(args.start, args.end, cache_path=args.cache)
     df = mtf.prepare_frame(m5, "M5")
     boundary = mtf.split_boundary(m5, args.split)
-    costs = CostModel.from_config(spread_points=args.spread_points)
+    costs = CostModel.from_config(spread_points=args.spread_points,
+                                  commission_usd_oz=args.commission_usd_oz)
     run_id = uuid.uuid4().hex[:8]
 
     fwd = forward_outcomes(df)
