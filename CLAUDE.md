@@ -98,8 +98,9 @@ Statistical research layer in `src/research/` for finding small, frequently-repe
 ### Workflow (in order; each stage gates the next)
 
 ```bash
-# 1. Fetch deep history on the MT5 machine (multi-year: prefer explicit --start)
-python scripts/fetch_data.py --start 2021-01-01
+# 1. Fetch the deepest history the broker serves (MT5 here retains only
+#    ~15-17 months of M5 — a 2021 --start would yield only what exists)
+python scripts/fetch_data.py --months 18
 
 # 2. Export DB -> portable cache (research runs anywhere from this file)
 python scripts/export_cache.py --gzip        # data/lab_m5_cache.csv.gz
