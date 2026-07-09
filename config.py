@@ -785,8 +785,15 @@ SWEEP_MODEL = {
 #   BOTH (AMD+NY_IB) run 3f3ea9d1: 256tr 60.2% WR +0.266R PF 2.06 DD 19.5%,
 #     final $2,342 vs champion 124d15ef $2,125 — MORE profit, LOWER DD, +80%
 #     trades. Passes the pre-registered accept bar (beats champion, DD<25%).
+# PAUSED 2026-07-09 pending re-validation: the regime broke Mar-Jul 2026
+#   (77-83% WR -> ~46% in the virgin window, run be08230a) and the full-arc
+#   no-controls comparison shows NY_IB SUBTRACTS by position displacement —
+#   AMD-only f754d882 (+$2,363, DD 22.5%, PF 2.00, Sharpe 3.29) beats
+#   BOTH f997b260 (+$2,036, DD 24.6%, PF 1.72) on EVERY metric; NY_IB's own
+#   141 trades netted ~+$17. Re-enable only after a fresh lab pass on recent
+#   data (scripts/mtf_lab.py --strategies ny_ib) clears the pre-registered bar.
 NY_IB_MODEL = {
-    "enabled": True,                 # engine-validated; runs beside AMD (BOTH)
+    "enabled": False,                # PAUSED 2026-07-09 — see note above
     "only": False,                   # True = suppress AMD (validation runs)
 
     "ib_start": "16:30",             # broker time (= 09:30 ET, DST-locked)
