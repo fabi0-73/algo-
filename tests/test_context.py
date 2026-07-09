@@ -77,3 +77,70 @@ def test_vwap_side_matches_sign():
     vwap = anchored_vwap(df)
     above = ctx["vwap_side"] == "above"
     assert (df.loc[above, "close"] > vwap[above]).all()
+
+
+def silver_frame(start="2025-01-06 01:00", periods=200, jump_at=None, seed=9):
+    """Synthetic silver M5: flat noise, optional +5.0 jump on the close of
+    the bar at positional index jump_at (a huge up-momentum event)."""
+    rng = np.random.default_rng(seed)
+    # noise tiny vs the wick-driven ATR (~0.1) so momentum buckets stay
+    # "flat" except for the planted jump
+    close = 30 + rng.normal(0, 0.001, periods).cumsum()
+    if jump_at is not None:
+        close[jump_at:] += 5.0
+    open_ = np.roll(close, 1)
+    open_[0] = 30.0
+    return pd.DataFrame({
+        "timestamp": pd.date_range(start, periods=periods, freq="5min"),
+        "open": open_,
+        "high": np.maximum(open_, close) + 0.05,
+        "low": np.minimum(open_, close) - 0.05,
+        "close": close,
+        "volume": 50,
+    })
+
+
+def test_xag_mom_prefix_invariant():
+    m5 = m5_frame(periods=400)
+    df = prepare_frame(m5, "M5")
+    xag = silver_frame(periods=400)
+    full = context_frame(df, m5, xag=xag)
+    cut = 300
+    m5p = m5.iloc[: cut + 1].reset_index(drop=True)
+    dfp = prepare_frame(m5p, "M5")
+    part = context_frame(dfp, m5p, xag=xag)
+    assert (full.loc[: cut, "xag_mom"] == part["xag_mom"]).all()
+
+
+def test_xag_mom_uses_only_closed_silver_bars():
+    # Silver jumps +5 on the bar stamped T. That bar closes at T+5, so the
+    # gold bar stamped T (evaluated at ITS close, also T+5) must NOT see the
+    # jump; the gold bar stamped T+5 must.
+    n = 100
+    m5 = m5_frame(periods=n + 2)
+    df = prepare_frame(m5, "M5")
+    xag = silver_frame(periods=n, jump_at=n - 1)
+    ctx = context_frame(df, m5, xag=xag)
+    t_jump = xag["timestamp"].iloc[-1]
+    at_jump = df.index[df["timestamp"] == t_jump][0]
+    after = df.index[df["timestamp"] == t_jump + pd.Timedelta(minutes=5)][0]
+    assert ctx.loc[at_jump, "xag_mom"] == "flat"  # jump bar not yet closed
+    assert ctx.loc[after, "xag_mom"] == "up"
+
+
+def test_xag_mom_missing_and_stale_silver_are_na():
+    m5 = m5_frame(periods=300)
+    df = prepare_frame(m5, "M5")
+    # empty/absent silver -> all na
+    ctx = context_frame(df, m5, xag=pd.DataFrame())
+    assert (ctx["xag_mom"] == "na").all()
+    # silver covering only the first 100 bars: gold bars beyond the staleness
+    # tolerance must be na, never carrying old momentum forward
+    xag = silver_frame(periods=100)
+    ctx2 = context_frame(df, m5, xag=xag)
+    silver_end = xag["timestamp"].iloc[-1]
+    stale = df["timestamp"] > silver_end + pd.Timedelta(minutes=35)
+    assert (ctx2.loc[stale, "xag_mom"] == "na").all()
+    live = df["timestamp"].between(
+        silver_end - pd.Timedelta(minutes=60), silver_end)
+    assert (ctx2.loc[live, "xag_mom"] != "na").any()

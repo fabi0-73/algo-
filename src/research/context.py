@@ -9,7 +9,8 @@ mtf.align_htf (completed bars only); rolling percentiles are shift(1)-ed.
 import numpy as np
 import pandas as pd
 
-from .mtf import align_htf
+from .mtf import align_htf, prepare_frame
+from .smt import load_corr
 from .strategies.base import anchored_vwap, prior_day_stats, session_mask
 
 # 20 trading days of M5 bars — window for the ATR-regime percentile.
@@ -17,8 +18,47 @@ ATR_REGIME_WINDOW = 20 * 288
 
 CONTEXT_COLUMNS = [
     "session", "dow", "atr_regime", "h1_trend", "pd_side",
-    "pdh_dist", "pdl_dist", "vwap_side",
+    "pdh_dist", "pdl_dist", "vwap_side", "xag_mom",
 ]
+
+# xag_mom: silver's trailing momentum as context for gold. Silver's own M5
+# edge is real but untradeable at its cost floor (see memory/PR notes) — its
+# value is as a leading context. Conservative one-bar lag: a silver bar
+# stamped s is usable from s+5min (its close), so a gold bar at t only sees
+# silver bars stamped <= t-5min even though both close simultaneously.
+XAG_MOM_BARS = 12          # trailing 1h on M5
+XAG_MOM_THRESH_ATR = 0.5   # |momentum| >= 0.5 silver-ATR -> up/dn
+XAG_MOM_TOLERANCE_MIN = 30  # stale silver (gap/halt) -> na, never carried
+
+
+def _xag_mom(ts: pd.Series, corr: pd.DataFrame = None) -> np.ndarray:
+    """Bucket {up, flat, dn, na} of silver's last-1h return in silver-ATR
+    units at each gold bar. corr=None auto-loads data/lab_xagusd_cache.csv;
+    missing/short/empty silver -> all 'na' (tests and fresh clones pass).
+    Train-isolation note: values at gold bar t read only silver bars closed
+    before t, so mining on a truncated gold frame never sees post-boundary
+    information even when the silver file spans further."""
+    if corr is None:
+        corr = load_corr("xagusd")
+    if corr is None or len(corr) < XAG_MOM_BARS + 20:
+        return np.full(len(ts), "na", dtype=object)
+    c = prepare_frame(corr.copy(), "M5")
+    mom = (c["close"] - c["close"].shift(XAG_MOM_BARS)) / c["atr"]
+    right = pd.DataFrame({
+        "available_at": c["timestamp"] + pd.Timedelta(minutes=5),
+        "mom": mom.to_numpy(float),
+    }).dropna().sort_values("available_at")
+    if right.empty:
+        return np.full(len(ts), "na", dtype=object)
+    merged = pd.merge_asof(
+        pd.DataFrame({"ts": ts.to_numpy()}), right,
+        left_on="ts", right_on="available_at", direction="backward",
+        tolerance=pd.Timedelta(minutes=XAG_MOM_TOLERANCE_MIN))
+    m = merged["mom"]
+    return np.where(m.isna(), "na",
+                    np.where(m >= XAG_MOM_THRESH_ATR, "up",
+                             np.where(m <= -XAG_MOM_THRESH_ATR, "dn",
+                                      "flat")))
 
 
 def _h1_ema(df: pd.DataFrame) -> pd.DataFrame:
@@ -27,9 +67,11 @@ def _h1_ema(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def context_frame(df: pd.DataFrame, m5: pd.DataFrame) -> pd.DataFrame:
+def context_frame(df: pd.DataFrame, m5: pd.DataFrame,
+                  xag: pd.DataFrame = None) -> pd.DataFrame:
     """Per-bar context labels for the entry frame `df` (a prepare_frame
-    output). `m5` is the raw M5 frame used to build HTF context."""
+    output). `m5` is the raw M5 frame used to build HTF context. `xag` is
+    an optional raw silver M5 frame (tests); default auto-loads the cache."""
     ts = df["timestamp"]
     out = pd.DataFrame(index=df.index)
 
@@ -65,4 +107,6 @@ def context_frame(df: pd.DataFrame, m5: pd.DataFrame) -> pd.DataFrame:
     vwap = anchored_vwap(df)
     out["vwap_side"] = np.where(vwap.isna(), "na",
                                 np.where(df["close"] > vwap, "above", "below"))
+
+    out["xag_mom"] = _xag_mom(df["timestamp"], xag)
     return out
