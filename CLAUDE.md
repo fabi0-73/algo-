@@ -37,6 +37,13 @@ python scripts/walk_forward.py --split 0.7 --monte-carlo
 # Live signal scanner (signal-only, no execution)
 python scripts/run_live.py
 
+# Persistent 24/7 scanner (Windows Scheduled Task; survives session/reboot)
+powershell -ExecutionPolicy Bypass -File scripts/install_live_task.ps1  # install (once)
+# then: Start-ScheduledTask AMD_Live_Scanner | Stop-ScheduledTask AMD_Live_Scanner
+# status: Get-ScheduledTask AMD_Live_Scanner | Get-ScheduledTaskInfo
+# log:    logs/live_scanner.log  (supervised loop restarts the scanner on crash;
+#         needs the user logged on — MT5 is a GUI terminal)
+
 # Database setup
 python scripts/setup_database.py
 ```
