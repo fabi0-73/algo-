@@ -662,13 +662,25 @@ ADAPTIVE_EXITS = {
 #   3) Equity-based risk scaling — smoothly de-risk the deeper the drawdown, so the
 #      equity curve is smoother and bad runs shrink position size automatically.
 # Toggle the whole system with "enabled" (or CLI --no-drawdown-controls).
+#
+# RE-TUNED 2026-07-09 to catastrophe-only after the virgin-window inversion:
+# the shipped 20% breaker + scaling turned a +$447 window (run be08230a raw)
+# into -$113 (run f3cc3fa4 shipped) by halting through the recovery, and cost
+# ~$300 over the full 23mo arc (no-controls f997b260 +$2,036 / AMD-only
+# f754d882 +$2,363 vs ~+$1,730 shipped composite) to cap a DD that unhalted
+# peaked at 24.55% and recovered to new highs. On a min-lot account the stack
+# cannot size down, so halting was its only lever — and halting amputates the
+# trailing-runner recoveries that fund the system. New shape: breaker at 30%
+# (pure tail insurance — never fired in any measured arc), scaling and
+# consec-loss brake OFF (both were on in the losing config, off in both
+# winners), monthly 6% loss limit KEPT (active in the winning runs).
 DRAWDOWN_CONTROLS = {
     "enabled": True,
 
     # 1) Account-level circuit breaker (peak->current realized-equity drawdown)
     "circuit_breaker_enabled": True,
-    "max_account_dd_pct": 0.20,      # halt new entries once DD from peak >= 20%
-    "resume_dd_pct": 0.10,           # resume once DD recovers to <= 10% (hysteresis)
+    "max_account_dd_pct": 0.30,      # catastrophe-only: above any measured arc (24.55%)
+    "resume_dd_pct": 0.15,           # resume once DD recovers to <= 15% (hysteresis)
     # Deadlock fix: with entries halted and no open position, equity can never recover,
     # so a pure DD-recovery resume would latch forever (seen in run c19e123e: 7,503
     # blocked entries). After this many bars halted, resume anyway — the risk-scaling
@@ -676,16 +688,16 @@ DRAWDOWN_CONTROLS = {
     # "manual review then resume smaller". 1440 bars = ~5 trading days on M5.
     "halt_max_bars": 1440,
 
-    # 2) Consecutive-loss brake
-    "consec_loss_enabled": True,
+    # 2) Consecutive-loss brake — OFF 2026-07-09 (on in the losing shipped
+    # config, off in both winning arcs f997b260/f754d882)
+    "consec_loss_enabled": False,
     "max_consecutive_losses": 4,     # after 4 losses in a row...
     "consec_loss_risk_factor": 0.5,  # ...trade at 50% risk until the next win
 
-    # 3) Equity-based (drawdown) risk scaling — linear from full risk to the floor
-    # NOTE: tightening these (4%/12%) was tested (run 70c1d5f1) and made DD WORSE
-    # (23.4% vs 20.2%) — on a min-lot-pinned small account, %-de-risking can't shrink
-    # positions, so tighter limits only block the recovery trades. Keep 6%/15%.
-    "risk_scaling_enabled": True,
+    # 3) Equity-based (drawdown) risk scaling — OFF 2026-07-09: impotent at the
+    # min-lot floor, proven twice (tightening test 70c1d5f1 made DD worse;
+    # full-arc f997b260 shows the whole scaling+halt stack subtracts value).
+    "risk_scaling_enabled": False,
     "risk_scale_start_dd": 0.06,     # start scaling risk down once DD > 6%
     "risk_scale_full_dd": 0.15,      # reach the floor factor at 15% DD
     "risk_scale_min_factor": 0.5,    # never size below 50% of the tier's base risk
@@ -785,8 +797,15 @@ SWEEP_MODEL = {
 #   BOTH (AMD+NY_IB) run 3f3ea9d1: 256tr 60.2% WR +0.266R PF 2.06 DD 19.5%,
 #     final $2,342 vs champion 124d15ef $2,125 — MORE profit, LOWER DD, +80%
 #     trades. Passes the pre-registered accept bar (beats champion, DD<25%).
+# PAUSED 2026-07-09 pending re-validation: the regime broke Mar-Jul 2026
+#   (77-83% WR -> ~46% in the virgin window, run be08230a) and the full-arc
+#   no-controls comparison shows NY_IB SUBTRACTS by position displacement —
+#   AMD-only f754d882 (+$2,363, DD 22.5%, PF 2.00, Sharpe 3.29) beats
+#   BOTH f997b260 (+$2,036, DD 24.6%, PF 1.72) on EVERY metric; NY_IB's own
+#   141 trades netted ~+$17. Re-enable only after a fresh lab pass on recent
+#   data (scripts/mtf_lab.py --strategies ny_ib) clears the pre-registered bar.
 NY_IB_MODEL = {
-    "enabled": True,                 # engine-validated; runs beside AMD (BOTH)
+    "enabled": False,                # PAUSED 2026-07-09 — see note above
     "only": False,                   # True = suppress AMD (validation runs)
 
     "ib_start": "16:30",             # broker time (= 09:30 ET, DST-locked)

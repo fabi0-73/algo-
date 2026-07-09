@@ -23,11 +23,21 @@ DAILY_MINUTES = 1440
 _CACHE_PATH = Path(__file__).resolve().parents[2] / "data" / "lab_m5_cache.csv"
 
 
-def load_m5(start=None, end=None, use_cache: bool = True) -> pd.DataFrame:
-    """Load the full XAUUSD M5 frame, with a local CSV cache to skip the DB."""
+def load_m5(start=None, end=None, use_cache: bool = True,
+            cache_path=None) -> pd.DataFrame:
+    """Load the full XAUUSD M5 frame, with a local CSV cache to skip the DB.
+
+    cache_path: explicit cache file (.csv or .csv.gz) — lets scripts and
+    tests point at fixtures/exports; default is data/lab_m5_cache.csv with a
+    .csv.gz fallback."""
     df = None
-    if use_cache and _CACHE_PATH.exists():
-        df = pd.read_csv(_CACHE_PATH, parse_dates=["timestamp"])
+    if cache_path is not None:
+        df = pd.read_csv(cache_path, parse_dates=["timestamp"])
+    elif use_cache:
+        for path in (_CACHE_PATH, _CACHE_PATH.with_suffix(".csv.gz")):
+            if path.exists():
+                df = pd.read_csv(path, parse_dates=["timestamp"])
+                break
     if df is None or df.empty:
         from src.data.db import Database
         db = Database()
