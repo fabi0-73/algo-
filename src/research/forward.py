@@ -52,6 +52,47 @@ def net_r(fr: pd.Series, cost_atr: pd.Series) -> pd.Series:
     return fr - cost_atr
 
 
+BRACKET_HORIZONS = (6, 12, 24)
+
+
+def bracket_outcomes_atr(
+    fwd: pd.DataFrame,
+    direction: int,
+    target_atr: float = 1.0,
+    stop_atr: float = 1.0,
+    horizons=BRACKET_HORIZONS,
+) -> dict:
+    """First-touch bracket outcome per bar, in ATR units, for a `direction`
+    trade opened at open[i+1] with a +target/-stop bracket, WORST_CASE
+    convention (repo-wide): if the stop side was touched within the horizon
+    the outcome is -stop regardless of the target (interbar ordering is not
+    knowable from MFE/MAE, so assume stop first); else +target if the target
+    side was touched; else the horizon close. Values are already
+    direction-signed (positive = the hypothesis made money). NaN tails kept.
+
+    This is the hit-rate measurement the mean-drift study structurally
+    cannot see: an edge can have modest mean drift but touch +1 ATR before
+    -1 ATR far more often than baseline. Horizons 1/3 are excluded (too few
+    bars to reach 1 ATR); 48 is redundant with 24 at these bracket sizes."""
+    out = {}
+    for h in horizons:
+        fr = fwd[f"fr_{h}"].to_numpy(float)
+        mfe = fwd[f"mfe_{h}"].to_numpy(float)
+        mae = fwd[f"mae_{h}"].to_numpy(float)
+        if direction >= 0:
+            hit_stop = mae <= -stop_atr
+            hit_tgt = mfe >= target_atr
+            timeout = fr
+        else:
+            hit_stop = mfe >= stop_atr
+            hit_tgt = mae <= -target_atr
+            timeout = -fr
+        vals = np.where(hit_stop, -stop_atr,
+                        np.where(hit_tgt, target_atr, timeout))
+        out[h] = np.where(np.isnan(fr), np.nan, vals)
+    return out
+
+
 def tod_bucket(ts: pd.Series, bucket_minutes: int = 120) -> pd.Series:
     """Time-of-day bucket id (broker time) — the stratification key for
     baselines and permutation nulls. 120-min buckets -> 12 per day."""
@@ -64,12 +105,13 @@ def day_ids(ts: pd.Series) -> pd.Series:
     return ts.dt.normalize().astype("int64")
 
 
-def baseline_pool(fwd: pd.DataFrame, buckets: pd.Series, horizon: int) -> dict:
+def baseline_pool(fwd: pd.DataFrame, buckets, horizon: int) -> dict:
     """Unconditional forward returns (all bars) with their TOD buckets —
-    the pool the permutation null draws from. NaN tails dropped."""
+    the pool the permutation null draws from. NaN tails dropped.
+    `buckets` may be a Series or a positional ndarray of equal length."""
     fr = fwd[f"fr_{horizon}"]
-    ok = fr.notna()
+    ok = fr.notna().to_numpy()
     return {
-        "values": fr[ok].to_numpy(float),
-        "buckets": buckets[ok].to_numpy(),
+        "values": fr.to_numpy(float)[ok],
+        "buckets": np.asarray(buckets)[ok],
     }

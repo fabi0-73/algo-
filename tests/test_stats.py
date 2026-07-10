@@ -3,8 +3,10 @@ calibration, and a hand-worked BH-FDR example."""
 import numpy as np
 
 from src.research.stats import (
-    bh_fdr, block_bootstrap_ci, decluster, perm_pvalue_excess, summarize_edge,
+    bh_fdr, block_bootstrap_ci, decluster, expected_null_mean,
+    perm_pvalue_excess, summarize_edge,
 )
+from src.research.study import evaluate_cell
 
 
 def test_decluster_spacing():
@@ -114,3 +116,78 @@ def test_summarize_edge_empty_and_nan():
                         np.array([0, 0, 0]), np.random.default_rng(0).normal(0, 1, 500),
                         np.zeros(500, int), n_boot=100, n_perm=100)
     assert r2["n"] == 2  # NaN dropped
+
+
+def test_expected_null_mean_matches_permutation():
+    rng = np.random.default_rng(11)
+    pool = np.concatenate([rng.normal(0, 0.3, 2000), rng.normal(1, 0.3, 2000)])
+    pool_buckets = np.concatenate([np.zeros(2000, int), np.ones(2000, int)])
+    event_buckets = np.array([0] * 50 + [1] * 150)
+    det = expected_null_mean(event_buckets, pool, pool_buckets)
+    perm = perm_pvalue_excess(np.zeros(200), event_buckets, pool, pool_buckets,
+                              n_perm=2000, seed=2)
+    # perm null_mean converges to the deterministic composition-weighted mean
+    assert abs(det - perm["null_mean"]) < 0.02
+    assert abs(det - (0.25 * 0.0 + 0.75 * 1.0)) < 0.05
+
+
+def test_summarize_edge_win_rate_leg():
+    # Pool is a fair +1/-1 coin per bucket; events win 80% -> WR excess ~0.3.
+    rng = np.random.default_rng(13)
+    pool = rng.choice([-1.0, 1.0], size=4000)
+    pool_buckets = np.tile(np.arange(4), 1000)
+    events = rng.choice([-1.0, 1.0], size=300, p=[0.2, 0.8])
+    buckets = np.tile(np.arange(4), 75)
+    days = np.repeat(np.arange(30), 10)
+    r = summarize_edge(events, days, buckets, pool, pool_buckets,
+                       n_boot=200, n_perm=500, seed=3)
+    assert 0.72 <= r["win_rate"] <= 0.88
+    assert 0.2 < r["wr_excess"] < 0.4
+    assert r["wr_p_value"] < 0.01
+
+
+def test_bh_fdr_p1_padding_equivalent_to_true_p():
+    # Fast-rejected cells enter FDR with p=1.0; survivors' adjusted p and
+    # rejection must be identical to a full run where those cells had their
+    # true (large) p-values.
+    full = bh_fdr(np.array([0.001, 0.40, 0.60]), q=0.10)
+    padded = bh_fdr(np.array([0.001, 1.0, 1.0]), q=0.10)
+    assert full["n_tests"] == padded["n_tests"] == 3
+    assert np.isclose(full["p_adj"][0], padded["p_adj"][0])
+    assert full["reject"].tolist() == padded["reject"].tolist()
+
+
+def _cell_fixture(edge: float, seed: int = 17):
+    rng = np.random.default_rng(seed)
+    n = 6000
+    fr = rng.normal(0, 1, n)
+    idx = np.arange(100, 5800, 20)  # spacing 20 > any horizon: no declustering
+    fr[idx] += edge
+    cost = np.full(n, 0.15)
+    days = np.repeat(np.arange(n // 100), 100)
+    buckets = np.tile(np.arange(12), n // 12 + 1)[:n]
+    ok = np.ones(n, dtype=bool)
+    pool_v, pool_b = fr[ok], buckets[ok]
+    return idx, fr, cost, days, buckets, pool_v, pool_b
+
+
+def test_evaluate_cell_fast_reject_hopeless_cell():
+    idx, fr, cost, days, buckets, pv, pb = _cell_fixture(edge=0.0)
+    r = evaluate_cell(idx, 1, 6, fr, cost, days, buckets, pv, pb,
+                      min_n=100, n_boot=100, n_perm=100, seed=0,
+                      effect_floor=(0.05, 1.5))
+    assert r["fast_reject"] is True
+    assert r["p_value"] == 1.0
+    assert "net_r_mean" in r and "excess" in r and "cost_mean" in r
+
+
+def test_evaluate_cell_planted_edge_survives_fast_path():
+    idx, fr, cost, days, buckets, pv, pb = _cell_fixture(edge=1.0)
+    r = evaluate_cell(idx, 1, 6, fr, cost, days, buckets, pv, pb,
+                      min_n=100, n_boot=100, n_perm=200, seed=0,
+                      effect_floor=(0.05, 1.5))
+    assert r["fast_reject"] is False
+    assert r["p_value"] < 0.05
+    assert r["net_r_mean"] > 0.5
+    assert r["net_r_mean_c20"] < r["net_r_mean_c15"] < r["net_r_mean"]
+    assert 0.0 <= r["win_rate"] <= 1.0
