@@ -132,6 +132,7 @@ def validate_distribution_strength(
     distribution: DistributionResult,
     min_follow_through_candles: int = 2,
     require_extension: bool = None,
+    current_idx: int = None,
 ) -> bool:
     """
     Validate that distribution has follow-through (not just a spike).
@@ -153,6 +154,11 @@ def validate_distribution_strength(
 
     start_idx = distribution.break_candle_idx + 1
     end_idx = min(start_idx + min_follow_through_candles, len(df))
+    if current_idx is not None:
+        # Decision at current_idx may only see completed bars <= current_idx;
+        # live frames end at the decision bar, so this reproduces live exactly
+        # (including the assume-valid branch below when no bars are observed).
+        end_idx = min(end_idx, current_idx + 1)
 
     if end_idx <= start_idx:
         return True  # Not enough data to validate, assume valid

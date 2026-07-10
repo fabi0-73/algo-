@@ -59,3 +59,7 @@ Thumbs.db
 # Data files (user should manage their own data)
 data/*.csv
 !data/*.example.csv
+
+# Live scanner artifacts (session-local)
+*.jsonl
+data/monitor_state.json

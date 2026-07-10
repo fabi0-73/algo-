@@ -75,7 +75,7 @@ Each filter engine follows a consistent interface: takes DataFrame + config + cu
 
 ### Confluence Scoring
 
-Trades require `min_confluence_score` (default 2) from these factors: BOS confirmed (+1), FVG at retest (+1), Order Block at retest (+1), equal level swept (+1), volume spike (+1), breaker block (+1), Judas quality ≥2 (+1). FVG/OB are always searched regardless of entry mode to feed this score.
+Trades require `min_confluence_score` (default 3) from these factors: BOS confirmed (+1), FVG at retest (+1), Order Block at retest (+1), equal level swept (+1), volume spike (+1), breaker block (+1), Judas quality ≥2 (+1). FVG/OB are always searched regardless of entry mode to feed this score.
 
 ### Execution Model
 
@@ -83,7 +83,7 @@ Realistic cost modeling: spread (fixed or column-based), slippage (ATR-multiplie
 
 ### Risk & Position Sizing
 
-Uses contract size of 100 oz/lot (XAUUSD). Position size = Risk Amount / (Entry - SL) / Contract Size. Default risk: 0.5% per trade. Stops placed at manipulation extreme + buffer (1.0 ATR), minimum 1.5 ATR distance. Breakeven stop activates at 1R, trailing stop at 1.5R with 2.0 ATR trail.
+Uses contract size of 100 oz/lot (XAUUSD). Position size = Risk Amount / (Entry - SL) / Contract Size. Default risk: 0.3% per trade (confidence tiers up-size; on small accounts the 0.01 min-lot floor dominates and `risk_amount_usd` reports the FLOORED dollar risk). Stops placed at manipulation extreme + buffer (1.0 ATR), minimum 1.5 ATR distance. Breakeven stop activates at 1R (cushion `be_buffer_atr_mult`), trailing stop at 2.0R with 2.5 ATR trail. Stop moves computed from a bar take effect on the NEXT bar (causality contract, tests/test_causality.py).
 
 ### Quality Gates (in order within `_scan_for_patterns`)
 
@@ -92,7 +92,7 @@ Uses contract size of 100 oz/lot (XAUUSD). Position size = Risk Amount / (Entry 
 3. Liquidity sweep / volume spike — can be required or used as confluence bonus
 4. Distribution follow-through — requires 3 candles making new extremes beyond break price
 5. BOS required — break of structure must confirm direction
-6. Stale retest filter — max 15 bars after distribution
+6. Stale retest filter — max 40 bars after distribution (`max_bars_after_distribution`)
 
 ### Backtest Output
 
@@ -129,7 +129,7 @@ python scripts/mtf_lab.py --strategies <name>
 
 ### Key Research Modules
 
-- `src/research/events.py` — 23 vectorized per-bar event detectors (sweeps, FVGs, BOS, OB retests, Judas, session opens, PDH/PDL, VWAP stretch). Contract: `detect_<name>(df, params) -> [fired, direction, strength]` aligned to df; event knowable at bar-i close. `HORIZONS = (1,3,6,12,24,48)` is fixed upfront — never add horizons per-event.
+- `src/research/events.py` — 37 vectorized per-bar event detectors (sweeps, FVGs, BOS, OB retests, Judas, session opens, PDH/PDL, VWAP stretch; 2026-07-10 batch: ORB break/pullback, sweep-reclaim, failed-break fade, wick rejection, round-number rejects, vol dry-up, inside-NR7, settlement gaps, PM-fix window, news-reopen, H1 sweeps). Contract: `detect_<name>(df, params) -> [fired, direction, strength]` aligned to df; event knowable at bar-i close. `HORIZONS = (1,3,6,12,24,48)` is fixed upfront — never add horizons per-event. Pure time-of-day atoms are nulled by construction in the TOD-matched excess; their informative stat is the CI-vs-zero.
 - `src/research/forward.py` — forward returns/MFE/MAE from `open[i+1]` in ATR units; `cost_in_atr()` is the effect-size floor (spread+commission+slippage ≈ 0.10–0.17 ATR on real gold M5).
 - `src/research/stats.py` — numpy-only: day-block bootstrap CI, time-of-day-matched permutation p (normal-tail extension beyond permutation resolution), BH-FDR, `decluster()`.
 - `src/research/context.py` — categorical conditioning features (session, dow, ATR regime, H1 trend, PD levels, VWAP side), ≤5 levels each, lookahead-safe.

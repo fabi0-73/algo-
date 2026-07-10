@@ -534,6 +534,497 @@ def detect_vwap_stretch(df: pd.DataFrame, params: dict = None) -> pd.DataFrame:
     return out
 
 
+# ---------------------------------------------------------------- opening range
+
+# NY or_minutes=60 matches the validated NY_IB initial balance (16:30-17:30);
+# London 30min is the classic ORB window after the 10:00 broker open.
+ORB_LDN_DEFAULTS = {"session": "london", "or_minutes": 30}
+ORB_NY_DEFAULTS = {"session": "ny", "or_minutes": 60}
+
+
+def _orb_levels(df: pd.DataFrame, session: str, or_minutes: int):
+    """Frozen opening-range high/low per day: extremes of the first
+    `or_minutes` of the session, NaN until that window has fully closed —
+    causal by construction (only same-day past bars enter the cummax)."""
+    start, _ = SESSIONS[session]
+    sh, sm = (int(x) for x in start.split(":"))
+    start_min = sh * 60 + sm
+    mod = df["timestamp"].dt.hour * 60 + df["timestamp"].dt.minute
+    day = df["timestamp"].dt.normalize()
+    in_or = (mod >= start_min) & (mod < start_min + or_minutes)
+    after = mod >= start_min + or_minutes
+    or_hi = df["high"].where(in_or).groupby(day).cummax().groupby(day).ffill().where(after)
+    or_lo = df["low"].where(in_or).groupby(day).cummin().groupby(day).ffill().where(after)
+    return or_hi, or_lo, day
+
+
+def _orb_break(df: pd.DataFrame, p: dict) -> pd.DataFrame:
+    out = _frame(len(df))
+    or_hi, or_lo, day = _orb_levels(df, p["session"], p["or_minutes"])
+    atr = df["atr"]
+    same_day = day == day.shift(1)
+    up = (df["close"] > or_hi) & or_hi.notna() & atr.notna()
+    dn = (df["close"] < or_lo) & or_lo.notna() & atr.notna()
+    first_up = up & ~up.groupby(day).cummax().shift(1, fill_value=False).where(same_day, False)
+    first_dn = dn & ~dn.groupby(day).cummax().shift(1, fill_value=False).where(same_day, False)
+    first_dn &= ~first_up
+    out.loc[first_up, "fired"] = True
+    out.loc[first_up, "direction"] = 1
+    out.loc[first_up, "strength"] = ((df["close"] - or_hi) / atr)[first_up]
+    out.loc[first_dn, "fired"] = True
+    out.loc[first_dn, "direction"] = -1
+    out.loc[first_dn, "strength"] = ((or_lo - df["close"]) / atr)[first_dn]
+    return out
+
+
+def detect_orb_break_london(df: pd.DataFrame, params: dict = None) -> pd.DataFrame:
+    """First close beyond the London opening range (per side, per day):
+    breakout-continuation hypothesis. Miner-ready atomization of the ORB
+    family (the only lab KEEPER, ny_ib, is this family's pullback variant)."""
+    return _orb_break(df, _merged(ORB_LDN_DEFAULTS, params))
+
+
+def detect_orb_break_ny(df: pd.DataFrame, params: dict = None) -> pd.DataFrame:
+    """First close beyond the NY initial balance (16:30-17:30 broker)."""
+    return _orb_break(df, _merged(ORB_NY_DEFAULTS, params))
+
+
+ORB_PB_LDN_DEFAULTS = {"session": "london", "or_minutes": 30,
+                       "tol_atr": 0.15, "max_age_bars": 24}
+ORB_PB_NY_DEFAULTS = {"session": "ny", "or_minutes": 60,
+                      "tol_atr": 0.15, "max_age_bars": 24}
+
+
+def _orb_pullback(df: pd.DataFrame, p: dict) -> pd.DataFrame:
+    """After an ORB break, the first bar that trades back to the broken edge
+    (within tol_atr) and CLOSES in the break direction -> continuation. The
+    retrace-to-broken-level geometry that separated the KEEPER (ny_ib) from
+    the killed enter-at-the-break atoms. Causal O(n) state loop."""
+    out = _frame(len(df))
+    breaks = _orb_break(df, p)
+    or_hi, or_lo, _ = _orb_levels(df, p["session"], p["or_minutes"])
+    bf = breaks["fired"].to_numpy()
+    bd = breaks["direction"].to_numpy()
+    hi_arr = or_hi.to_numpy(float)
+    lo_arr = or_lo.to_numpy(float)
+    high = df["high"].to_numpy(float)
+    low = df["low"].to_numpy(float)
+    close = df["close"].to_numpy(float)
+    atr = df["atr"].to_numpy(float)
+    n = len(df)
+    fired = np.zeros(n, dtype=bool)
+    direction = np.zeros(n, dtype=np.int8)
+    strength = np.zeros(n)
+    level, d, born = None, 0, -1
+    for i in range(n):
+        if level is not None and i - born > p["max_age_bars"]:
+            level = None
+        if level is not None and i > born and atr[i] > 0:
+            tol = p["tol_atr"] * atr[i]
+            if d > 0 and low[i] <= level + tol and close[i] > level:
+                fired[i] = True
+                direction[i] = 1
+                strength[i] = (close[i] - level) / atr[i]
+                level = None
+            elif d < 0 and high[i] >= level - tol and close[i] < level:
+                fired[i] = True
+                direction[i] = -1
+                strength[i] = (level - close[i]) / atr[i]
+                level = None
+        if bf[i]:
+            d = int(bd[i])
+            level = hi_arr[i] if d > 0 else lo_arr[i]
+            born = i
+    out["fired"] = fired
+    out["direction"] = direction
+    out["strength"] = strength
+    return out
+
+
+def detect_orb_pullback_london(df: pd.DataFrame, params: dict = None) -> pd.DataFrame:
+    """Retrace to the broken London OR edge, close in break direction."""
+    return _orb_pullback(df, _merged(ORB_PB_LDN_DEFAULTS, params))
+
+
+def detect_orb_pullback_ny(df: pd.DataFrame, params: dict = None) -> pd.DataFrame:
+    """Retrace to the broken NY IB edge, close in break direction."""
+    return _orb_pullback(df, _merged(ORB_PB_NY_DEFAULTS, params))
+
+
+# ---------------------------------------------------------------- confirmation / fade atoms
+
+SWEEP_RECLAIM_DEFAULTS = {"lookback": 24, "min_poke_atr": 0.05, "confirm_bars": 6}
+
+
+def detect_sweep_reclaim(df: pd.DataFrame, params: dict = None) -> pd.DataFrame:
+    """Sweep -> CONFIRMED reclaim: after a sweep_low at bar s, the first close
+    above high[s] within confirm_bars -> long (mirror for sweep_high). Fires
+    on the confirmation bar, never the poke — the manipulation->distribution
+    handoff the AMD engine trades, as one atom. Distinct population from raw
+    sweeps (only the confirmed subset, bars later)."""
+    p = _merged(SWEEP_RECLAIM_DEFAULTS, params)
+    lo = detect_sweep_low(df, p)["fired"].to_numpy()
+    hi = detect_sweep_high(df, p)["fired"].to_numpy()
+    high = df["high"].to_numpy(float)
+    low = df["low"].to_numpy(float)
+    close = df["close"].to_numpy(float)
+    atr = df["atr"].to_numpy(float)
+    n = len(df)
+    out = _frame(n)
+    fired = np.zeros(n, dtype=bool)
+    direction = np.zeros(n, dtype=np.int8)
+    strength = np.zeros(n)
+    d, trig, born = 0, None, -1
+    for i in range(n):
+        if trig is not None and i - born > p["confirm_bars"]:
+            trig = None
+        if trig is not None and i > born and atr[i] > 0:
+            if d > 0 and close[i] > trig:
+                fired[i] = True
+                direction[i] = 1
+                strength[i] = (close[i] - trig) / atr[i]
+                trig = None
+            elif d < 0 and close[i] < trig:
+                fired[i] = True
+                direction[i] = -1
+                strength[i] = (trig - close[i]) / atr[i]
+                trig = None
+        # newest sweep wins (poke bar itself can never confirm)
+        if lo[i]:
+            d, trig, born = 1, high[i], i
+        elif hi[i]:
+            d, trig, born = -1, low[i], i
+    out["fired"] = fired
+    out["direction"] = direction
+    out["strength"] = strength
+    return out
+
+
+FAILED_BREAK_DEFAULTS = {"window": 36, "max_width_atr": 3.0, "confirm_bars": 6}
+
+
+def detect_failed_break(df: pd.DataFrame, params: dict = None) -> pd.DataFrame:
+    """Failed compressed-range breakout: a range_break whose price CLOSES back
+    inside the old range within confirm_bars -> fade in the reversal
+    direction (trapped breakout traders). The complement population of the
+    killed break-continuation atoms."""
+    p = _merged(FAILED_BREAK_DEFAULTS, params)
+    breaks = detect_range_break(df, p)
+    hi = df["high"].rolling(p["window"]).max().shift(1).to_numpy(float)
+    lo = df["low"].rolling(p["window"]).min().shift(1).to_numpy(float)
+    bf = breaks["fired"].to_numpy()
+    bd = breaks["direction"].to_numpy()
+    close = df["close"].to_numpy(float)
+    atr = df["atr"].to_numpy(float)
+    n = len(df)
+    out = _frame(n)
+    fired = np.zeros(n, dtype=bool)
+    direction = np.zeros(n, dtype=np.int8)
+    strength = np.zeros(n)
+    d, edge, born = 0, None, -1
+    for i in range(n):
+        if edge is not None and i - born > p["confirm_bars"]:
+            edge = None
+        if edge is not None and i > born and atr[i] > 0:
+            if d > 0 and close[i] < edge:
+                fired[i] = True
+                direction[i] = -1
+                strength[i] = (edge - close[i]) / atr[i]
+                edge = None
+            elif d < 0 and close[i] > edge:
+                fired[i] = True
+                direction[i] = 1
+                strength[i] = (close[i] - edge) / atr[i]
+                edge = None
+        if bf[i]:
+            d = int(bd[i])
+            edge = hi[i] if d > 0 else lo[i]  # the broken range edge
+            born = i
+    out["fired"] = fired
+    out["direction"] = direction
+    out["strength"] = strength
+    return out
+
+
+WICK_REJECT_DEFAULTS = {"min_wick_atr": 0.75, "max_body_frac": 0.35}
+
+
+def detect_wick_rejection(df: pd.DataFrame, params: dict = None) -> pd.DataFrame:
+    """Pin bar: small body, one dominant wick, close in the opposite third of
+    the range -> away-from-the-wick hypothesis. The INVERSE shape of
+    displacement (small body / long wick vs big body), and unanchored — it
+    can fire in open air where no sweep/level atom sees anything."""
+    p = _merged(WICK_REJECT_DEFAULTS, params)
+    out = _frame(len(df))
+    o = df["open"]
+    c = df["close"]
+    rng = (df["high"] - df["low"]).replace(0, np.nan)
+    body = (c - o).abs()
+    upper = df["high"] - np.maximum(o, c)
+    lower = np.minimum(o, c) - df["low"]
+    small_body = body <= p["max_body_frac"] * rng
+    valid = df["atr"].notna() & rng.notna()
+    lo_rej = small_body & valid & (lower / df["atr"] >= p["min_wick_atr"]) \
+        & (c >= df["high"] - rng / 3)
+    hi_rej = small_body & valid & (upper / df["atr"] >= p["min_wick_atr"]) \
+        & (c <= df["low"] + rng / 3) & ~lo_rej
+    lo_rej = lo_rej.fillna(False)
+    hi_rej = hi_rej.fillna(False)
+    out.loc[lo_rej, "fired"] = True
+    out.loc[lo_rej, "direction"] = 1
+    out.loc[lo_rej, "strength"] = (lower / df["atr"])[lo_rej]
+    out.loc[hi_rej, "fired"] = True
+    out.loc[hi_rej, "direction"] = -1
+    out.loc[hi_rej, "strength"] = (upper / df["atr"])[hi_rej]
+    return out
+
+
+ROUND_LEVEL_DEFAULTS = {"grid_usd": 10.0, "min_poke_atr": 0.02}
+
+
+def detect_round_level_reject(df: pd.DataFrame, params: dict = None) -> pd.DataFrame:
+    """Poke-and-reject at static round-number levels (every grid_usd): open
+    below the next $10 handle, high pokes it, close back below -> short
+    (mirror for support). Psychological-barrier literature (Aggarwal &
+    Lucey); static grid = no lookahead possible. Distinct from pdh/pdl and
+    VWAP: those are dynamic levels, this one never moves."""
+    p = _merged(ROUND_LEVEL_DEFAULTS, params)
+    out = _frame(len(df))
+    g = p["grid_usd"]
+    o = df["open"].to_numpy(float)
+    up_lvl = np.ceil(o / g) * g
+    dn_lvl = np.floor(o / g) * g
+    atr = df["atr"].to_numpy(float)
+    high = df["high"].to_numpy(float)
+    low = df["low"].to_numpy(float)
+    close = df["close"].to_numpy(float)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        poke_up = (high - up_lvl) / atr
+        poke_dn = (dn_lvl - low) / atr
+    valid = ~np.isnan(atr) & (atr > 0)
+    short = valid & (o < up_lvl) & (poke_up >= p["min_poke_atr"]) & (close < up_lvl)
+    long_ = valid & (o > dn_lvl) & (poke_dn >= p["min_poke_atr"]) & (close > dn_lvl) & ~short
+    out.loc[short, "fired"] = True
+    out.loc[short, "direction"] = -1
+    out.loc[short, "strength"] = poke_up[short]
+    out.loc[long_, "fired"] = True
+    out.loc[long_, "direction"] = 1
+    out.loc[long_, "strength"] = poke_dn[long_]
+    return out
+
+
+# ---------------------------------------------------------------- compression / gaps / time
+
+VOL_DRYUP_DEFAULTS = {"window": 48, "max_frac": 0.4}
+
+
+def detect_vol_dryup(df: pd.DataFrame, params: dict = None) -> pd.DataFrame:
+    """Participation dry-up: tick volume <= max_frac x rolling median — the
+    opposite tail of vol_spike (climax) and the classic precursor of
+    expansion. No directional prior; strength = median/volume multiple."""
+    p = _merged(VOL_DRYUP_DEFAULTS, params)
+    out = _frame(len(df))
+    med = df["volume"].rolling(p["window"]).median().shift(1)
+    vol = df["volume"].replace(0, np.nan)
+    frac = vol / med.replace(0, np.nan)
+    fired = (frac <= p["max_frac"]) & med.notna() & df["atr"].notna()
+    fired = fired.fillna(False)
+    out.loc[fired, "fired"] = True
+    out.loc[fired, "strength"] = (1.0 / frac)[fired]
+    return out
+
+
+NR_DEFAULTS = {"nr_window": 7}
+
+
+def detect_inside_nr7(df: pd.DataFrame, params: dict = None) -> pd.DataFrame:
+    """Inside bar that is also the narrowest range of the last nr_window bars
+    (Crabel NR7 + inside day): anticipatory compression atom, fires BEFORE
+    any breakout (range_break fires after). No directional prior; strength =
+    prior median range / current range (compression ratio)."""
+    p = _merged(NR_DEFAULTS, params)
+    out = _frame(len(df))
+    rng = (df["high"] - df["low"]).replace(0, np.nan)
+    inside = (df["high"] < df["high"].shift(1)) & (df["low"] > df["low"].shift(1))
+    narrowest = rng <= rng.rolling(p["nr_window"]).min()
+    med_prior = rng.shift(1).rolling(p["nr_window"] - 1).median()
+    fired = inside & narrowest & med_prior.notna() & rng.notna() & df["atr"].notna()
+    fired = fired.fillna(False)
+    out.loc[fired, "fired"] = True
+    out.loc[fired, "strength"] = (med_prior / rng)[fired]
+    return out
+
+
+GAP_DEFAULTS = {"min_gap_atr": 0.5}
+
+
+def detect_settlement_gap(df: pd.DataFrame, params: dict = None) -> pd.DataFrame:
+    """Open gap on the first bar of a new trading day (weekend/settlement):
+    fade hypothesis (gap-fill), direction = against the gap. Strength =
+    |gap|/ATR. Uses the gap taxonomy the data audit already validates."""
+    p = _merged(GAP_DEFAULTS, params)
+    out = _frame(len(df))
+    day = df["timestamp"].dt.normalize()
+    new_day = (day != day.shift(1)) & df["close"].shift(1).notna()
+    gap = (df["open"] - df["close"].shift(1)) / df["atr"]
+    fired = new_day & (gap.abs() >= p["min_gap_atr"]) & df["atr"].notna()
+    fired = fired.fillna(False)
+    out.loc[fired, "fired"] = True
+    out.loc[fired, "direction"] = (-np.sign(gap[fired])).astype(np.int8)
+    out.loc[fired, "strength"] = gap.abs()[fired]
+    return out
+
+
+PM_FIX_DEFAULTS = {"start": "16:30", "end": "17:00"}
+
+
+def detect_pm_fix_window(df: pd.DataFrame, params: dict = None) -> pd.DataFrame:
+    """London PM gold fix approach window (15:00 London = 17:00 broker):
+    documented systematic decline into the fix (Speck's 1-min study; LBMA
+    debate) -> short during the pre-fix window. NOTE: pure time-of-day drift
+    is nulled BY CONSTRUCTION in the TOD-matched excess (deliberate
+    anti-seasonality discipline) — the informative statistics for this atom
+    are the CI-vs-zero columns in the event study. Strength = VWAP stretch
+    at the bar, so terciles carry a non-time dimension (stretched-above-VWAP
+    into the fix is the strongest form of the hypothesis)."""
+    p = _merged(PM_FIX_DEFAULTS, params)
+    out = _frame(len(df))
+    in_win = session_mask(df["timestamp"], p["start"], p["end"])
+    vwap = anchored_vwap(df)
+    stretch = ((df["close"] - vwap) / df["atr"]).clip(lower=0.0)
+    fired = in_win & df["atr"].notna() & vwap.notna()
+    fired = fired.fillna(False)
+    out.loc[fired, "fired"] = True
+    out.loc[fired, "direction"] = -1
+    out.loc[fired, "strength"] = stretch[fired].fillna(0.0)
+    return out
+
+
+NEWS_REOPEN_DEFAULTS = {"csv_path": "data/news_events.csv",
+                        "pre_minutes": 30, "post_minutes": 30}
+
+
+def detect_news_reopen(df: pd.DataFrame, params: dict = None) -> pd.DataFrame:
+    """First bar after a scheduled-news blackout window ends: direction =
+    sign of the move ACROSS the blackout (post-news continuation, the
+    post-announcement-drift literature). The calendar is scheduled macro
+    releases (static file, broker frame — dates knowable in advance, so no
+    lookahead); missing file -> no fires. Strength = |blackout move|/ATR."""
+    p = _merged(NEWS_REOPEN_DEFAULTS, params)
+    out = _frame(len(df))
+    from pathlib import Path
+    path = Path(p["csv_path"])
+    if not path.exists() or len(df) == 0:
+        return out
+    try:
+        cal = pd.read_csv(path)
+        ev_ts = pd.to_datetime(cal["timestamp"]).sort_values().to_numpy()
+    except Exception:
+        return out
+    ts = df["timestamp"].to_numpy()
+    close = df["close"].to_numpy(float)
+    atr = df["atr"].to_numpy(float)
+    pre = np.timedelta64(p["pre_minutes"], "m")
+    post = np.timedelta64(p["post_minutes"], "m")
+    for t in ev_ts:
+        anchor = np.searchsorted(ts, t - pre) - 1   # last bar before blackout
+        reopen = np.searchsorted(ts, t + post)      # first bar at/after end
+        if anchor < 0 or reopen >= len(df) or reopen <= anchor:
+            continue
+        if not (np.isfinite(atr[reopen]) and atr[reopen] > 0):
+            continue
+        move = close[reopen] - close[anchor]
+        if move == 0:
+            continue
+        out.iloc[reopen, 0] = True                  # fired
+        out.iloc[reopen, 1] = np.int8(1 if move > 0 else -1)
+        out.iloc[reopen, 2] = abs(move) / atr[reopen]
+    return out
+
+
+H1_SWEEP_DEFAULTS = {"swing_strength": 2, "min_poke_atr": 0.05,
+                     "max_swing_age_h1": 48}
+
+
+def detect_h1_sweep(df: pd.DataFrame, params: dict = None) -> pd.DataFrame:
+    """Sweep-and-reject of a CONFIRMED H1 swing level, detected on M5: low
+    pokes below the last confirmed H1 swing low, close back above -> long
+    (mirror above H1 swing highs). Higher-timeframe structure is a different
+    liquidity population from any M5 atom. Causality: an H1 swing at bucket
+    j (fractal of swing_strength) is usable only from the m5 bar whose
+    timestamp >= the END of bucket j+swing_strength — completed H1 data
+    only, so prefix-invariance holds mechanically. One fire per swing."""
+    p = _merged(H1_SWEEP_DEFAULTS, params)
+    out = _frame(len(df))
+    n = len(df)
+    if n == 0:
+        return out
+    k = int(p["swing_strength"])
+    h1 = (df.set_index("timestamp")
+            .resample("1h", label="right", closed="left")
+            .agg({"high": "max", "low": "min"})
+            .dropna())
+    if len(h1) < 2 * k + 1:
+        return out
+    h1_high = h1["high"].to_numpy(float)
+    h1_low = h1["low"].to_numpy(float)
+    h1_end = h1.index.to_numpy()  # label=right == bucket END time
+    # confirmed swings: (usable_from_time, level); usable when the k-th
+    # neighbor bucket has CLOSED
+    swings_hi, swings_lo = [], []
+    for j in range(k, len(h1) - k):
+        seg_h = h1_high[j - k: j + k + 1]
+        if h1_high[j] == seg_h.max() and (h1_high[j] > seg_h[:k]).all() \
+                and (h1_high[j] > seg_h[k + 1:]).all():
+            swings_hi.append((h1_end[j + k], h1_high[j]))
+        seg_l = h1_low[j - k: j + k + 1]
+        if h1_low[j] == seg_l.min() and (h1_low[j] < seg_l[:k]).all() \
+                and (h1_low[j] < seg_l[k + 1:]).all():
+            swings_lo.append((h1_end[j + k], h1_low[j]))
+    ts = df["timestamp"].to_numpy()
+    high = df["high"].to_numpy(float)
+    low = df["low"].to_numpy(float)
+    close = df["close"].to_numpy(float)
+    atr = df["atr"].to_numpy(float)
+    fired = np.zeros(n, dtype=bool)
+    direction = np.zeros(n, dtype=np.int8)
+    strength = np.zeros(n)
+    max_age = np.timedelta64(int(p["max_swing_age_h1"]), "h")
+    pi = pj = 0
+    cur_hi = cur_lo = None  # (usable_from, level)
+    for i in range(n):
+        while pi < len(swings_hi) and swings_hi[pi][0] <= ts[i]:
+            cur_hi = swings_hi[pi]
+            pi += 1
+        while pj < len(swings_lo) and swings_lo[pj][0] <= ts[i]:
+            cur_lo = swings_lo[pj]
+            pj += 1
+        if cur_hi is not None and ts[i] - cur_hi[0] > max_age:
+            cur_hi = None
+        if cur_lo is not None and ts[i] - cur_lo[0] > max_age:
+            cur_lo = None
+        if atr[i] <= 0 or not np.isfinite(atr[i]):
+            continue
+        if cur_lo is not None:
+            poke = (cur_lo[1] - low[i]) / atr[i]
+            if poke >= p["min_poke_atr"] and close[i] > cur_lo[1]:
+                fired[i] = True
+                direction[i] = 1
+                strength[i] = poke
+                cur_lo = None
+        if not fired[i] and cur_hi is not None:
+            poke = (high[i] - cur_hi[1]) / atr[i]
+            if poke >= p["min_poke_atr"] and close[i] < cur_hi[1]:
+                fired[i] = True
+                direction[i] = -1
+                strength[i] = poke
+                cur_hi = None
+    out["fired"] = fired
+    out["direction"] = direction
+    out["strength"] = strength
+    return out
+
+
 # ---------------------------------------------------------------- registry
 
 EVENT_REGISTRY = {
@@ -560,6 +1051,22 @@ EVENT_REGISTRY = {
     "pdh_break": (detect_pdh_break, PD_LEVEL_DEFAULTS),
     "pdl_break": (detect_pdl_break, PD_LEVEL_DEFAULTS),
     "vwap_stretch": (detect_vwap_stretch, VWAP_STRETCH_DEFAULTS),
+    # 2026-07-10 expansion: retrace/confirmation white space + documented
+    # anomaly families (see mining discipline in CLAUDE.md — same gauntlet)
+    "orb_break_london": (detect_orb_break_london, ORB_LDN_DEFAULTS),
+    "orb_break_ny": (detect_orb_break_ny, ORB_NY_DEFAULTS),
+    "orb_pullback_london": (detect_orb_pullback_london, ORB_PB_LDN_DEFAULTS),
+    "orb_pullback_ny": (detect_orb_pullback_ny, ORB_PB_NY_DEFAULTS),
+    "sweep_reclaim": (detect_sweep_reclaim, SWEEP_RECLAIM_DEFAULTS),
+    "failed_break": (detect_failed_break, FAILED_BREAK_DEFAULTS),
+    "wick_rejection": (detect_wick_rejection, WICK_REJECT_DEFAULTS),
+    "round_level_reject": (detect_round_level_reject, ROUND_LEVEL_DEFAULTS),
+    "vol_dryup": (detect_vol_dryup, VOL_DRYUP_DEFAULTS),
+    "inside_nr7": (detect_inside_nr7, NR_DEFAULTS),
+    "settlement_gap": (detect_settlement_gap, GAP_DEFAULTS),
+    "pm_fix_window": (detect_pm_fix_window, PM_FIX_DEFAULTS),
+    "news_reopen": (detect_news_reopen, NEWS_REOPEN_DEFAULTS),
+    "h1_sweep": (detect_h1_sweep, H1_SWEEP_DEFAULTS),
 }
 
 

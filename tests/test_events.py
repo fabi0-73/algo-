@@ -160,3 +160,177 @@ def test_detectors_return_aligned_schema():
         assert len(res) == len(df), name
         assert res["fired"].dtype == bool, name
         assert (res.loc[~res["fired"], "direction"] == 0).all(), name
+
+
+# ------------------------------------------------- 2026-07-10 detector batch
+
+from src.research.events import (  # noqa: E402
+    detect_failed_break, detect_h1_sweep, detect_inside_nr7,
+    detect_news_reopen, detect_orb_break_london, detect_orb_pullback_london,
+    detect_pm_fix_window, detect_round_level_reject, detect_settlement_gap,
+    detect_sweep_reclaim, detect_vol_dryup, detect_wick_rejection,
+)
+
+
+def day_frame(start="2025-01-06 09:00", n=72, px=100.0):
+    """Contiguous flat M5 day starting at `start` (broker time)."""
+    return frame(flat_bars(n, px), start=start)
+
+
+def test_orb_break_london_fires_after_window_closes():
+    # 09:00 start -> London OR window = 10:00-10:25 (6 bars, or_minutes=30)
+    df = day_frame()
+    i_break = 18  # the 10:30 bar
+    df.loc[i_break, ["open", "high", "low", "close"]] = [100.0, 101.2, 99.9, 101.0]
+    r = detect_orb_break_london(df)
+    assert r.loc[i_break, "fired"] and r.loc[i_break, "direction"] == 1
+    assert np.isclose(r.loc[i_break, "strength"], 0.8)  # 101.0 - OR hi 100.2
+    assert r["fired"].sum() == 1
+    # a close above OR-hi DURING the forming window must not fire
+    df2 = day_frame()
+    df2.loc[13, ["open", "high", "low", "close"]] = [100.0, 101.2, 99.9, 101.0]
+    assert not detect_orb_break_london(df2).loc[13, "fired"]
+
+
+def test_orb_pullback_london_retest_of_broken_edge():
+    df = day_frame()
+    df.loc[18, ["open", "high", "low", "close"]] = [100.0, 101.2, 99.9, 101.0]
+    df.loc[20, ["open", "high", "low", "close"]] = [100.9, 100.9, 100.3, 100.6]
+    r = detect_orb_pullback_london(df)
+    assert r.loc[20, "fired"] and r.loc[20, "direction"] == 1
+    assert np.isclose(r.loc[20, "strength"], 0.4)  # close 100.6 - edge 100.2
+    assert r["fired"].sum() == 1
+
+
+def test_sweep_reclaim_fires_on_confirmation_not_poke():
+    bars = flat_bars(30)                          # prior min 99.8
+    bars += [(100.0, 100.0, 99.4, 99.9)]          # bar 30: sweep low, high 100.0
+    bars += [(99.9, 100.1, 99.8, 100.0)]          # bar 31: not above 100.0 yet
+    bars += [(100.0, 100.6, 99.9, 100.5)]         # bar 32: close 100.5 > 100.0
+    df = frame(bars)
+    r = detect_sweep_reclaim(df)
+    assert not r.loc[30, "fired"]                 # never at the poke
+    assert r.loc[32, "fired"] and r.loc[32, "direction"] == 1
+    assert np.isclose(r.loc[32, "strength"], 0.5)
+    assert r["fired"].sum() == 1
+    # a reclaim AFTER the confirm window must not fire
+    bars2 = flat_bars(30) + [(100.0, 100.0, 99.4, 99.9)] + flat_bars(7, 99.9) \
+        + [(99.9, 100.7, 99.8, 100.6)]
+    assert not detect_sweep_reclaim(frame(bars2))["fired"].iloc[-1]
+
+
+def test_failed_break_fades_reentry():
+    px = 100.0
+    bars = flat_bars(40, px)                       # compressed range, hi 100.2
+    bars += [(px, 101.5, px - 0.1, 101.4)]         # bar 40: range break up
+    bars += [(101.4, 101.5, 101.0, 101.2)]         # still outside
+    bars += [(101.2, 101.3, 99.7, 99.9)]           # bar 42: close back inside
+    df = frame(bars)
+    r = detect_failed_break(df)
+    assert r.loc[42, "fired"] and r.loc[42, "direction"] == -1
+    assert np.isclose(r.loc[42, "strength"], 0.3)  # edge 100.2 - close 99.9
+    assert r["fired"].sum() == 1
+
+
+def test_wick_rejection_pin_bar():
+    bars = flat_bars(5)
+    bars += [(100.0, 100.15, 98.8, 100.1)]  # lower wick 1.2, body 0.1
+    bars += flat_bars(2)
+    df = frame(bars)
+    r = detect_wick_rejection(df)
+    assert r.loc[5, "fired"] and r.loc[5, "direction"] == 1
+    assert np.isclose(r.loc[5, "strength"], 1.2)
+    # a big-body bar must not fire
+    bars2 = flat_bars(5) + [(100.0, 101.6, 99.9, 101.5)] + flat_bars(2)
+    assert not detect_wick_rejection(frame(bars2)).loc[5, "fired"]
+
+
+def test_round_level_reject_static_grid():
+    bars = flat_bars(3, 99.0)
+    bars += [(99.5, 100.3, 99.4, 99.8)]    # poke $100 from below, reject
+    bars += [(100.5, 100.6, 99.8, 100.4)]  # poke $100 from above, reject
+    df = frame(bars)
+    r = detect_round_level_reject(df)
+    assert r.loc[3, "fired"] and r.loc[3, "direction"] == -1
+    assert np.isclose(r.loc[3, "strength"], 0.3)
+    assert r.loc[4, "fired"] and r.loc[4, "direction"] == 1
+    assert np.isclose(r.loc[4, "strength"], 0.2)
+
+
+def test_vol_dryup_fires_on_low_participation():
+    df = frame(flat_bars(60))
+    df["volume"] = 100
+    df.loc[55, "volume"] = 20
+    r = detect_vol_dryup(df)
+    assert r.loc[55, "fired"] and r.loc[55, "direction"] == 0
+    assert np.isclose(r.loc[55, "strength"], 5.0)
+    assert not r.loc[54, "fired"]
+
+
+def test_inside_nr7_compression():
+    bars = [(100.0, 100.5, 99.5, 100.0)] * 8          # range 1.0
+    bars += [(100.0, 100.1, 99.95, 100.05)]           # inside + narrowest
+    df = frame(bars)
+    r = detect_inside_nr7(df)
+    assert r.loc[8, "fired"] and r.loc[8, "direction"] == 0
+    assert r.loc[8, "strength"] > 5  # median 1.0 / range 0.15
+    assert r["fired"].sum() == 1
+
+
+def test_settlement_gap_fades_the_gap():
+    ts = list(pd.date_range("2025-01-06 22:00", periods=12, freq="5min"))
+    ts += list(pd.date_range("2025-01-07 02:00", periods=12, freq="5min"))
+    df = pd.DataFrame({
+        "timestamp": ts,
+        "open": 100.0, "high": 100.2, "low": 99.8, "close": 100.0,
+        "volume": 100, "atr": 1.0,
+    })
+    df.loc[12, ["open", "high", "low", "close"]] = [101.0, 101.2, 100.8, 101.1]
+    r = detect_settlement_gap(df)
+    assert r.loc[12, "fired"] and r.loc[12, "direction"] == -1  # fade the up-gap
+    assert np.isclose(r.loc[12, "strength"], 1.0)
+    assert r["fired"].sum() == 1
+
+
+def test_pm_fix_window_prefix_window_only():
+    df = frame(flat_bars(36), start="2025-01-06 15:00")  # 15:00-17:55
+    r = detect_pm_fix_window(df)
+    fired_ts = df.loc[r["fired"], "timestamp"]
+    assert len(fired_ts) == 6  # 16:30..16:55
+    assert all((t.hour == 16 and t.minute >= 30) for t in fired_ts)
+    assert (r.loc[r["fired"], "direction"] == -1).all()
+
+
+def test_news_reopen_continuation_direction(tmp_path):
+    cal = tmp_path / "news.csv"
+    cal.write_text("timestamp,currency,impact,title\n"
+                   "2025-01-06 12:00:00,USD,HIGH,CPI\n")
+    df = frame(flat_bars(60), start="2025-01-06 09:00")  # through 13:55
+    anchor = df.index[df["timestamp"] == "2025-01-06 11:25:00"][0]
+    reopen = df.index[df["timestamp"] == "2025-01-06 12:30:00"][0]
+    df.loc[anchor, "close"] = 100.0
+    df.loc[reopen, "close"] = 100.8
+    r = detect_news_reopen(df, {"csv_path": str(cal)})
+    assert r.loc[reopen, "fired"] and r.loc[reopen, "direction"] == 1
+    assert np.isclose(r.loc[reopen, "strength"], 0.8)
+    assert r["fired"].sum() == 1
+
+
+def test_h1_sweep_uses_confirmed_swings_only():
+    df = frame(flat_bars(72), start="2025-01-06 09:00")  # 09:00-14:55
+    # H1 swing low 99.0 in bucket [11:00,12:00) -> usable from 14:00
+    j = df.index[df["timestamp"] == "2025-01-06 11:20:00"][0]
+    df.loc[j, "low"] = 99.0
+    i = df.index[df["timestamp"] == "2025-01-06 14:10:00"][0]
+    df.loc[i, ["open", "high", "low", "close"]] = [99.6, 99.7, 98.9, 99.4]
+    r = detect_h1_sweep(df)
+    assert r.loc[i, "fired"] and r.loc[i, "direction"] == 1
+    assert np.isclose(r.loc[i, "strength"], 0.1)
+    assert r["fired"].sum() == 1
+    # the same poke BEFORE the swing is confirmed must not fire
+    df2 = frame(flat_bars(72), start="2025-01-06 09:00")
+    j2 = df2.index[df2["timestamp"] == "2025-01-06 11:20:00"][0]
+    df2.loc[j2, "low"] = 99.0
+    i2 = df2.index[df2["timestamp"] == "2025-01-06 13:30:00"][0]
+    df2.loc[i2, ["open", "high", "low", "close"]] = [99.6, 99.7, 98.9, 99.4]
+    assert not detect_h1_sweep(df2)["fired"].any()

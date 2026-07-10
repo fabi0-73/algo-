@@ -40,6 +40,14 @@ SIGNAL_DEFAULTS = {
     "max_bars": 100000,      # timeout exit at close
     "eod_hhmm": 0,           # broker-time force-flat, e.g. 2330 (0 = none)
     "tag": 0,                # sub-setup diagnostics
+    # trade-management shapes (all optional; engine-parity semantics)
+    "partial_at_r": 0.0,     # book partial_pct at this R (0 = never); the
+                             # remainder's stop moves to entry NEXT bar
+    "partial_pct": 0.5,      # fraction closed at the partial
+    "time_stop_bars": 0,     # after N bars, exit at close if r < time_stop_min_r
+    "time_stop_min_r": 0.0,
+    "trail_mode": "atr",     # "atr" (trail_atr_mult) | "step" (whole-R ladder:
+                             # at m full R of MFE, stop locks to (m-1) R)
 }
 
 REQUIRED_COLS = ["signal_idx", "direction", "entry_type", "sl"]

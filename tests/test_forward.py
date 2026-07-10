@@ -85,3 +85,36 @@ def test_baseline_pool_drops_nan():
     assert len(pool["values"]) == 2
     assert len(pool["buckets"]) == 2
     assert not np.isnan(pool["values"]).any()
+
+
+def test_bracket_outcomes_worst_case_truth_table():
+    from src.research.forward import bracket_outcomes_atr
+
+    fwd = pd.DataFrame({
+        # long win | long loss | both touched | timeout | NaN tail
+        "fr_6":  [0.3, 0.3, 0.3, 0.3, np.nan],
+        "mfe_6": [1.5, 0.4, 1.5, 0.6, 1.5],
+        "mae_6": [-0.5, -1.2, -1.2, -0.6, -0.5],
+    })
+    out = bracket_outcomes_atr(fwd, direction=1, horizons=(6,))[6]
+    assert out[0] == 1.0           # target touched, stop never
+    assert out[1] == -1.0          # stop touched
+    assert out[2] == -1.0          # BOTH touched -> WORST_CASE loss
+    assert np.isclose(out[3], 0.3)  # neither -> horizon close
+    assert np.isnan(out[4])
+
+
+def test_bracket_outcomes_short_mirrored():
+    from src.research.forward import bracket_outcomes_atr
+
+    fwd = pd.DataFrame({
+        # short win (fell 1.4) | short loss (rose 1.3) | both -> loss | timeout
+        "fr_6":  [-0.4, 0.2, -0.4, -0.2],
+        "mfe_6": [0.4, 1.3, 1.3, 0.6],
+        "mae_6": [-1.4, -0.3, -1.4, -0.6],
+    })
+    out = bracket_outcomes_atr(fwd, direction=-1, horizons=(6,))[6]
+    assert out[0] == 1.0
+    assert out[1] == -1.0
+    assert out[2] == -1.0
+    assert np.isclose(out[3], 0.2)  # timeout: -fr (short profits when fr<0)

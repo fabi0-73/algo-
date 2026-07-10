@@ -32,7 +32,7 @@ from src.research.study import directional_indices, evaluate_cell
 
 HDR = (f"{'event':<20} {'dir':>3} {'h':>3} {'split':<5} {'n':>5} "
        f"{'mean':>7} {'excess':>7} {'ci_lo':>7} {'ci_hi':>7} "
-       f"{'p':>7} {'p_adj':>7} {'netR':>7} {'fdr':>4}")
+       f"{'p':>7} {'p_adj':>7} {'netR':>7} {'WR':>5} {'wrX':>6} {'fdr':>4}")
 
 
 def session_split(df, idx, vals):
@@ -97,7 +97,7 @@ def main():
           f"boundary {boundary}, {len(names)} events x {len(HORIZONS)} horizons")
     rows = []
     for split_name, mask in splits:
-        pools = {h: baseline_pool(fwd[mask], tod_bucket(df.loc[mask, 'timestamp']), h)
+        pools = {h: baseline_pool(fwd[mask], buckets[mask], h)
                  for h in HORIZONS}
         for name in names:
             by_dir = directional_indices(events[name], mask)
@@ -137,7 +137,9 @@ def main():
                   f"{r['split']:<5} {r['n']:>5} {r['mean']:>7.3f} "
                   f"{r['excess']:>7.3f} {r['ci_lo']:>7.3f} {r['ci_hi']:>7.3f} "
                   f"{r['p_value']:>7.4f} {r['p_adj']:>7.4f} "
-                  f"{r['net_r_mean']:>7.3f} {'PASS' if r['fdr_pass'] else '':>4}")
+                  f"{r['net_r_mean']:>7.3f} {r.get('win_rate', float('nan')):>5.2f} "
+                  f"{r.get('wr_excess', float('nan')):>6.3f} "
+                  f"{'PASS' if r['fdr_pass'] else '':>4}")
 
     if not args.no_json:
         out_dir = Path(args.out) / f"events_{run_id}"

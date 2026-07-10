@@ -878,7 +878,8 @@ class BacktestEngine:
                 return
 
         # Scan backwards for consolidation zones (step by 2 for speed)
-        for consol_end_offset in range(min_offset, max_offset, 2):
+        for consol_end_offset in range(min_offset, max_offset,
+                                       STRATEGY.get("consolidation_scan_step", 2)):
             consol_end_idx = current_idx - consol_end_offset
             consol_start_idx = consol_end_idx - lookback
 
@@ -962,7 +963,8 @@ class BacktestEngine:
                 self.rejection_stats["no_distribution"] += 1
                 continue
             follow_through_candles = STRATEGY.get("distribution_follow_through_candles", 2)
-            if not validate_distribution_strength(df, dist, min_follow_through_candles=follow_through_candles):
+            if not validate_distribution_strength(df, dist, min_follow_through_candles=follow_through_candles,
+                                                  current_idx=current_idx):
                 self.rejection_stats["no_distribution_follow_through"] += 1
                 continue
 
@@ -1001,6 +1003,7 @@ class BacktestEngine:
                     df, manip.return_candle_idx, expected_bos_dir,
                     search_window=20, swing_lookback=STRATEGY.get("bos_swing_lookback", 5),
                     highs_arr=self._highs, lows_arr=self._lows, closes_arr=self._closes,
+                    current_idx=current_idx,
                 )
 
                 if STRATEGY.get("bos_required", False) and (bos is None or not bos.valid):
@@ -1562,45 +1565,6 @@ class BacktestEngine:
                 f"{self._nyib_hi:.2f}, SL {sl:.2f}, TP {tp:.2f})"
             )
 
-    def _is_consolidation(self, window: pd.DataFrame, atr: float) -> bool:
-        """Check if window forms a valid consolidation."""
-        range_high = window['high'].max()
-        range_low = window['low'].min()
-        range_size = range_high - range_low
-
-        # Range must be tight
-        max_range = STRATEGY["consolidation_range_atr_mult"] * atr
-        if range_size > max_range:
-            return False
-
-        # Check closes inside range
-        closes = window['close']
-        closes_inside = ((closes >= range_low) & (closes <= range_high)).sum()
-        close_pct = closes_inside / len(window)
-
-        if close_pct < STRATEGY["consolidation_close_pct"]:
-            return False
-
-        return True
-
-    def _is_consolidation_arrays(self, high_arr: np.ndarray, low_arr: np.ndarray, close_arr: np.ndarray, atr: float) -> bool:
-        """Check consolidation using numpy arrays (faster hot path)."""
-        range_high = np.max(high_arr)
-        range_low = np.min(low_arr)
-        range_size = range_high - range_low
-
-        max_range = STRATEGY["consolidation_range_atr_mult"] * atr
-        if range_size > max_range:
-            return False
-
-        closes_inside = np.sum((close_arr >= range_low) & (close_arr <= range_high))
-        close_pct = closes_inside / len(close_arr)
-
-        if close_pct < STRATEGY["consolidation_close_pct"]:
-            return False
-
-        return True
-
     def _check_manipulation_after(
         self,
         df: pd.DataFrame,
@@ -1782,74 +1746,6 @@ class BacktestEngine:
 
         return DistributionResult(valid=False)
 
-    def _check_entry_now(
-        self,
-        df: pd.DataFrame,
-        consol: ConsolidationResult,
-        manip: ManipulationResult,
-        dist: DistributionResult,
-        current_idx: int,
-    ) -> EntrySignal:
-        """Check if current bar provides valid entry."""
-
-        candle = df.iloc[current_idx]
-        atr = dist.atr
-        tolerance = STRATEGY["retest_tolerance_atr_mult"] * atr
-        wick_ratio = STRATEGY["rejection_wick_ratio"]
-
-        if dist.direction == "UP":
-            # Long setup - retest of range_high from above
-            retest_level = consol.range_high
-            direction = "LONG"
-
-            # Check if low retests the level
-            if candle["low"] <= retest_level + tolerance and candle["low"] >= retest_level - tolerance:
-                # Check for rejection (bullish)
-                body = abs(candle["close"] - candle["open"])
-                lower_wick = min(candle["open"], candle["close"]) - candle["low"]
-
-                if body == 0 or lower_wick >= body * wick_ratio:
-                    return EntrySignal(
-                        valid=True,
-                        direction=direction,
-                        entry_price=candle["close"],
-                        entry_candle_idx=current_idx,
-                        entry_timestamp=candle.get("timestamp"),
-                        rejection_confirmed=True,
-                        retest_level=retest_level,
-                        consolidation_high=consol.range_high,
-                        consolidation_low=consol.range_low,
-                        manipulation_extreme=manip.extreme_price,
-                        manipulation_direction=manip.direction,
-                    )
-        else:
-            # Short setup - retest of range_low from below
-            retest_level = consol.range_low
-            direction = "SHORT"
-
-            # Check if high retests the level
-            if candle["high"] >= retest_level - tolerance and candle["high"] <= retest_level + tolerance:
-                # Check for rejection (bearish)
-                body = abs(candle["close"] - candle["open"])
-                upper_wick = candle["high"] - max(candle["open"], candle["close"])
-
-                if body == 0 or upper_wick >= body * wick_ratio:
-                    return EntrySignal(
-                        valid=True,
-                        direction=direction,
-                        entry_price=candle["close"],
-                        entry_candle_idx=current_idx,
-                        entry_timestamp=candle.get("timestamp"),
-                        rejection_confirmed=True,
-                        retest_level=retest_level,
-                        consolidation_high=consol.range_high,
-                        consolidation_low=consol.range_low,
-                        manipulation_extreme=manip.extreme_price,
-                        manipulation_direction=manip.direction,
-                    )
-
-        return EntrySignal(valid=False)
-
     def _check_entry_now_with_confluence(
         self,
         df: pd.DataFrame,
@@ -2028,7 +1924,43 @@ class BacktestEngine:
                 self._exit_position(candle["close"], "EOD_FLAT", candle, verbose)
                 return
 
-        # Update best/worst price tracking (for trailing stop and MFE/MAE)
+        # --- Exit check FIRST, against stops as they stood at bar start ---
+        # Causality: BE/trail moves computed from THIS bar's extremes take
+        # effect on the NEXT bar (lab convention, live knowability) — a stop
+        # raised by this bar's high must not stop out on this bar's low.
+        use_adaptive = ADAPTIVE_EXITS.get("enabled", False) and trade.exit_tier
+        be_buffer_mult = trade.tier_be_buffer_atr_mult if use_adaptive \
+            else STRATEGY.get("be_buffer_atr_mult", 0.1)
+
+        # Check if partial TP is enabled (via RISK_MODEL, adaptive tier, or per-trade HYBRID style)
+        tier_partial = (use_adaptive and self._get_tier_config(trade.exit_tier, "partial_tp_enabled", False))
+        hybrid_style = getattr(trade, "exit_style", "") == "HYBRID"
+        bracket_style = getattr(trade, "exit_style", "") == "BRACKET"
+        if (RISK_MODEL.get("partial_tp_enabled", False) or tier_partial or hybrid_style) and not bracket_style:
+            if hybrid_style:
+                partial_at_r = SWEEP_MODEL.get("hybrid_partial_at_r", 1.0)
+                partial_pct = SWEEP_MODEL.get("hybrid_partial_pct", 0.5)
+            else:
+                partial_at_r = self._get_tier_config(trade.exit_tier, "partial_tp_at_r") if tier_partial else None
+                partial_pct = self._get_tier_config(trade.exit_tier, "partial_close_pct") if tier_partial else None
+            exit_decision = self.execution.check_exit_with_partial(
+                trade=trade,
+                candle=candle,
+                atr=atr,
+                partial_at_r=partial_at_r,
+                partial_pct=partial_pct,
+                be_buffer_atr=be_buffer_mult if (tier_partial or hybrid_style) else None,
+            )
+        else:
+            exit_decision = self.execution.check_exit(
+                trade=trade,
+                candle=candle,
+                atr=atr,
+            )
+
+        # Update best/worst price tracking (for trailing stop and MFE/MAE).
+        # Runs after the exit decision (stops must not see this bar's extremes)
+        # but before recording it, so excursions include the exit bar.
         if trade.direction == "LONG":
             trade.best_price_in_favor = max(
                 getattr(trade, "best_price_in_favor", trade.entry_price),
@@ -2048,11 +1980,19 @@ class BacktestEngine:
                 candle["high"],
             )
 
+        # Handle partial close
+        if exit_decision.is_partial:
+            self._handle_partial_close(exit_decision, candle, verbose)
+            return
+
+        if exit_decision.should_exit:
+            self._exit_position(exit_decision.exit_price, exit_decision.exit_reason, candle, verbose)
+            return
+
+        # --- No exit this bar: stage BE/trail/TP-disable for the NEXT bars ---
         # Move SL to breakeven at configured R level (before trailing stop)
         # Use per-trade tier params when adaptive exits are active
-        use_adaptive = ADAPTIVE_EXITS.get("enabled", False) and trade.exit_tier
         be_trigger_r = trade.tier_be_trigger_r if use_adaptive else STRATEGY.get("move_sl_to_be_at_r", 0)
-        be_buffer_mult = trade.tier_be_buffer_atr_mult if use_adaptive else 0.1
         # BRACKET style = pure fixed bracket: no BE move, no trailing, no partial
         if getattr(trade, "exit_style", "") == "BRACKET":
             be_trigger_r = 0
@@ -2128,42 +2068,6 @@ class BacktestEngine:
                 trade.tp_price = float('inf')
             else:
                 trade.tp_price = 0.0
-
-        # Use execution engine for exit decision (with partial TP support)
-        # Check if partial TP is enabled (via RISK_MODEL, adaptive tier, or per-trade HYBRID style)
-        tier_partial = (use_adaptive and self._get_tier_config(trade.exit_tier, "partial_tp_enabled", False))
-        hybrid_style = getattr(trade, "exit_style", "") == "HYBRID"
-        bracket_style = getattr(trade, "exit_style", "") == "BRACKET"
-        if (RISK_MODEL.get("partial_tp_enabled", False) or tier_partial or hybrid_style) and not bracket_style:
-            if hybrid_style:
-                partial_at_r = SWEEP_MODEL.get("hybrid_partial_at_r", 1.0)
-                partial_pct = SWEEP_MODEL.get("hybrid_partial_pct", 0.5)
-            else:
-                partial_at_r = self._get_tier_config(trade.exit_tier, "partial_tp_at_r") if tier_partial else None
-                partial_pct = self._get_tier_config(trade.exit_tier, "partial_close_pct") if tier_partial else None
-            exit_decision = self.execution.check_exit_with_partial(
-                trade=trade,
-                candle=candle,
-                atr=atr,
-                partial_at_r=partial_at_r,
-                partial_pct=partial_pct,
-                be_buffer_atr=be_buffer_mult if (tier_partial or hybrid_style) else None,
-            )
-        else:
-            exit_decision = self.execution.check_exit(
-                trade=trade,
-                candle=candle,
-                atr=atr,
-            )
-
-        # Handle partial close
-        if exit_decision.is_partial:
-            self._handle_partial_close(exit_decision, candle, verbose)
-            return
-
-        if exit_decision.should_exit:
-            self._exit_position(exit_decision.exit_price, exit_decision.exit_reason, candle, verbose)
-            return
 
     def _handle_partial_close(self, exit_decision: ExitDecision, candle: pd.Series, verbose: bool):
         """Handle partial TP close and SL move to breakeven."""
@@ -2666,7 +2570,13 @@ class BacktestEngine:
             l = float(self._lows[idx])
             atr = float(self._atrs[idx])
 
-            # Update best price in favor
+            # Causality: exits are checked against the stop/TP as they stood
+            # at bar start; BE/trail staged from this bar apply from the next
+            # bar (same contract as _check_exit and the research lab).
+            sl_at_bar_start = current_sl
+            tp_disabled_at_bar_start = disable_tp_trailing and trailing_active
+
+            # Update best price in favor (stages BE/trail for the NEXT bar)
             if direction == "LONG":
                 best_price = max(best_price, h)
             else:
@@ -2679,7 +2589,7 @@ class BacktestEngine:
                 else:
                     current_r = (entry_price - best_price) / stop_distance_ref
                 if current_r >= be_trigger_r:
-                    be_buffer = atr * 0.1
+                    be_buffer = atr * STRATEGY.get("be_buffer_atr_mult", 0.1)
                     if direction == "LONG":
                         new_be = entry_price + be_buffer
                         if new_be > current_sl:
@@ -2705,22 +2615,22 @@ class BacktestEngine:
                 if is_trailing:
                     trailing_active = True
 
-            # Effective TP (disable when trailing)
+            # Effective TP (disable when trailing was active at bar start)
             check_tp = tp_price
-            if disable_tp_trailing and trailing_active:
+            if tp_disabled_at_bar_start:
                 check_tp = float('inf') if direction == "LONG" else 0.0
 
-            # Check SL/TP hit
+            # Check SL/TP hit against start-of-bar stop
             if direction == "LONG":
-                sl_hit = l <= current_sl
+                sl_hit = l <= sl_at_bar_start
                 tp_hit = h >= check_tp
             else:
-                sl_hit = h >= current_sl
+                sl_hit = h >= sl_at_bar_start
                 tp_hit = l <= check_tp
 
             if sl_hit or tp_hit:
                 exit_at_sl = sl_hit if not (sl_hit and tp_hit) else True  # WORST_CASE
-                exit_price = current_sl if exit_at_sl else check_tp
+                exit_price = sl_at_bar_start if exit_at_sl else check_tp
                 exit_reason = "SL" if exit_at_sl else "TP"
 
                 r_multiple = calculate_exit_r_multiple(

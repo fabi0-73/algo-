@@ -139,6 +139,28 @@ def bh_fdr(pvals: np.ndarray, q: float = 0.10) -> dict:
     return {"reject": reject, "p_adj": adj, "n_tests": m}
 
 
+def expected_null_mean(
+    event_buckets: np.ndarray,
+    pool_values: np.ndarray,
+    pool_buckets: np.ndarray,
+) -> float:
+    """Deterministic TOD-matched null mean: per-bucket pool means weighted by
+    the event bucket composition. This is the exact value the permutation
+    null means converge to — cheap enough to gate on before resampling."""
+    event_buckets = np.asarray(event_buckets)
+    pool_values = np.asarray(pool_values, dtype=float)
+    pool_buckets = np.asarray(pool_buckets)
+    if event_buckets.size == 0:
+        return np.nan
+    total = 0.0
+    for b in np.unique(event_buckets):
+        pool_b = pool_values[pool_buckets == b]
+        if pool_b.size == 0:
+            pool_b = pool_values
+        total += pool_b.mean() * (event_buckets == b).sum()
+    return float(total / event_buckets.size)
+
+
 def summarize_edge(
     event_values: np.ndarray,
     event_day_ids: np.ndarray,
@@ -149,9 +171,11 @@ def summarize_edge(
     n_perm: int = 2000,
     seed: int = 42,
 ) -> dict:
-    """One cell of the edge table: sample size, location, day-block CI, and
-    TOD-matched permutation excess/p. Values are forward returns in ATR
-    units (or net R) for one (event x direction x horizon)."""
+    """One cell of the edge table: sample size, location, day-block CI,
+    TOD-matched permutation excess/p — and the same excess/p machinery on
+    the WIN RATE (P(value>0) vs the TOD-matched baseline hit rate), since a
+    high-WR edge can exist with an unremarkable mean. Values are forward
+    returns in ATR units (or net R) for one (event x direction x horizon)."""
     event_values = np.asarray(event_values, dtype=float)
     ok = ~np.isnan(event_values)
     event_values = event_values[ok]
@@ -161,12 +185,21 @@ def summarize_edge(
     out = {"n": int(event_values.size)}
     if event_values.size == 0:
         out.update({"mean": np.nan, "median": np.nan, "ci_lo": np.nan,
-                    "ci_hi": np.nan, "excess": np.nan, "p_value": np.nan})
+                    "ci_hi": np.nan, "excess": np.nan, "p_value": np.nan,
+                    "win_rate": np.nan, "wr_excess": np.nan,
+                    "wr_p_value": np.nan})
         return out
 
     boot = block_bootstrap_ci(event_values, event_day_ids, n_boot=n_boot, seed=seed)
     perm = perm_pvalue_excess(event_values, event_buckets, pool_values,
                               pool_buckets, n_perm=n_perm, seed=seed)
+    # Win-rate leg: identical machinery on the >0 indicator (seed offset so
+    # the two nulls are not draw-correlated).
+    pool_ok = ~np.isnan(pool_values)
+    wr_perm = perm_pvalue_excess(
+        (event_values > 0).astype(float), event_buckets,
+        (pool_values[pool_ok] > 0).astype(float), pool_buckets[pool_ok],
+        n_perm=n_perm, seed=seed + 1)
     out.update({
         "mean": float(event_values.mean()),
         "median": float(np.median(event_values)),
@@ -174,5 +207,8 @@ def summarize_edge(
         "ci_hi": boot["ci_hi"],
         "excess": perm["excess"],
         "p_value": perm["p_value"],
+        "win_rate": float((event_values > 0).mean()),
+        "wr_excess": wr_perm["excess"],
+        "wr_p_value": wr_perm["p_value"],
     })
     return out

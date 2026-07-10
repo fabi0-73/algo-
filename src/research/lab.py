@@ -19,6 +19,12 @@ same bar); sizing replay uses floor() (engine risk.py rounds).
 R accounting: r_price = dir*(exit-entry)/stop_dist (engine-comparable,
 SL slippage already in exit). r_net = r_price - cost_per_oz/stop_dist.
 SCREENING DECISIONS USE r_net.
+
+Optional trade-management shapes (signal columns, see base.SIGNAL_DEFAULTS):
+partial_at_r/partial_pct (book a fraction at +X R, remainder to BE next bar,
+WORST_CASE: same-bar SL wins over the partial), time_stop_bars/time_stop_min_r
+(cut dead trades at close), trail_mode="step" (whole-R ladder: at m full R of
+MFE the stop locks to (m-1) R, staged next bar like every stop move).
 """
 from dataclasses import dataclass
 from datetime import timedelta
@@ -68,6 +74,16 @@ class CostModel:
             rollover_mm=mm,
             contract_size=contract,
         )
+
+
+def _optf(row, name: str, default: float) -> float:
+    """Optional numeric signal column (namedtuple row); NaN/absent -> default."""
+    v = getattr(row, name, default)
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return default
+    return v if np.isfinite(v) else default
 
 
 def count_rollovers(entry_time: pd.Timestamp, exit_time: pd.Timestamp,
@@ -165,6 +181,18 @@ def simulate(
         atr_entry = atr[fill_bar] if np.isfinite(atr[fill_bar]) else 0.0
         slip_entry = costs.slippage_atr_mult * atr_entry
 
+        # optional trade-management shapes (columns may be absent)
+        partial_at = _optf(row, "partial_at_r", 0.0)
+        partial_pct = _optf(row, "partial_pct", 0.5)
+        t_stop_bars = int(_optf(row, "time_stop_bars", 0.0))
+        t_stop_min_r = _optf(row, "time_stop_min_r", 0.0)
+        trail_mode = str(getattr(row, "trail_mode", "atr"))
+        if trail_mode not in ("atr", "step"):
+            trail_mode = "atr"
+        partial_px = entry + direction * partial_at * stop_dist \
+            if partial_at > 0 else np.nan
+        partial_taken = False
+
         cur_sl = sl
         be_done = False
         trailing = False
@@ -186,6 +214,12 @@ def simulate(
                 exit_px = cur_sl - slip_k if direction > 0 else cur_sl + slip_k
                 exit_bar, reason = k, "SL"
                 break
+            # partial TP: resting limit at partial_px (checked after SL —
+            # WORST_CASE ordering); remainder's BE move stages for NEXT bar
+            if (partial_at > 0 and not partial_taken
+                    and (h[k] >= partial_px if direction > 0
+                         else l[k] <= partial_px)):
+                partial_taken = True
             if tp_hit:
                 exit_bar, exit_px, reason = k, tp, "TP"
                 break
@@ -194,6 +228,13 @@ def simulate(
             flags = exit_flags_long if direction > 0 else exit_flags_short
             if flags is not None and flags[k]:
                 exit_bar, exit_px, reason = k, c[k], "IND"
+                break
+
+            # R-based time stop: after N bars, cut the trade at close if it
+            # has not reached the minimum R (dead-trade tail control)
+            if (t_stop_bars > 0 and k - fill_bar >= t_stop_bars
+                    and direction * (c[k] - entry) < t_stop_min_r * stop_dist):
+                exit_bar, exit_px, reason = k, c[k], "TIME_R"
                 break
 
             # EOD flat: last bar of this trading day before the cutoff
@@ -216,22 +257,32 @@ def simulate(
                 if be_at > 0 and not be_done and h[k] >= entry + be_at:
                     cur_sl = max(cur_sl, entry)
                     be_done = True
+                if partial_taken:
+                    cur_sl = max(cur_sl, entry)  # BE after partial (staged)
                 if trail_mult > 0:
                     if not trailing and mfe >= trail_act:
                         trailing = True
                     if trailing:
                         cur_sl = max(cur_sl, h[k] - trail_mult * a_k)
+                if trail_mode == "step" and mfe >= stop_dist:
+                    lock = entry + (int(mfe / stop_dist) - 1) * stop_dist
+                    cur_sl = max(cur_sl, lock)
             else:
                 mfe = max(mfe, entry - l[k])
                 mae = max(mae, h[k] - entry)
                 if be_at > 0 and not be_done and l[k] <= entry - be_at:
                     cur_sl = min(cur_sl, entry)
                     be_done = True
+                if partial_taken:
+                    cur_sl = min(cur_sl, entry)  # BE after partial (staged)
                 if trail_mult > 0:
                     if not trailing and mfe >= trail_act:
                         trailing = True
                     if trailing:
                         cur_sl = min(cur_sl, l[k] + trail_mult * a_k)
+                if trail_mode == "step" and mfe >= stop_dist:
+                    lock = entry - (int(mfe / stop_dist) - 1) * stop_dist
+                    cur_sl = min(cur_sl, lock)
 
         # excursions on the exit bar too (for MAE-based DD replay)
         if exit_bar >= 0:
@@ -250,6 +301,11 @@ def simulate(
         cost_per_oz = (costs.spread_usd_oz + slip_entry + costs.commission_usd_oz
                        + costs.swap_usd_oz_per_night * nights)
         r_price = direction * (exit_px - entry) / stop_dist
+        if partial_taken:
+            # size-weighted R: partial leg locked at partial_at R, remainder
+            # at the recorded exit (cost stays one whole-position round trip,
+            # matching the engine's proportional cost split)
+            r_price = partial_pct * partial_at + (1.0 - partial_pct) * r_price
         r_net = r_price - cost_per_oz / stop_dist
 
         trades.append({
@@ -270,6 +326,7 @@ def simulate(
             "cost_per_oz": cost_per_oz,
             "r_net": r_net,
             "atr_entry": atr_entry,
+            "partial_taken": partial_taken,
             "tag": int(row.tag),
         })
         stats["taken"] += 1
