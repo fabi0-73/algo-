@@ -46,10 +46,15 @@ class TelegramNotifier:
         )
         return self._send_message(text)
 
+    def send_alert(self, text: str) -> bool:
+        """Send an operational alert (scanner stopped, coverage gap, etc.)."""
+        return self._send_message(f"<b>AMD Scanner alert</b>\n\n{self._esc(text)}")
+
     def _format_signal(self, signal: LiveSignal) -> str:
         """Build HTML message body for the signal."""
         ts = signal.timestamp
-        ts_str = ts.strftime("%Y-%m-%d %H:%M:%S UTC") if ts else "—"
+        # Candle timestamps are broker time (~NY+7), not UTC — label honestly
+        ts_str = ts.strftime("%Y-%m-%d %H:%M:%S broker") if ts else "—"
 
         # NY_IB stream: compact bracket-order message (no AMD confluence/stars)
         if getattr(signal, "entry_mode", "") == "NY_IB":

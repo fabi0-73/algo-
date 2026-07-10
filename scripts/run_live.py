@@ -27,7 +27,8 @@ import logging
 import time
 from datetime import datetime
 
-from config import STRATEGY, BACKTEST, MT5_CONFIG, TELEGRAM
+from config import (STRATEGY, BACKTEST, MT5_CONFIG, TELEGRAM,
+                    SESSION_FILTER, DRAWDOWN_CONTROLS)
 from src.live.signals import LiveSignalScanner
 from src.live.monitor import LiveMonitor
 from src.live.telegram_notifier import TelegramNotifier
@@ -38,6 +39,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# One MT5 client for the whole scanner lifetime: re-initializing the terminal
+# connection every poll is wasteful and bypasses the client's own reconnect
+# logic. Reset to None on any fetch error so the next scan reconnects fresh.
+_mt5_client = None
+
+
+def _get_mt5_client():
+    global _mt5_client
+    if _mt5_client is None:
+        from src.data.mt5_client import MT5Client
+        _mt5_client = MT5Client()
+    return _mt5_client
+
 
 def fetch_latest_candles(symbol: str, timeframe: str, count: int = 500):
     """
@@ -45,11 +59,11 @@ def fetch_latest_candles(symbol: str, timeframe: str, count: int = 500):
 
     Tries MT5 first; falls back to database if MT5 is not configured.
     """
+    global _mt5_client
     # Try MT5
     if MT5_CONFIG.get("login") and MT5_CONFIG["login"] != 0:
         try:
-            from src.data.mt5_client import MT5Client
-            client = MT5Client()
+            client = _get_mt5_client()
             df = client.get_candles(symbol, timeframe, count=count)
             if df is not None and not df.empty:
                 # Closed-candle guard: MT5 position-0 bar is the currently
@@ -61,7 +75,8 @@ def fetch_latest_candles(symbol: str, timeframe: str, count: int = 500):
                 logger.info(f"MT5: fetched {len(df)} closed candles for {symbol} {timeframe}")
                 return df
         except Exception as e:
-            logger.warning(f"MT5 fetch failed: {e}")
+            logger.warning(f"MT5 fetch failed: {e} — will reconnect next scan")
+            _mt5_client = None
 
     # Fallback to database
     try:
@@ -100,11 +115,15 @@ def run_signal_loop(
         use_telegram: If True, send signals to Telegram. If None, use TELEGRAM["enabled"] from config.
     """
     scanner = LiveSignalScanner(symbol=symbol, account_balance=balance)
+    # Advisory in signal-only mode (no fills are recorded), but keep the
+    # thresholds identical to the VALIDATED config — the old hardcoded
+    # 1%/15% literals would halt at the backtest's RESUME threshold if
+    # execution were ever wired in.
     monitor = LiveMonitor(
         initial_balance=balance,
-        daily_loss_limit_pct=0.01,
-        max_account_dd_pct=0.15,
-        max_trades_per_day=3,
+        daily_loss_limit_pct=SESSION_FILTER.get("daily_loss_limit_pct", 0.008),
+        max_account_dd_pct=DRAWDOWN_CONTROLS.get("max_account_dd_pct", 0.30),
+        max_trades_per_day=SESSION_FILTER.get("max_trades_per_day", 3),
     )
 
     telegram_notifier = None
@@ -128,9 +147,11 @@ def run_signal_loop(
     logger.info("=" * 60)
 
     scan_count = 0
+    last_bar_ts = None
 
-    while True:
-        scan_count += 1
+    def do_scan() -> str:
+        """One poll cycle. Returns 'ok' (keep looping) or 'stop' (fatal)."""
+        nonlocal last_bar_ts
         now = datetime.utcnow()
         logger.info(f"Scan #{scan_count} at {now.strftime('%Y-%m-%d %H:%M:%S')} UTC")
 
@@ -139,18 +160,35 @@ def run_signal_loop(
             logger.warning(f"Trading blocked: {reason}")
             status = monitor.status_summary()
             logger.info(f"Monitor: {json.dumps(status)}")
-            if once:
-                break
-            time.sleep(interval_seconds)
-            continue
+            return "ok"
 
         df = fetch_latest_candles(symbol, timeframe, count=500)
         if df is None or df.empty:
             logger.error("No candle data available")
-            if once:
-                break
-            time.sleep(interval_seconds)
-            continue
+            return "ok"
+
+        newest_ts = df["timestamp"].iloc[-1]
+
+        # News-coverage guard: a calendar that ends before the data means the
+        # blackout filter approves everything silently (this ran unprotected
+        # Feb->Jul 2026). Better no scanner than a blind one — stop loudly.
+        if not scanner.news_filter.coverage_ok(newest_ts):
+            msg = (f"news calendar coverage ends before newest candle "
+                   f"({newest_ts}) — news filter is BLIND. Regenerate with: "
+                   f"python scripts/generate_news_events.py, then restart.")
+            logger.critical(msg)
+            if telegram_notifier:
+                telegram_notifier.send_alert("Scanner STOPPED: " + msg)
+            return "stop"
+
+        # Freshness guard: decisions are closed-candle; if no new bar closed
+        # since the last scan (weekend, holiday, stalled feed) there is
+        # nothing new to decide — and rescanning stale bars would re-emit
+        # the same signal every 30 min once dedup expires.
+        if last_bar_ts is not None and newest_ts == last_bar_ts:
+            logger.info(f"No new closed bar since {newest_ts} — skipping scan")
+            return "ok"
+        last_bar_ts = newest_ts
 
         signals = scanner.scan(df)
 
@@ -185,10 +223,19 @@ def run_signal_loop(
                 )
         else:
             logger.info("No signals detected")
+        return "ok"
 
-        if once:
+    while True:
+        scan_count += 1
+        try:
+            status = do_scan()
+        except Exception:
+            # One bad scan must not kill the scanner (there is no supervisor
+            # by choice) — log with traceback and retry next interval.
+            logger.exception("Scan loop error — retrying next interval")
+            status = "ok"
+        if status == "stop" or once:
             break
-
         logger.info(f"Next scan in {interval_seconds}s...")
         time.sleep(interval_seconds)
 

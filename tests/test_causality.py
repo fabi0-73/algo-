@@ -335,3 +335,25 @@ class TestLiveScannerBOSParity:
         assert len(sigs) == 1
         assert sigs[0].bos_confirmed is True
         assert sigs[0].direction == "LONG"
+
+
+# =============================================================================
+# 5. News-coverage guard (a calendar ending in the past = blind filter)
+# =============================================================================
+
+class TestNewsCoverageGuard:
+    def test_coverage_ok_bounds(self, tmp_path):
+        from src.strategy.news_filter import NewsFilterEngine
+
+        p = tmp_path / "news.csv"
+        p.write_text("timestamp,currency,impact,title\n"
+                     "2026-01-14 15:30:00,USD,HIGH,CPI\n")
+        nf = NewsFilterEngine(enabled=True, csv_path=str(p))
+        assert nf.coverage_ok(datetime(2026, 1, 1)) is True
+        assert nf.coverage_ok(datetime(2026, 2, 1)) is False
+
+    def test_disabled_filter_never_blocks(self, tmp_path):
+        from src.strategy.news_filter import NewsFilterEngine
+
+        nf = NewsFilterEngine(enabled=False, csv_path=str(tmp_path / "x.csv"))
+        assert nf.coverage_ok(datetime(2030, 1, 1)) is True

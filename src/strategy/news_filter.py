@@ -93,6 +93,19 @@ class NewsFilterEngine:
                 raise RuntimeError(f"Failed to load news CSV {self.csv_path}: {e}")
             logger.error(f"Failed to load news CSV: {e}. News filter DISABLED.")
             self.enabled = False
+            return
+
+        # Staleness alarm: a calendar that ends in the past means the filter
+        # silently approves every entry (this bit us: coverage ended 2026-02-11
+        # and the live scanner ran unprotected through every release since).
+        if self.events:
+            last = self.events[-1].timestamp
+            if last < datetime.now(ZoneInfo("UTC")):
+                logger.error(
+                    f"News calendar coverage ENDS {last:%Y-%m-%d} — in the past; "
+                    f"the filter is blind from there on. Regenerate: "
+                    f"python scripts/generate_news_events.py"
+                )
 
     def _load_events(self):
         """Load events from CSV file."""
@@ -157,6 +170,18 @@ class NewsFilterEngine:
                 return True, event.title or f"{event.currency} {event.impact}"
 
         return False, ""
+
+    def coverage_ok(self, ts: datetime) -> bool:
+        """True when the loaded calendar extends past ts (same timestamp
+        normalization as is_in_blackout). False means the filter is blind at
+        ts — callers that must not run unprotected should stop loudly."""
+        if not self.enabled:
+            return True  # filter off by choice — nothing to cover
+        if not self.events:
+            return False
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=ZoneInfo(TIME_CONFIG["data_timezone"]))
+        return self.events[-1].timestamp >= ts.astimezone(ZoneInfo("UTC"))
 
     def can_enter_trade(self, ts: datetime) -> tuple:
         """
