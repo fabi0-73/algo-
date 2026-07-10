@@ -200,17 +200,26 @@ class LiveSignalScanner:
             dist = self._find_distribution(df, consol, manip, current_idx)
             if not dist.valid:
                 continue
-            if not validate_distribution_strength(df, dist, min_follow_through_candles=2):
+            if not validate_distribution_strength(
+                    df, dist,
+                    min_follow_through_candles=STRATEGY.get("distribution_follow_through_candles", 2),
+                    current_idx=current_idx):
                 continue
 
             bos = None
             entry_mode = STRATEGY.get("entry_mode", ENTRY_MODE_RETEST_ONLY)
-            if entry_mode != ENTRY_MODE_RETEST_ONLY:
+            # Engine parity (engine.py _scan_for_patterns): BOS must be searched
+            # whenever bos_required is set, regardless of entry mode. The old
+            # `entry_mode != RETEST_ONLY` condition meant that under the shipping
+            # config (RETEST_ONLY + bos_required) live NEVER found a BOS, and the
+            # entry gate then rejected every AMD setup — zero live signals.
+            if STRATEGY.get("bos_required", False) or entry_mode != ENTRY_MODE_RETEST_ONLY:
                 expected_dir = "BULLISH" if manip.direction == "DOWN" else "BEARISH"
                 bos = find_bos_after_manipulation(
                     df, manip.return_candle_idx, expected_dir,
                     search_window=20,
                     swing_lookback=STRATEGY.get("bos_swing_lookback", 5),
+                    current_idx=current_idx,
                 )
 
             entry = check_entry_at_candle(

@@ -310,6 +310,7 @@ def find_bos_after_manipulation(
     highs_arr=None,
     lows_arr=None,
     closes_arr=None,
+    current_idx: int = None,
 ) -> Optional[StructureBreak]:
     """
     Find Break of Structure after manipulation phase.
@@ -331,7 +332,9 @@ def find_bos_after_manipulation(
         highs_arr: Pre-extracted highs array
         lows_arr: Pre-extracted lows array
         closes_arr: Pre-extracted closes array
-    
+        current_idx: Last bar knowable at decision time. Bars beyond it are
+            never scanned (backtest causality; live frames simply end here).
+
     Returns:
         StructureBreak if found
     """
@@ -358,7 +361,10 @@ def find_bos_after_manipulation(
         return None
     
     end_idx = min(manipulation_return_idx + search_window, len(df))
-    
+    if current_idx is not None:
+        # Decision at current_idx may only see completed bars <= current_idx
+        end_idx = min(end_idx, current_idx + 1)
+
     for idx in range(manipulation_return_idx + 1, end_idx):
         bos = detect_break_of_structure(
             df, idx, swing, require_close=True,

@@ -223,6 +223,11 @@ def calculate_risk(
             rejection_reason=f"position_too_small:{lots}<{min_lot}"
         )
 
+    # Recompute the dollar risk from the FINAL lot size: the min-lot floor and
+    # leverage guard above can change lots, and on small accounts the floor
+    # dominates — the intended balance*risk_pct would understate true risk.
+    risk_amount_usd = stop_distance * contract_size * lots
+
     # Legacy pip calculation for compatibility (1 pip = $0.10 for gold)
     pip_size = 0.1
     risk_pips = stop_distance / pip_size

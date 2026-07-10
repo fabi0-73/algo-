@@ -403,19 +403,28 @@ class ExecutionEngine:
             partial_hit = not partial_tp_taken and candle["low"] <= partial_tp
             tp_hit = candle["low"] <= tp_price
 
-        # Priority 1: SL hit = full exit (with slippage)
+        # Priority 1: SL hit = full exit (with slippage). When the bar also
+        # touched the partial/final TP, resolve the ambiguity with the same
+        # intrabar_assumption check_exit honors (WORST_CASE -> SL first).
         if sl_hit:
-            sl_slippage = self._calculate_slippage(atr)
-            if direction == "LONG":
-                slipped_sl = sl_price - sl_slippage
-            else:
-                slipped_sl = sl_price + sl_slippage
-            return ExitDecision(
-                should_exit=True,
-                exit_reason="SL",
-                exit_price=slipped_sl,
-                is_partial=False,
-            )
+            exit_at_sl = True
+            if partial_hit or tp_hit:
+                if self.intrabar_assumption == "BEST_CASE":
+                    exit_at_sl = False
+                elif self.intrabar_assumption != "WORST_CASE":
+                    exit_at_sl = self.rng.random() < 0.5
+            if exit_at_sl:
+                sl_slippage = self._calculate_slippage(atr)
+                if direction == "LONG":
+                    slipped_sl = sl_price - sl_slippage
+                else:
+                    slipped_sl = sl_price + sl_slippage
+                return ExitDecision(
+                    should_exit=True,
+                    exit_reason="SL",
+                    exit_price=slipped_sl,
+                    is_partial=False,
+                )
 
         # Priority 2: Partial TP (if enabled and not taken)
         if partial_enabled and partial_hit:
