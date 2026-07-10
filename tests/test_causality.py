@@ -338,7 +338,30 @@ class TestLiveScannerBOSParity:
 
 
 # =============================================================================
-# 5. News-coverage guard (a calendar ending in the past = blind filter)
+# 5. Min-lot floor: reported dollar risk must be the FLOORED reality
+# =============================================================================
+
+class TestMinLotRiskTruth:
+    def test_small_account_risk_reports_floored_lots(self):
+        """$500 @ 0.3%: intended $1.50 of risk, but 0.01 min-lot on a $6-wide
+        stop means the REAL risk is $6 (1.2%). risk_amount_usd must say $6."""
+        from types import SimpleNamespace
+        from src.strategy.risk import calculate_risk
+
+        entry = SimpleNamespace(valid=True, direction="LONG",
+                                entry_price=2000.0,
+                                manipulation_extreme=1996.0, atr=2.0)
+        rp = calculate_risk(entry, account_balance=500.0, atr=2.0)
+        assert rp.valid
+        assert rp.position_size == pytest.approx(0.01)  # floored up
+        # dollar risk = stop_distance * contract * lots, NOT balance * pct
+        assert rp.risk_amount_usd == pytest.approx(
+            rp.stop_distance * 100 * 0.01)
+        assert rp.risk_amount_usd > 500.0 * 0.01  # >1% despite 0.3% intent
+
+
+# =============================================================================
+# 6. News-coverage guard (a calendar ending in the past = blind filter)
 # =============================================================================
 
 class TestNewsCoverageGuard:

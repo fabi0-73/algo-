@@ -162,7 +162,8 @@ class LiveSignalScanner:
             current_idx - self.lookback,
         )
 
-        for offset in range(min_offset, max_offset, 2):
+        for offset in range(min_offset, max_offset,
+                            STRATEGY.get("consolidation_scan_step", 2)):
             end_idx = current_idx - offset
             start_idx = end_idx - self.lookback
 

@@ -25,7 +25,12 @@ import argparse
 import json
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timezone
+
+
+def _utcnow() -> datetime:
+    """Naive UTC now (utcnow() is deprecated; monitor state expects naive)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 from config import (STRATEGY, BACKTEST, MT5_CONFIG, TELEGRAM,
                     SESSION_FILTER, DRAWDOWN_CONTROLS)
@@ -152,7 +157,7 @@ def run_signal_loop(
     def do_scan() -> str:
         """One poll cycle. Returns 'ok' (keep looping) or 'stop' (fatal)."""
         nonlocal last_bar_ts
-        now = datetime.utcnow()
+        now = _utcnow()
         logger.info(f"Scan #{scan_count} at {now.strftime('%Y-%m-%d %H:%M:%S')} UTC")
 
         can_trade, reason = monitor.can_trade(now)

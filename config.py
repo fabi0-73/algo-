@@ -150,9 +150,9 @@ SESSION_FILTER = {
 
     # Consolidation detection in Asian session
     # Allow pattern DETECTION during Asian (useful for setups that complete in London)
+    # (require_consolidation_in_asian lives in the Session-based Pattern
+    # Timing section below — it was duplicated here and the later key won)
     "allow_consolidation_in_asian": True,
-    # If True, REQUIRE consolidation to form during Asian session
-    "require_consolidation_in_asian": False,
 
     # Daily trade limits
     "max_trades_per_day": 3,  # Allow more setups per day
@@ -421,6 +421,24 @@ STRATEGY = {
 
     # Entry Mode: "RETEST_ONLY", "RETEST_WITH_FVG", "ORDER_BLOCK", "PEAK_LOW"
     "entry_mode": "RETEST_ONLY",            # No FVG required - more trades
+
+    # --- previously-hidden knobs, surfaced 2026-07-10 (defaults unchanged) ---
+    # Pattern-search window: how many bars after a consolidation ends the
+    # scanner looks for manipulation/distribution. Bounds trade count.
+    "pattern_min_bars_after_consolidation": 10,
+    "pattern_max_bars_after_consolidation": 60,
+    # Scan stride over candidate consolidation windows (engine + live share
+    # it). 2 = evaluate every second window; 1 doubles candidates AND compute.
+    # NEVER change without the full validation battery — more candidates
+    # changes which patterns dedup first.
+    "consolidation_scan_step": 2,
+    # Breakeven cushion above/below entry when the BE stop moves (ATR mult).
+    "be_buffer_atr_mult": 0.1,
+    # Entry order type at the retest ("LIMIT" validated; "MARKET" = chase,
+    # tested and rejected in run c19e123e) + rejection-candle fallback for
+    # FVG mode (never validated on).
+    "entry_execution": "LIMIT",
+    "allow_rejection_fallback": False,
 
     # Fair Value Gap (FVG) Settings
     "fvg_min_size_atr_mult": 0.10,          # Min FVG size as ATR multiple

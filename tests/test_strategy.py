@@ -1027,8 +1027,8 @@ class TestDistributionFollowThrough:
             enable_fundamentals=False,
         )
 
-        # Force consolidation/manipulation/distribution to appear valid
-        monkeypatch.setattr(engine, "_is_consolidation_arrays", lambda *args, **kwargs: True)
+        # Force manipulation/distribution to appear valid (consolidation is
+        # forced via the precomputed rolling arrays set up below)
         monkeypatch.setattr(
             engine,
             "_check_manipulation_after",

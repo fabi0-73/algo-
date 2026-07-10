@@ -1,23 +1,28 @@
 # AMD Strategy Backtester Dependencies
+# Pinned 2026-07-10 to the versions the live scanner + validated backtests
+# actually run on (unpinned ranges let a fresh install pull pandas 3.x /
+# numpy 2.x and silently break the runtime). Bump deliberately, then run
+# the full suite + a battery run before trusting results.
+
 # Core trading
-MetaTrader5>=5.0.45
+MetaTrader5==5.0.5488
 
 # Data processing
-pandas>=2.0.0
-numpy>=1.24.0
+pandas==2.2.2
+numpy==1.26.4
 
 # Database
-psycopg2-binary>=2.9.9
-sqlalchemy>=2.0.0
+psycopg2-binary==2.9.11
+sqlalchemy==2.0.30
 
 # Visualization
-matplotlib>=3.7.0
+matplotlib==3.8.4
 
 # Configuration
-python-dotenv>=1.0.0
+python-dotenv==1.2.1
 
 # HTTP (Telegram Bot API)
-requests>=2.31.0
+requests==2.32.2
 
 # Testing
-pytest>=7.4.0
+pytest==7.4.4

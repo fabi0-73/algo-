@@ -878,7 +878,8 @@ class BacktestEngine:
                 return
 
         # Scan backwards for consolidation zones (step by 2 for speed)
-        for consol_end_offset in range(min_offset, max_offset, 2):
+        for consol_end_offset in range(min_offset, max_offset,
+                                       STRATEGY.get("consolidation_scan_step", 2)):
             consol_end_idx = current_idx - consol_end_offset
             consol_start_idx = consol_end_idx - lookback
 
@@ -1564,45 +1565,6 @@ class BacktestEngine:
                 f"{self._nyib_hi:.2f}, SL {sl:.2f}, TP {tp:.2f})"
             )
 
-    def _is_consolidation(self, window: pd.DataFrame, atr: float) -> bool:
-        """Check if window forms a valid consolidation."""
-        range_high = window['high'].max()
-        range_low = window['low'].min()
-        range_size = range_high - range_low
-
-        # Range must be tight
-        max_range = STRATEGY["consolidation_range_atr_mult"] * atr
-        if range_size > max_range:
-            return False
-
-        # Check closes inside range
-        closes = window['close']
-        closes_inside = ((closes >= range_low) & (closes <= range_high)).sum()
-        close_pct = closes_inside / len(window)
-
-        if close_pct < STRATEGY["consolidation_close_pct"]:
-            return False
-
-        return True
-
-    def _is_consolidation_arrays(self, high_arr: np.ndarray, low_arr: np.ndarray, close_arr: np.ndarray, atr: float) -> bool:
-        """Check consolidation using numpy arrays (faster hot path)."""
-        range_high = np.max(high_arr)
-        range_low = np.min(low_arr)
-        range_size = range_high - range_low
-
-        max_range = STRATEGY["consolidation_range_atr_mult"] * atr
-        if range_size > max_range:
-            return False
-
-        closes_inside = np.sum((close_arr >= range_low) & (close_arr <= range_high))
-        close_pct = closes_inside / len(close_arr)
-
-        if close_pct < STRATEGY["consolidation_close_pct"]:
-            return False
-
-        return True
-
     def _check_manipulation_after(
         self,
         df: pd.DataFrame,
@@ -1783,74 +1745,6 @@ class BacktestEngine:
                     )
 
         return DistributionResult(valid=False)
-
-    def _check_entry_now(
-        self,
-        df: pd.DataFrame,
-        consol: ConsolidationResult,
-        manip: ManipulationResult,
-        dist: DistributionResult,
-        current_idx: int,
-    ) -> EntrySignal:
-        """Check if current bar provides valid entry."""
-
-        candle = df.iloc[current_idx]
-        atr = dist.atr
-        tolerance = STRATEGY["retest_tolerance_atr_mult"] * atr
-        wick_ratio = STRATEGY["rejection_wick_ratio"]
-
-        if dist.direction == "UP":
-            # Long setup - retest of range_high from above
-            retest_level = consol.range_high
-            direction = "LONG"
-
-            # Check if low retests the level
-            if candle["low"] <= retest_level + tolerance and candle["low"] >= retest_level - tolerance:
-                # Check for rejection (bullish)
-                body = abs(candle["close"] - candle["open"])
-                lower_wick = min(candle["open"], candle["close"]) - candle["low"]
-
-                if body == 0 or lower_wick >= body * wick_ratio:
-                    return EntrySignal(
-                        valid=True,
-                        direction=direction,
-                        entry_price=candle["close"],
-                        entry_candle_idx=current_idx,
-                        entry_timestamp=candle.get("timestamp"),
-                        rejection_confirmed=True,
-                        retest_level=retest_level,
-                        consolidation_high=consol.range_high,
-                        consolidation_low=consol.range_low,
-                        manipulation_extreme=manip.extreme_price,
-                        manipulation_direction=manip.direction,
-                    )
-        else:
-            # Short setup - retest of range_low from below
-            retest_level = consol.range_low
-            direction = "SHORT"
-
-            # Check if high retests the level
-            if candle["high"] >= retest_level - tolerance and candle["high"] <= retest_level + tolerance:
-                # Check for rejection (bearish)
-                body = abs(candle["close"] - candle["open"])
-                upper_wick = candle["high"] - max(candle["open"], candle["close"])
-
-                if body == 0 or upper_wick >= body * wick_ratio:
-                    return EntrySignal(
-                        valid=True,
-                        direction=direction,
-                        entry_price=candle["close"],
-                        entry_candle_idx=current_idx,
-                        entry_timestamp=candle.get("timestamp"),
-                        rejection_confirmed=True,
-                        retest_level=retest_level,
-                        consolidation_high=consol.range_high,
-                        consolidation_low=consol.range_low,
-                        manipulation_extreme=manip.extreme_price,
-                        manipulation_direction=manip.direction,
-                    )
-
-        return EntrySignal(valid=False)
 
     def _check_entry_now_with_confluence(
         self,
@@ -2035,7 +1929,8 @@ class BacktestEngine:
         # effect on the NEXT bar (lab convention, live knowability) — a stop
         # raised by this bar's high must not stop out on this bar's low.
         use_adaptive = ADAPTIVE_EXITS.get("enabled", False) and trade.exit_tier
-        be_buffer_mult = trade.tier_be_buffer_atr_mult if use_adaptive else 0.1
+        be_buffer_mult = trade.tier_be_buffer_atr_mult if use_adaptive \
+            else STRATEGY.get("be_buffer_atr_mult", 0.1)
 
         # Check if partial TP is enabled (via RISK_MODEL, adaptive tier, or per-trade HYBRID style)
         tier_partial = (use_adaptive and self._get_tier_config(trade.exit_tier, "partial_tp_enabled", False))
@@ -2694,7 +2589,7 @@ class BacktestEngine:
                 else:
                     current_r = (entry_price - best_price) / stop_distance_ref
                 if current_r >= be_trigger_r:
-                    be_buffer = atr * 0.1
+                    be_buffer = atr * STRATEGY.get("be_buffer_atr_mult", 0.1)
                     if direction == "LONG":
                         new_be = entry_price + be_buffer
                         if new_be > current_sl:

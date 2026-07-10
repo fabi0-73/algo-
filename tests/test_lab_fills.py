@@ -65,6 +65,57 @@ def test_stop_gap_through_fills_at_open():
     assert trades["entry"].iloc[0] == 103.0
 
 
+def test_partial_tp_books_half_then_be_next_bar():
+    # entry 100 (market @ bar1 open), sl 98 (dist 2), partial at +1R = 102
+    df = mk_df([(100, 100.5, 99.5, 100),
+                (100, 102.6, 99.0, 101.5),    # partial fills; BE stages
+                (100.5, 100.8, 99.5, 99.8)])  # low 99.5 <= staged BE 100 -> SL
+    trades, _ = run_one(df, signal_idx=0, direction=1, entry_type=ENTRY_MARKET,
+                        sl=98.0, partial_at_r=1.0, partial_pct=0.5)
+    t = trades.iloc[0]
+    assert t["partial_taken"]
+    assert t["exit_reason"] == "SL"
+    assert t["exit"] == pytest.approx(100.0 - 0.04)  # BE stop, slipped
+    # r = 0.5*1R + 0.5*((99.96-100)/2) = 0.5 - 0.01
+    assert t["r_price"] == pytest.approx(0.49)
+
+
+def test_partial_same_bar_as_sl_is_worst_case_loss():
+    df = mk_df([(100, 100.5, 99.5, 100),
+                (100, 102.5, 97.5, 100)])  # touches partial 102 AND sl 98
+    trades, _ = run_one(df, signal_idx=0, direction=1, entry_type=ENTRY_MARKET,
+                        sl=98.0, partial_at_r=1.0, partial_pct=0.5)
+    t = trades.iloc[0]
+    assert not t["partial_taken"]
+    assert t["exit_reason"] == "SL"
+    assert t["r_price"] == pytest.approx(-1.02)  # full loss + slippage
+
+
+def test_time_stop_cuts_dead_trade():
+    flat = (100, 100.4, 99.8, 100.2)
+    df = mk_df([(100, 100.5, 99.5, 100), flat, flat, flat, flat])
+    trades, _ = run_one(df, signal_idx=0, direction=1, entry_type=ENTRY_MARKET,
+                        sl=98.0, time_stop_bars=2, time_stop_min_r=0.5)
+    t = trades.iloc[0]
+    assert t["exit_reason"] == "TIME_R"
+    assert t["bars_held"] == 2
+    assert t["exit"] == pytest.approx(100.2)
+
+
+def test_step_trail_locks_whole_r():
+    # entry 100, sl 97 (dist 3); bar1 runs to 106.5 (mfe 6.5 -> lock (2-1)*3=103
+    # staged); bar2 low 102.5 hits the 103 lock
+    df = mk_df([(100, 100.5, 99.5, 100),
+                (100, 106.5, 99.8, 106),
+                (105, 105.5, 102.5, 103.5)])
+    trades, _ = run_one(df, signal_idx=0, direction=1, entry_type=ENTRY_MARKET,
+                        sl=97.0, trail_mode="step")
+    t = trades.iloc[0]
+    assert t["exit_reason"] == "SL"
+    assert t["exit"] == pytest.approx(103.0 - 0.04)
+    assert t["r_price"] == pytest.approx((102.96 - 100.0) / 3.0)
+
+
 def test_worst_case_sl_first_matches_engine():
     """Bar touches both SL and TP -> lab must exit at SL with slippage,
     bit-for-bit equal to ExecutionEngine.check_exit."""
