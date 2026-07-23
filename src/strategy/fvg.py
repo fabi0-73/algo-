@@ -67,27 +67,34 @@ def detect_fvg(
         FVG object if found, None otherwise
     """
     min_size_atr_mult = min_size_atr_mult or STRATEGY.get("fvg_min_size_atr_mult", 0.10)
-    
+    return _detect_fvg_core(df["high"].values, df["low"].values, len(df),
+                            idx, min_size_atr_mult, atr)
+
+
+def _detect_fvg_core(highs, lows, n, idx, min_size_atr_mult, atr):
+    """Array-core of detect_fvg — identical logic on plain numpy columns
+    (the pandas per-row .iloc access dominated the whole backtest profile)."""
     # Need at least 3 candles
-    if idx < 2 or idx >= len(df):
+    if idx < 2 or idx >= n:
         return None
-    
-    candle_1 = df.iloc[idx - 2]  # First candle
-    candle_2 = df.iloc[idx - 1]  # Middle (impulse) candle
-    candle_3 = df.iloc[idx]      # Third candle
-    
+
+    c1_high = highs[idx - 2]
+    c1_low = lows[idx - 2]
+    c3_low = lows[idx]
+    c3_high = highs[idx]
+
     # Check for Bullish FVG (gap up)
     # Gap exists when candle 1's high is below candle 3's low
-    if candle_1["high"] < candle_3["low"]:
-        fvg_bottom = candle_1["high"]
-        fvg_top = candle_3["low"]
+    if c1_high < c3_low:
+        fvg_bottom = c1_high
+        fvg_top = c3_low
         fvg_size = fvg_top - fvg_bottom
-        
+
         # Validate minimum size
         if atr is not None and min_size_atr_mult > 0:
             if fvg_size < min_size_atr_mult * atr:
                 return None
-        
+
         return FVG(
             valid=True,
             direction="BULLISH",
@@ -95,19 +102,19 @@ def detect_fvg(
             bottom=fvg_bottom,
             candle_idx=idx - 1,  # Middle candle created the FVG
         )
-    
+
     # Check for Bearish FVG (gap down)
     # Gap exists when candle 1's low is above candle 3's high
-    if candle_1["low"] > candle_3["high"]:
-        fvg_top = candle_1["low"]
-        fvg_bottom = candle_3["high"]
+    if c1_low > c3_high:
+        fvg_top = c1_low
+        fvg_bottom = c3_high
         fvg_size = fvg_top - fvg_bottom
-        
+
         # Validate minimum size
         if atr is not None and min_size_atr_mult > 0:
             if fvg_size < min_size_atr_mult * atr:
                 return None
-        
+
         return FVG(
             valid=True,
             direction="BEARISH",
@@ -115,7 +122,7 @@ def detect_fvg(
             bottom=fvg_bottom,
             candle_idx=idx - 1,
         )
-    
+
     return None
 
 
@@ -140,6 +147,13 @@ def score_fvg(
     Returns:
         FVG with quality_score populated
     """
+    return _score_fvg_core(df["open"].values, df["high"].values,
+                           df["low"].values, df["close"].values, len(df),
+                           fvg, atr)
+
+
+def _score_fvg_core(opens, highs, lows, closes, n, fvg, atr):
+    """Array-core of score_fvg — identical logic on plain numpy columns."""
     if not fvg.valid or atr <= 0:
         return fvg
 
@@ -155,10 +169,10 @@ def score_fvg(
         score += 1
 
     # Impulse candle body ratio scoring
-    if fvg.candle_idx < len(df):
-        impulse_candle = df.iloc[fvg.candle_idx]
-        body = abs(impulse_candle["close"] - impulse_candle["open"])
-        total_range = impulse_candle["high"] - impulse_candle["low"]
+    if fvg.candle_idx < n:
+        i = fvg.candle_idx
+        body = abs(closes[i] - opens[i])
+        total_range = highs[i] - lows[i]
 
         if total_range > 0:
             body_ratio = body / total_range
@@ -236,19 +250,29 @@ def find_fvgs_in_range(
     """
     fvgs = []
     min_quality = min_quality_score if min_quality_score is not None else STRATEGY.get("fvg_min_quality_score", 0)
+    msm = min_size_atr_mult or STRATEGY.get("fvg_min_size_atr_mult", 0.10)
+
+    # Extract columns ONCE — per-row .iloc in this loop was the single
+    # hottest path of the whole backtest (see 2026-07-23 profile).
+    opens = df["open"].values
+    highs = df["high"].values
+    lows = df["low"].values
+    closes = df["close"].values
+    n = len(df)
 
     # Need at least 3 candles to form FVG
     search_start = max(start_idx, 2)
-    search_end = min(end_idx + 1, len(df))
+    search_end = min(end_idx + 1, n)
 
     for idx in range(search_start, search_end):
-        fvg = detect_fvg(df, idx, min_size_atr_mult, atr)
+        fvg = _detect_fvg_core(highs, lows, n, idx, msm, atr)
 
         if fvg is not None:
             if direction is None or fvg.direction == direction:
                 # Score the FVG if ATR is available
                 if atr is not None and atr > 0:
-                    fvg = score_fvg(fvg, df, atr)
+                    fvg = _score_fvg_core(opens, highs, lows, closes, n,
+                                          fvg, atr)
 
                 # Filter by quality score
                 if fvg.quality_score >= min_quality:

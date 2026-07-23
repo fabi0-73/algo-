@@ -88,57 +88,66 @@ def detect_order_block(
     displacement_mult = displacement_mult or STRATEGY.get("ob_displacement_mult", 1.5)
     lookback = lookback if lookback is not None else STRATEGY.get("ob_lookback", 10)
 
-    if impulse_start_idx < 1 or impulse_start_idx >= len(df):
+    return _detect_ob_core(df["open"].values, df["high"].values,
+                           df["low"].values, df["close"].values, len(df),
+                           impulse_start_idx, direction, min_body_atr_mult,
+                           displacement_mult, atr, lookback)
+
+
+def _detect_ob_core(opens, highs, lows, closes, n, impulse_start_idx,
+                    direction, min_body_atr_mult, displacement_mult, atr,
+                    lookback):
+    """Array-core of detect_order_block — identical logic on numpy columns."""
+    if impulse_start_idx < 1 or impulse_start_idx >= n:
         return None
 
     search_start = max(0, impulse_start_idx - lookback)
-    
+
     # Find the last opposing candle before impulse
     ob_candle_idx = None
-    
+
     for idx in range(impulse_start_idx - 1, search_start - 1, -1):
-        candle = df.iloc[idx]
-        
         if direction == "BULLISH":
             # Looking for last bearish candle
-            if is_bearish_candle(candle):
+            if closes[idx] < opens[idx]:
                 ob_candle_idx = idx
                 break
         else:
             # Looking for last bullish candle
-            if is_bullish_candle(candle):
+            if closes[idx] > opens[idx]:
                 ob_candle_idx = idx
                 break
-    
+
     if ob_candle_idx is None:
         return None
-    
-    ob_candle = df.iloc[ob_candle_idx]
-    ob_body = get_body_size(ob_candle)
-    
+
+    ob_body = abs(closes[ob_candle_idx] - opens[ob_candle_idx])
+
     # Validate minimum body size
     if atr is not None and min_body_atr_mult > 0:
         if ob_body < min_body_atr_mult * atr:
             return None
-    
+
     # Calculate displacement (how far price moved after OB)
     # Look at the move from OB to current impulse position
-    impulse_end_idx = min(impulse_start_idx + 5, len(df) - 1)
-    
+    impulse_end_idx = min(impulse_start_idx + 5, n - 1)
+    if impulse_end_idx < ob_candle_idx + 1:      # unreachable; numpy guard
+        return None
+
     if direction == "BULLISH":
         # Measure upward displacement
-        high_after = df.iloc[ob_candle_idx + 1:impulse_end_idx + 1]["high"].max()
-        displacement = high_after - ob_candle["high"]
+        high_after = highs[ob_candle_idx + 1:impulse_end_idx + 1].max()
+        displacement = high_after - highs[ob_candle_idx]
     else:
         # Measure downward displacement
-        low_after = df.iloc[ob_candle_idx + 1:impulse_end_idx + 1]["low"].min()
-        displacement = ob_candle["low"] - low_after
-    
+        low_after = lows[ob_candle_idx + 1:impulse_end_idx + 1].min()
+        displacement = lows[ob_candle_idx] - low_after
+
     # Validate displacement
     min_displacement = ob_body * displacement_mult
     if displacement < min_displacement:
         return None
-    
+
     # Calculate strength (displacement relative to OB size)
     strength = displacement / ob_body if ob_body > 0 else 0
 
@@ -147,12 +156,12 @@ def detect_order_block(
 
     if use_body_only:
         # Use candle body (open/close) - standard SMC approach
-        ob_top = max(ob_candle["open"], ob_candle["close"])
-        ob_bottom = min(ob_candle["open"], ob_candle["close"])
+        ob_top = max(opens[ob_candle_idx], closes[ob_candle_idx])
+        ob_bottom = min(opens[ob_candle_idx], closes[ob_candle_idx])
     else:
         # Use full candle range (high/low)
-        ob_top = ob_candle["high"]
-        ob_bottom = ob_candle["low"]
+        ob_top = highs[ob_candle_idx]
+        ob_bottom = lows[ob_candle_idx]
 
     return OrderBlock(
         valid=True,
@@ -191,43 +200,50 @@ def find_order_blocks_in_range(
         List of OrderBlock objects
     """
     order_blocks = []
-    
+
+    # Extract columns ONCE — per-row .iloc here was the #2 hot path of the
+    # whole backtest (2026-07-23 profile).
+    opens = df["open"].values
+    highs = df["high"].values
+    lows = df["low"].values
+    closes = df["close"].values
+    n = len(df)
+    mba = min_body_atr_mult or STRATEGY.get("ob_min_body_atr_mult", 0.15)
+    dm = displacement_mult or STRATEGY.get("ob_displacement_mult", 1.5)
+    lookback = STRATEGY.get("ob_lookback", 10)
+
     # First, identify impulsive candles (large body moves)
-    avg_body = abs(df["close"] - df["open"]).iloc[start_idx:end_idx].mean()
-    
-    for idx in range(start_idx + 1, min(end_idx, len(df))):
-        candle = df.iloc[idx]
-        body = get_body_size(candle)
-        
+    seg = np.abs(closes[start_idx:end_idx] - opens[start_idx:end_idx])
+    avg_body = seg.mean() if len(seg) else float("nan")
+
+    for idx in range(start_idx + 1, min(end_idx, n)):
+        body = abs(closes[idx] - opens[idx])
+
         # Check if this is an impulsive candle (large body)
         if body < avg_body * 1.5:
             continue
-        
+
         # Determine impulse direction
-        if is_bullish_candle(candle):
+        if closes[idx] > opens[idx]:
             impulse_dir = "BULLISH"
         else:
             impulse_dir = "BEARISH"
-        
+
         # Skip if direction filter doesn't match
         if direction is not None and direction != impulse_dir:
             continue
-        
+
         # Look for OB before this impulse
-        ob = detect_order_block(
-            df=df,
-            impulse_start_idx=idx,
-            direction=impulse_dir,
-            min_body_atr_mult=min_body_atr_mult,
-            displacement_mult=displacement_mult,
-            atr=atr,
-        )
-        
+        ob = _detect_ob_core(opens, highs, lows, closes, n,
+                             impulse_start_idx=idx, direction=impulse_dir,
+                             min_body_atr_mult=mba, displacement_mult=dm,
+                             atr=atr, lookback=lookback)
+
         if ob is not None:
             # Avoid duplicates (same OB candle)
             if not any(existing.candle_idx == ob.candle_idx for existing in order_blocks):
                 order_blocks.append(ob)
-    
+
     return order_blocks
 
 
@@ -473,6 +489,12 @@ def detect_breaker_block(
     if not ob.valid:
         return None
 
+    return _detect_breaker_core(df["close"].values, len(df), ob,
+                                current_idx, min_break_candles)
+
+
+def _detect_breaker_core(closes, n, ob, current_idx, min_break_candles=2):
+    """Array-core of detect_breaker_block — identical logic on numpy closes."""
     # Search for break after OB formed
     search_start = ob.candle_idx + 1
     search_end = min(current_idx, search_start + 30)
@@ -481,14 +503,12 @@ def detect_breaker_block(
     break_idx = 0
 
     for idx in range(search_start, search_end):
-        if idx >= len(df):
+        if idx >= n:
             break
-
-        candle = df.iloc[idx]
 
         if ob.direction == "BULLISH":
             # Bullish OB broken when price closes below OB bottom
-            if candle["close"] < ob.bottom:
+            if closes[idx] < ob.bottom:
                 if break_candle_count == 0:
                     break_idx = idx
                 break_candle_count += 1
@@ -496,7 +516,7 @@ def detect_breaker_block(
                 break_candle_count = 0  # Reset if price comes back
         else:
             # Bearish OB broken when price closes above OB top
-            if candle["close"] > ob.top:
+            if closes[idx] > ob.top:
                 if break_candle_count == 0:
                     break_idx = idx
                 break_candle_count += 1
@@ -559,8 +579,12 @@ def find_breakers_in_range(
         atr=atr,
     )
     breakers = []
+    closes = df["close"].values
+    n = len(df)
     for ob in obs:
-        bb = detect_breaker_block(df, ob, current_idx)
+        if not ob.valid:
+            continue
+        bb = _detect_breaker_core(closes, n, ob, current_idx)
         if bb is not None and bb.valid and bb.direction == direction:
             breakers.append(bb)
     return breakers
