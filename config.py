@@ -364,6 +364,22 @@ RISK_MODEL = {
     # trade. Reverted to the validated 0.01 (run 124d15ef). Aggressive-but-survivable
     # option: 0.02 (bootstrap: 1.9% ruin, ~2x trajectory). 0.10 becomes sane ~$5,000 equity.
     "min_lot": 0.01,
+
+    # Fixed-Ratio lot ladder (Ryan Jones; approved design 2026-07-23).
+    # The FLOOR rises with banked profit: floor = min_lot + 0.01 per
+    # `fixed_ratio_delta` dollars of (balance - initial_capital), capped at
+    # `fixed_ratio_max_floor`. Not martingale — steps up only on realized
+    # gains, steps back down if profit is given back. Risk-based sizing
+    # still applies above the floor. delta=None disables (validation gate:
+    # full gauntlet before a delta is adopted).
+    # 2026-07-23 ADOPTED delta=300 (run fb3da9d2 + gauntlet): +$6,708 vs
+    # $3,834 baseline (+75%), PF 2.46, DD 27.7% (+0.3pt); severe-cost PF 1.97;
+    # bootstrap joint 98.6%; zero fresh-start ruin; walk-forward test PF 2.05
+    # (77% retention), test WR 57%. Known trade-offs (accepted): severe-tier
+    # DD 45%, profit back-loaded (2026 = 63% share — ladder math, bigger lots
+    # only exist after banked gains). Sweep: d500 $5,827, d750 $5,464.
+    "fixed_ratio_delta": 300.0,
+    "fixed_ratio_max_floor": 0.05,
     "max_lot": 50.0,
     "lot_step": 0.01,
 
@@ -1003,4 +1019,10 @@ HTF_TREND_MODEL = {
     "min_m5_bars": 4200,            # H1 EMA(93) needs ~180 closed H1 bars
     "signal_expiry_minutes": 75,    # one alert per closed signal bar
     "advisory_note": "SIGNAL-ONLY: execute at >=$1,250 equity (see module docstring)",
+    # Equity throttle for WHEN execution unlocks (approved design 2026-07-23):
+    # halve size while the stream's trailing-30d realized P&L < 0. Justified by
+    # the stream's trade-R lag-1 autocorr +0.376 (trend results cluster) — the
+    # documented precondition equity-throttles require. AMD gets NO throttle
+    # (its autocorr ~0; Davey/Alvarez tests show throttles degrade such systems).
+    "execution_throttle": {"enabled": True, "lookback_days": 30, "mult": 0.5},
 }

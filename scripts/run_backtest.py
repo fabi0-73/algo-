@@ -706,6 +706,12 @@ Examples:
                         help="Override move_sl_to_be_at_r (default 1.0)")
     parser.add_argument("--trail-activation-r", type=float, default=None,
                         help="Override trailing_stop_activation_r (default 2.0)")
+    parser.add_argument("--fixed-ratio-delta", type=float, default=None,
+                        help="Experiment: Fixed-Ratio ladder delta (dollars of "
+                             "banked profit per +0.01 lot floor step)")
+    parser.add_argument("--tier-boost", type=float, default=None,
+                        help="Experiment: multiply risk_pct AND lot_bonus of the "
+                             "standard/high confidence tiers by this factor")
     parser.add_argument("--keylevel-confluence", action="store_true",
                         help="Experiment: retest near a key level (PDH/PDL/weekly/"
                              "psych) counts as +1 confluence factor")
@@ -737,6 +743,15 @@ Examples:
         STRATEGY["trailing_stop_activation_r"] = args.trail_activation_r
     if args.keylevel_confluence:
         STRATEGY["keylevel_confluence_bonus"] = True
+    if args.fixed_ratio_delta is not None:
+        from config import RISK_MODEL
+        RISK_MODEL["fixed_ratio_delta"] = args.fixed_ratio_delta
+    if args.tier_boost is not None:
+        from config import CONFIDENCE_SIZING
+        for tier in CONFIDENCE_SIZING["tiers"]:
+            if tier["name"] in ("standard", "high"):
+                tier["risk_pct"] *= args.tier_boost
+                tier["lot_bonus"] *= args.tier_boost
 
     # E4 overnight-drift overlay override
     if args.long_runner_duration is not None:

@@ -202,6 +202,18 @@ def calculate_risk(
     # Round to lot step
     lots = round(lots / lot_step) * lot_step
 
+    # Fixed-Ratio lot ladder (approved 2026-07-23): the size FLOOR rises with
+    # banked profit — +1 step per fixed_ratio_delta dollars above initial
+    # capital, capped. Steps back down symmetrically if profit is given back.
+    if use_risk_model and RISK_MODEL.get("fixed_ratio_delta"):
+        from config import BACKTEST
+        initial = BACKTEST.get("initial_capital", 500.0)
+        banked = max(0.0, account_balance - initial)
+        steps = int(banked / RISK_MODEL["fixed_ratio_delta"])
+        ladder_floor = min(min_lot + steps * lot_step,
+                           RISK_MODEL.get("fixed_ratio_max_floor", 0.05))
+        min_lot = max(min_lot, ladder_floor)
+
     # Clamp to min/max
     lots = max(min_lot, min(lots, max_lot))
 
