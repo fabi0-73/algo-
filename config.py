@@ -351,7 +351,11 @@ RISK_MODEL = {
     # with 0.3-0.8% risk and the min_lot floor, real leverage used sits far below this.
     # Kept generous per the "$500, allow higher leverage" choice — lower to 100.0 to
     # hard-cap at 1:100. (Higher leverage on a small account raises risk of ruin.)
-    "max_position_notional_multiple": 300.0,
+    # 2026-07-23: account switched to 1:400 broker leverage (user decision).
+    # Engine ceiling aligned to it. NOTE: strategy never uses >16x (median 4x),
+    # so results are provably leverage-independent above ~1:20 — the 1:400
+    # value buys margin headroom in drawdown troughs, not different P&L.
+    "max_position_notional_multiple": 400.0,
 
     # Lot size constraints
     # 0.10 floor was tested at user request (run 75542d59): account DESTROYED — 5 trades,
