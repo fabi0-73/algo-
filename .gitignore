@@ -63,3 +63,6 @@ data/*.csv
 # Live scanner artifacts (session-local)
 *.jsonl
 data/monitor_state.json
+data/b2_snapshot/
+data/b2_xau_m5_cache.csv.gz
+.playwright-mcp/
