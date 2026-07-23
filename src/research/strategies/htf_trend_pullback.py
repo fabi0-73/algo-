@@ -12,6 +12,13 @@ $12-25 realized risk/trade; $500 equity replay shows 68%/94% path DD —
 viable as a signal stream or at >=$1.5-2k capital, NOT co-executed on a
 small shared account. Live integration requires the scanner's M30
 resampling gap (design doc 5b.2) + lab_portfolio overlap check first.
+REGIME MAP (B2 2018-2023 characterization, lab_92655f68): NEGATIVE
+pre-2023 (M30 -0.04R, H1 -0.08R aggregate; every year 2018-2022 flat or
+red), turns positive 2023 (+0.18/+0.24R) and holds through the 2026 OOS.
+Same modern-regime class as AMD (which turned on in 2022) — the two
+streams diversify tactically (monthly R corr +0.40) but share strategic
+regime risk; the regime throttle guards both. 2018-2021 is NOT usable as
+a validation window for v2 variants (hostile to the whole family).
 
 Pre-registered provenance: verbatim transfer of the neighbor lab's
 h1_ema_pullback — the ONLY strategy in their 14-slot roster to pass 4/4

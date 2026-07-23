@@ -52,6 +52,8 @@ def main():
                     help="ALSO print OOS rows (single look per survivor!)")
     ap.add_argument("--spread-points", type=float, default=None,
                     help="spread sensitivity override (e.g. 45 = $0.45/oz)")
+    ap.add_argument("--cache", default=None,
+                    help="alternate M5 cache (e.g. the 8.5y B2 cache)")
     ap.add_argument("--start", default=None)
     ap.add_argument("--end", default=None)
     ap.add_argument("--out", default="reports/lab")
@@ -70,7 +72,7 @@ def main():
         return
 
     tfs = args.timeframes.split(",")
-    m5 = mtf.load_m5(args.start, args.end)
+    m5 = mtf.load_m5(args.start, args.end, cache_path=args.cache)
     boundary = mtf.split_boundary(m5, args.split)
     t0, t1 = m5["timestamp"].iloc[0], m5["timestamp"].iloc[-1]
     costs = CostModel.from_config(spread_points=args.spread_points)
