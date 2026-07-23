@@ -595,15 +595,20 @@ CONFIDENCE_SIZING = {
             "name": "high",
             "min_confluence_score": 5,
             "prime_hours_only": True,     # H13-17 UTC
-            "risk_pct": 0.008,            # 0.8% — elite setups only
-            "lot_bonus": 0.02,            # +0.02 lots on top of calculated size
+            # 2026-07-23 tier-boost 2x ADOPTED (see standard tier note).
+            # Old: 0.008 / 0.02.
+            "risk_pct": 0.016,
+            "lot_bonus": 0.04,
         },
         {
             "name": "standard",
             "min_confluence_score": 3,
             "prime_hours_only": True,
-            "risk_pct": 0.005,            # 0.5% — prime hours, score 3+
-            "lot_bonus": 0.01,            # +0.01 lots on top of calculated size
+            # 2026-07-23 tier-boost 2x ADOPTED (run c4213e9d): +$3,834 vs $2,764,
+            # PF 2.76, DD 27.4% (breaker-inclusive), severe-stress PF 2.11,
+            # walk-forward test PF 3.04 > train 2.67. Old: 0.005 / 0.01.
+            "risk_pct": 0.010,
+            "lot_bonus": 0.02,
         },
         {
             "name": "off_hours",
