@@ -978,3 +978,20 @@ def validate_config() -> list[str]:
         )
 
     return warnings
+
+# =============================================================================
+# HTF Trend-Pullback second stream (SIGNAL-ONLY; lab-validated 2026-07-23)
+# =============================================================================
+# Lab dossier: train M30 +0.205R/PF 1.34, H1 +0.263R/PF 1.44 at the neighbor
+# lab's 4/4-WFO params verbatim; single OOS look spent (lab_d8e63ab5): M30
+# +0.121R (59% retention), H1 +0.208R (79%). Regime map: edge born 2023.
+# CAPITAL: wide 2.93-ATR stops = ~$28 median risk per 0.01 lot -> EXECUTION
+# needs >= ~$1,250-1,500 equity (combined-book MC 2026-07-23); below that this
+# stream is advisory/signal-only. Scanner emits with entry_mode HTF_TREND_*.
+HTF_TREND_MODEL = {
+    "enabled": True,                # signal-only emission (no execution anywhere)
+    "timeframes": ["M30", "H1"],
+    "min_m5_bars": 4200,            # H1 EMA(93) needs ~180 closed H1 bars
+    "signal_expiry_minutes": 75,    # one alert per closed signal bar
+    "advisory_note": "SIGNAL-ONLY: execute at >=$1,250 equity (see module docstring)",
+}

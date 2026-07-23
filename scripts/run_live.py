@@ -167,7 +167,9 @@ def run_signal_loop(
             logger.info(f"Monitor: {json.dumps(status)}")
             return "ok"
 
-        df = fetch_latest_candles(symbol, timeframe, count=500)
+        from config import HTF_TREND_MODEL
+        n_fetch = int(HTF_TREND_MODEL.get("min_m5_bars", 4200))             if HTF_TREND_MODEL.get("enabled") else 500
+        df = fetch_latest_candles(symbol, timeframe, count=n_fetch)
         if df is None or df.empty:
             logger.error("No candle data available")
             return "ok"

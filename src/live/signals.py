@@ -366,7 +366,88 @@ class LiveSignalScanner:
         except Exception as e:  # a broken second stream must never kill AMD
             logger.error(f"NY_IB scan failed: {e}")
 
+        # HTF trend-pullback stream (signal-only; lab-validated 2026-07-23)
+        try:
+            signals.extend(self.scan_htf_trend(df))
+        except Exception as e:  # a broken stream must never kill AMD
+            logger.error(f"HTF_TREND scan failed: {e}")
+
         return signals
+
+    def scan_htf_trend(self, df: pd.DataFrame) -> List[LiveSignal]:
+        """M30/H1 trend-pullback signals via the LAB MODULE ITSELF — one code
+        path for research and live kills parity drift by construction.
+        Lab dossier in src/research/strategies/htf_trend_pullback.py.
+        SIGNAL-ONLY: capital note in HTF_TREND_MODEL['advisory_note']."""
+        from config import HTF_TREND_MODEL
+        if not HTF_TREND_MODEL.get("enabled", False):
+            return []
+        min_bars = int(HTF_TREND_MODEL.get("min_m5_bars", 4200))
+        if len(df) < min_bars * 0.8:      # tolerate slightly short fetches
+            return []
+
+        from src.research import mtf
+        from src.research.strategies import htf_trend_pullback as mod
+        from src.research.strategies.base import MTFContext
+
+        m5 = df[["timestamp", "open", "high", "low", "close"]].copy()
+        vol_col = "tick_volume" if "tick_volume" in df.columns else (
+            "volume" if "volume" in df.columns else None)
+        m5["volume"] = df[vol_col] if vol_col else 0
+
+        out: List[LiveSignal] = []
+        now = datetime.now()
+        expiry = int(HTF_TREND_MODEL.get("signal_expiry_minutes", 75))
+        for tf in HTF_TREND_MODEL.get("timeframes", ["M30", "H1"]):
+            frame = mtf.prepare_frame(m5, tf)
+            if len(frame) < 190:
+                continue
+            htf = {}
+            for need in mod.HTF_NEEDS:
+                fn = getattr(mod, "HTF_INDICATORS", {}).get(need)
+                htf[need] = mtf.align_htf(frame, m5, need, indicator_fn=fn)
+            ctx = MTFContext(tf=tf, df=frame, htf=htf)
+            sig = mod.generate_signals(ctx, dict(mod.DEFAULTS))
+            if not len(sig):
+                continue
+            last = len(frame) - 1
+            hit = sig[sig["signal_idx"] == last]
+            if not len(hit):
+                continue
+            row = hit.iloc[0]
+            bar_ts = frame["timestamp"].iloc[last]
+            key = f"HTF_{tf}_{int(row['direction'])}_{bar_ts.isoformat()}"
+            if key in self._recent_signals:
+                if (now - self._recent_signals[key]).total_seconds() / 60 < expiry:
+                    continue
+            self._recent_signals[key] = now
+
+            entry = float(frame["close"].iloc[last])
+            sl = float(row["sl"])
+            tp = float(row["tp"]) if pd.notna(row["tp"]) else 0.0
+            direction = "LONG" if row["direction"] == 1 else "SHORT"
+            risk = abs(entry - sl)
+            out.append(LiveSignal(
+                timestamp=bar_ts.to_pydatetime(),
+                symbol=self.symbol,
+                direction=direction,
+                entry_price=entry,
+                stop_loss=sl,
+                take_profit=tp,
+                position_size_lots=0.01,   # min lot; stream is advisory
+                risk_reward=abs(tp - entry) / risk if risk > 0 and tp else 0.0,
+                confluence_score=0,
+                judas_quality=0,
+                confidence=HTF_TREND_MODEL.get("advisory_note", ""),
+                risk_pct=risk * 1.0 / max(self.account_balance, 1e-9),
+                entry_mode=f"HTF_TREND_{tf}",
+                trailing_activation_r=float(row.get("trail_act_r", 0) or 0),
+                trailing_atr_mult=float(row.get("trail_atr_mult", 0) or 0),
+                be_trigger_r=float(row.get("be_at_r", 0) or 0),
+            ))
+            logger.info(f"HTF_TREND {tf} {direction} signal at {entry:.2f} "
+                        f"(sl {sl:.2f}, tp {tp:.2f})")
+        return out
 
     def scan_ny_ib(self, df: pd.DataFrame) -> List[LiveSignal]:
         """NY Initial Balance pullback signals (NY_IB_MODEL; engine-validated
