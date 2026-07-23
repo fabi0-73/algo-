@@ -66,6 +66,9 @@ def main():
     ap.add_argument("--spread-points", type=float, default=None)
     ap.add_argument("--commission-usd-oz", type=float, default=None,
                     help="override $/oz commission (XAGUSD: 0.007)")
+    ap.add_argument("--params-json", default=None,
+                    help='per-event param overrides, e.g. \'{"ema_pullback_reclaim":'
+                         '{"pullback_ema":41,"trend_fast":25,"trend_slow":93}}\'')
     ap.add_argument("--out", default="reports/research")
     ap.add_argument("--no-json", action="store_true")
     args = ap.parse_args()
@@ -89,7 +92,8 @@ def main():
     buckets = tod_bucket(df["timestamp"]).to_numpy()
     days = day_ids(df["timestamp"]).to_numpy()
     train_mask = (df["timestamp"] < boundary).to_numpy()
-    events = run_all(df, names)
+    overrides = json.loads(args.params_json) if args.params_json else None
+    events = run_all(df, names, overrides=overrides)
 
     splits = [("train", train_mask)]
     if args.oos:

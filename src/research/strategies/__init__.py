@@ -15,6 +15,7 @@ STRATEGY_MODULES = [
     "zone_bounce",
     "vwap_reversion",
     "rsi2_trend",
+    "london_sweep_reversal",
 ]
 
 

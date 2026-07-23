@@ -442,3 +442,50 @@ def test_ribbon_expansion_fires_when_tight_then_ordered():
     assert len(fired) >= 1
     assert (r.loc[fired, "direction"] == 1).all()
     assert not r.loc[:79, "fired"].any()  # never inside the flat compression
+
+
+# ------------------------------------------------- london_sweep_reversal lab module
+
+def test_london_sweep_reversal_planted_day():
+    from src.research.strategies.base import MTFContext
+    from src.research.strategies import london_sweep_reversal as lsr
+
+    bars = []
+    ts = []
+    t0 = pd.Timestamp("2025-01-06 02:00")
+    # 21 days: 20 plain days establishing ADR ~2.0, then the planted day
+    for d in range(21):
+        day0 = t0 + pd.Timedelta(days=d)
+        for k in range(180):  # 02:00 -> 17:00 M5
+            t = day0 + pd.Timedelta(minutes=5 * k)
+            hour = t.hour + t.minute / 60
+            o = h = l = c = 99.5
+            if d < 20:
+                if k == 10: h, l = 100.5, 99.4     # give the day range ~2.0
+                if k == 20: l = 98.5
+            else:
+                # planted day: asia box [99.0, 100.0], sweep + reclaim in London
+                if hour < 10:
+                    o, c = 99.5, 99.5
+                    h, l = (100.0, 99.0) if k % 7 == 0 else (99.6, 99.4)
+                elif k == 100:                      # sweep bar: pokes above box
+                    o, h, l, c = 99.9, 100.15, 99.85, 100.05
+                elif k == 101:                      # holds above box (no reclaim yet)
+                    o, h, l, c = 100.0, 100.08, 99.98, 100.05
+                elif k == 102:                      # reclaim: closes back inside
+                    o, h, l, c = 100.0, 100.05, 99.85, 99.9
+                else:
+                    o = h = l = c = 99.8
+            ts.append(t)
+            bars.append((o, h, l, c))
+    df = pd.DataFrame(bars, columns=["open", "high", "low", "close"])
+    df.insert(0, "timestamp", pd.Series(ts))
+    df["volume"] = 100
+    df["atr"] = 0.1
+    ctx = MTFContext(tf="M5", df=df, htf={})
+    sig = lsr.generate_signals(ctx, dict(lsr.DEFAULTS))
+    assert len(sig) == 1
+    row = sig.iloc[0]
+    assert row["direction"] == -1                  # high sweep -> short
+    assert df.loc[row["signal_idx"], "timestamp"].hour >= 10
+    assert row["sl"] > 100.15 and row["tp"] == 99.5  # past sweep extreme; box mid
