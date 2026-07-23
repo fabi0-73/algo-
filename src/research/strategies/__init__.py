@@ -17,6 +17,7 @@ STRATEGY_MODULES = [
     "rsi2_trend",
     "london_sweep_reversal",
     "htf_trend_pullback",
+    "m15_trend_pullback",
 ]
 
 
