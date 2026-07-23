@@ -700,6 +700,15 @@ Examples:
                         help="Override max_bars_after_distribution (stale-retest window)")
     parser.add_argument("--dist-followthrough", type=int, default=None,
                         help="Override distribution_follow_through_candles (0 disables)")
+    parser.add_argument("--retest-tolerance", type=float, default=None,
+                        help="Override retest_tolerance_atr_mult (default 0.55)")
+    parser.add_argument("--be-at-r", type=float, default=None,
+                        help="Override move_sl_to_be_at_r (default 1.0)")
+    parser.add_argument("--trail-activation-r", type=float, default=None,
+                        help="Override trailing_stop_activation_r (default 2.0)")
+    parser.add_argument("--keylevel-confluence", action="store_true",
+                        help="Experiment: retest near a key level (PDH/PDL/weekly/"
+                             "psych) counts as +1 confluence factor")
     parser.add_argument("--adaptive-confidence", action="store_true",
                         help="Enable rolling confidence-bucket recalibration (E-adaptive)")
 
@@ -720,6 +729,14 @@ Examples:
         STRATEGY["max_bars_after_distribution"] = args.max_bars_after_dist
     if args.dist_followthrough is not None:
         STRATEGY["distribution_follow_through_candles"] = args.dist_followthrough
+    if args.retest_tolerance is not None:
+        STRATEGY["retest_tolerance_atr_mult"] = args.retest_tolerance
+    if args.be_at_r is not None:
+        STRATEGY["move_sl_to_be_at_r"] = args.be_at_r
+    if args.trail_activation_r is not None:
+        STRATEGY["trailing_stop_activation_r"] = args.trail_activation_r
+    if args.keylevel_confluence:
+        STRATEGY["keylevel_confluence_bonus"] = True
 
     # E4 overnight-drift overlay override
     if args.long_runner_duration is not None:

@@ -1761,6 +1761,34 @@ class BacktestEngine:
 
         entry_mode = STRATEGY.get("entry_mode", ENTRY_MODE_RETEST_ONLY)
 
+        # Experiment (2026-07-23, --keylevel-confluence): a retest level near a
+        # tracked key level (PDH/PDL, weekly/monthly H/L, psych) counts as +1
+        # confluence — implemented as a -1 on the gate for this pattern only.
+        kl_bonus = 0
+        if STRATEGY.get("keylevel_confluence_bonus", False):
+            candle = df.iloc[current_idx]
+            level = getattr(dist, "break_price", 0.0) or candle.get("close", 0.0)
+            kl = self.key_levels.calculate_score(
+                level, candle, candle.get("atr", 0.0))
+            kl_bonus = 1 if kl.total_score >= 1 else 0
+
+        if kl_bonus:
+            saved = STRATEGY.get("min_confluence_score", 0)
+            saved_s = STRATEGY.get("short_min_confluence_score", saved)
+            STRATEGY["min_confluence_score"] = max(0, saved - kl_bonus)
+            STRATEGY["short_min_confluence_score"] = max(0, saved_s - kl_bonus)
+            try:
+                entry = check_entry_at_candle(
+                    df=df, current_idx=current_idx, consolidation=consol,
+                    manipulation=manip, distribution=dist,
+                    structure_break=bos, fvg_at_level=fvg_at_level,
+                    ob_at_level=ob_at_level, entry_mode=entry_mode,
+                )
+            finally:
+                STRATEGY["min_confluence_score"] = saved
+                STRATEGY["short_min_confluence_score"] = saved_s
+            return entry
+
         # Use the new confluence-aware entry check
         entry = check_entry_at_candle(
             df=df,
