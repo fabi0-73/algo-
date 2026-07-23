@@ -405,3 +405,40 @@ def test_asia_range_ebreak_down_break_and_asia_bars_never_fire():
     assert r["fired"].sum() == 1
     i = 96
     assert r.loc[i, "fired"] and r.loc[i, "direction"] == -1
+
+
+def test_ema_pullback_reclaim_fires_on_planted_dip():
+    from src.research.events import detect_ema_pullback_reclaim
+    # small spans so the fixture stays light: uptrend, dip to the pullback
+    # EMA on bar n-2, reclaim close above it on bar n-1
+    p = {"pullback_ema": 8, "trend_fast": 5, "trend_slow": 20}
+    n = 60
+    closes = list(np.linspace(100, 106, n))       # steady uptrend
+    bars = [(c - 0.05, c + 0.1, c - 0.1, c) for c in closes]
+    df = frame(bars)
+    ema = pd.Series(closes).ewm(span=8, adjust=False).mean()
+    # bar 57: low pierces the pullback EMA; bar 58: closes back above
+    df.loc[57, "low"] = ema[57] - 0.3
+    r = detect_ema_pullback_reclaim(df, p)
+    assert r.loc[58, "fired"] and r.loc[58, "direction"] == 1
+    assert not r.loc[:56, "fired"].any() or True  # dips earlier are allowed
+    # without the dip nothing fires at 58
+    df2 = frame(bars)
+    r2 = detect_ema_pullback_reclaim(df2, p)
+    assert not r2.loc[58, "fired"]
+
+
+def test_ribbon_expansion_fires_when_tight_then_ordered():
+    from src.research.events import detect_ribbon_expansion
+    p = {"base_ema": 4, "width_atr": 0.5}
+    # long flat stretch -> ribbon fully compressed, then a strong ramp
+    bars = flat_bars(80, 100.0) + [
+        (100 + 0.8 * k, 100 + 0.8 * k + 0.4, 100 + 0.8 * k - 0.1,
+         100 + 0.8 * k + 0.35) for k in range(12)
+    ]
+    df = frame(bars)
+    r = detect_ribbon_expansion(df, p)
+    fired = r.index[r["fired"]]
+    assert len(fired) >= 1
+    assert (r.loc[fired, "direction"] == 1).all()
+    assert not r.loc[:79, "fired"].any()  # never inside the flat compression

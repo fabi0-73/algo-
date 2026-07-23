@@ -1118,6 +1118,72 @@ def detect_asia_range_ebreak(df: pd.DataFrame, params: dict = None) -> pd.DataFr
     return out
 
 
+# ------------------------------------------------- trend-pullback / ribbon
+# 2026-07-23 second wave from the quant-trading-lab triage: the two shapes
+# that passed the diversity + evidence screen (h1_ema_pullback was their only
+# 4/4 WFO revalidation pass; ribbon expansion is a vol-structure trigger we
+# don't otherwise cover). Spans are in M5 bars (their variants ran M30/H1;
+# scale via params when studying other frames).
+
+EMA_PULLBACK_DEFAULTS = {"pullback_ema": 240, "trend_fast": 300,
+                         "trend_slow": 1100}
+
+
+def detect_ema_pullback_reclaim(df: pd.DataFrame, params: dict = None) -> pd.DataFrame:
+    """Trend-continuation pullback: with the longer trend up (fast EMA above
+    slow EMA), the PRIOR bar dips to/below the pullback EMA and the current
+    bar closes back above it (mirror for downtrend). All EMAs use closes up
+    to bar i — knowable at bar-i close."""
+    p = _merged(EMA_PULLBACK_DEFAULTS, params)
+    out = _frame(len(df))
+    close = df["close"]
+    ema_pb = close.ewm(span=p["pullback_ema"], adjust=False).mean()
+    trend = np.sign(close.ewm(span=p["trend_fast"], adjust=False).mean()
+                    - close.ewm(span=p["trend_slow"], adjust=False).mean())
+    dipped = df["low"].shift(1) <= ema_pb.shift(1)
+    spiked = df["high"].shift(1) >= ema_pb.shift(1)
+    warm = np.arange(len(df)) >= p["trend_slow"]
+    long_f = (trend > 0) & dipped & (close > ema_pb) & warm
+    short_f = (trend < 0) & spiked & (close < ema_pb) & warm
+    long_f, short_f = long_f.fillna(False), short_f.fillna(False)
+    out.loc[long_f, "fired"] = True
+    out.loc[long_f, "direction"] = 1
+    out.loc[long_f, "strength"] = ((close - ema_pb) / df["atr"])[long_f]
+    out.loc[short_f, "fired"] = True
+    out.loc[short_f, "direction"] = -1
+    out.loc[short_f, "strength"] = ((ema_pb - close) / df["atr"])[short_f]
+    return out
+
+
+RIBBON_EXPANSION_DEFAULTS = {"base_ema": 60, "width_atr": 0.8}
+
+
+def detect_ribbon_expansion(df: pd.DataFrame, params: dict = None) -> pd.DataFrame:
+    """EMA ribbon (n, 2n, 4n, 8n) compressed on the prior bar (outer width
+    below `width_atr` ATRs) and now expanding with the EMAs in strict
+    bull/bear order -> volatility-expansion continuation."""
+    p = _merged(RIBBON_EXPANSION_DEFAULTS, params)
+    out = _frame(len(df))
+    n = p["base_ema"]
+    e1, e2, e3, e4 = (df["close"].ewm(span=n * m, adjust=False).mean()
+                      for m in (1, 2, 4, 8))
+    width = (e1 - e4).abs() / df["atr"]
+    was_tight = width.shift(1) < p["width_atr"]
+    expanding = width > width.shift(1)
+    bull = (e1 > e2) & (e2 > e3) & (e3 > e4)
+    bear = (e1 < e2) & (e2 < e3) & (e3 < e4)
+    warm = np.arange(len(df)) >= n * 8
+    long_f = (was_tight & expanding & bull & warm).fillna(False)
+    short_f = (was_tight & expanding & bear & warm).fillna(False)
+    out.loc[long_f, "fired"] = True
+    out.loc[long_f, "direction"] = 1
+    out.loc[long_f, "strength"] = (width - width.shift(1))[long_f]
+    out.loc[short_f, "fired"] = True
+    out.loc[short_f, "direction"] = -1
+    out.loc[short_f, "strength"] = (width - width.shift(1))[short_f]
+    return out
+
+
 # ---------------------------------------------------------------- registry
 
 EVENT_REGISTRY = {
@@ -1164,6 +1230,8 @@ EVENT_REGISTRY = {
     # analysis), re-implemented and judged under our own gauntlet
     "ratio_stretch": (detect_ratio_stretch, RATIO_STRETCH_DEFAULTS),
     "asia_range_ebreak": (detect_asia_range_ebreak, ASIA_EBREAK_DEFAULTS),
+    "ema_pullback_reclaim": (detect_ema_pullback_reclaim, EMA_PULLBACK_DEFAULTS),
+    "ribbon_expansion": (detect_ribbon_expansion, RIBBON_EXPANSION_DEFAULTS),
 }
 
 
