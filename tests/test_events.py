@@ -40,6 +40,9 @@ def random_frame(n=400, seed=11):
         "volume": rng.integers(50, 500, n),
     })
     df["atr"] = 1.0
+    # correlated-silver leg so ratio_stretch is genuinely exercised by the
+    # prefix-invariance sweep (detectors ignore unknown columns)
+    df["xag_close"] = close / 80.0 + rng.normal(0, 0.01, n)
     return df
 
 
@@ -334,3 +337,71 @@ def test_h1_sweep_uses_confirmed_swings_only():
     i2 = df2.index[df2["timestamp"] == "2025-01-06 13:30:00"][0]
     df2.loc[i2, ["open", "high", "low", "close"]] = [99.6, 99.7, 98.9, 99.4]
     assert not detect_h1_sweep(df2)["fired"].any()
+
+
+# ---------------------------------------------------------------- 2026-07-23
+# cross-asset + asia-range expansion (externally-validated geometries)
+
+def test_ratio_stretch_fires_on_planted_rich_ratio():
+    from src.research.events import detect_ratio_stretch
+    n = 40
+    bars = flat_bars(n, 100.0)
+    df = frame(bars)
+    # silver leg: gentle noise so the rolling std is non-degenerate, then a
+    # collapse at bar 30 -> gold/silver ratio spikes rich -> fade SHORT gold
+    xag = 1.25 + 0.001 * np.sin(np.arange(n))
+    xag[30] = 1.0
+    xag[31:] = 1.25
+    df["xag_close"] = xag
+    r = detect_ratio_stretch(df, {"window": 20, "z_thr": 2.0})
+    assert r.loc[30, "fired"] and r.loc[30, "direction"] == -1
+    assert r.loc[30, "strength"] > 0
+    assert not r.loc[: 19, "fired"].any()  # inside warmup window
+
+
+def test_ratio_stretch_cheap_ratio_fires_long():
+    from src.research.events import detect_ratio_stretch
+    n = 40
+    df = frame(flat_bars(n, 100.0))
+    xag = 1.25 + 0.001 * np.sin(np.arange(n))
+    xag[30] = 1.60  # silver rips -> ratio cheap -> fade LONG gold
+    df["xag_close"] = xag
+    r = detect_ratio_stretch(df, {"window": 20, "z_thr": 2.0})
+    assert r.loc[30, "fired"] and r.loc[30, "direction"] == 1
+
+
+def test_ratio_stretch_silent_without_silver():
+    from src.research.events import detect_ratio_stretch
+    df = frame(flat_bars(60, 100.0))
+    r = detect_ratio_stretch(df, {"window": 20, "z_thr": 2.0})
+    assert not r["fired"].any()
+
+
+def test_asia_range_ebreak_first_break_only():
+    from src.research.events import detect_asia_range_ebreak
+    # 96 asia bars 02:00-09:55 with range [99.8, 100.2], then London bars
+    asia = [(100.0, 100.2, 99.8, 100.0)] * 96
+    london = [
+        (100.0, 100.1, 99.9, 100.0),   # 10:00 inside range - no event
+        (100.0, 100.6, 99.9, 100.5),   # 10:05 close > 100.2 -> LONG fires
+        (100.5, 100.9, 100.4, 100.8),  # 10:10 still above - must NOT re-fire
+    ]
+    df = frame(asia + london, start="2025-01-06 02:00")
+    r = detect_asia_range_ebreak(df)
+    assert r["fired"].sum() == 1
+    i = 97
+    assert r.loc[i, "fired"] and r.loc[i, "direction"] == 1
+    assert np.isclose(r.loc[i, "strength"], (100.5 - 100.2) / 1.0)
+
+
+def test_asia_range_ebreak_down_break_and_asia_bars_never_fire():
+    from src.research.events import detect_asia_range_ebreak
+    asia = [(100.0, 100.2, 99.8, 100.0)] * 90 + [
+        (100.0, 100.5, 99.9, 100.4),   # 09:30 breaks above range IN asia
+    ] + [(100.0, 100.2, 99.8, 100.0)] * 5
+    london = [(100.0, 100.1, 99.4, 99.5)]  # 10:00 close < asia low -> SHORT
+    df = frame(asia + london, start="2025-01-06 02:00")
+    r = detect_asia_range_ebreak(df)
+    assert r["fired"].sum() == 1
+    i = 96
+    assert r.loc[i, "fired"] and r.loc[i, "direction"] == -1

@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.research import mtf
 from src.research.context import CONTEXT_COLUMNS, context_frame
-from src.research.events import EVENT_REGISTRY, HORIZONS, run_all
+from src.research.events import EVENT_REGISTRY, HORIZONS, attach_xag, run_all
 from src.research.forward import (BRACKET_HORIZONS, baseline_pool,
                                   bracket_outcomes_atr, cost_in_atr, day_ids,
                                   forward_outcomes, tod_bucket)
@@ -103,6 +103,7 @@ def main():
     m5 = m5_full[m5_full["timestamp"] < boundary].reset_index(drop=True)
     del m5_full
     df = mtf.prepare_frame(m5, "M5")
+    df = attach_xag(df)  # no-op without data/lab_xagusd_cache.csv
     costs = CostModel.from_config(spread_points=args.spread_points)
     run_id = uuid.uuid4().hex[:8]
 

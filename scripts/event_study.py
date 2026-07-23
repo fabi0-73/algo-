@@ -22,7 +22,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.research import mtf
-from src.research.events import EVENT_REGISTRY, HORIZONS, SESSIONS, run_all
+from src.research.events import (EVENT_REGISTRY, HORIZONS, SESSIONS,
+                                 attach_xag, run_all)
 from src.research.forward import (baseline_pool, cost_in_atr, day_ids,
                                   forward_outcomes, tod_bucket)
 from src.research.lab import CostModel
@@ -77,6 +78,7 @@ def main():
 
     m5 = mtf.load_m5(args.start, args.end, cache_path=args.cache)
     df = mtf.prepare_frame(m5, args.timeframe)
+    df = attach_xag(df)  # no-op without data/lab_xagusd_cache.csv
     boundary = mtf.split_boundary(m5, args.split)
     costs = CostModel.from_config(spread_points=args.spread_points,
                                   commission_usd_oz=args.commission_usd_oz)

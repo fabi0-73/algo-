@@ -1025,6 +1025,99 @@ def detect_h1_sweep(df: pd.DataFrame, params: dict = None) -> pd.DataFrame:
     return out
 
 
+# ------------------------------------------------- cross-asset / asia range
+# 2026-07-23 expansion. Idea provenance: the two most durable high-count M5
+# streams in the (independently analyzed) quant-trading-lab repo — gold/silver
+# ratio z-stretch fade (their WFO chose fade over follow) and the Asia-range
+# early break. Geometry re-implemented for OUR data contract and judged by OUR
+# gauntlet; nothing is imported as evidence. Silver caveat: broker retains
+# ~15-17mo of XAG M5 (cache starts 2025-01-31), so train-window n is thin —
+# treat event-study output as indicative until history accumulates.
+
+RATIO_STRETCH_DEFAULTS = {"window": 440, "z_thr": 2.0}
+
+
+def attach_xag(df: pd.DataFrame, path=None, max_gap_bars: int = 3) -> pd.DataFrame:
+    """Left-merge the cached XAGUSD M5 close onto df as `xag_close`.
+
+    Forward-fills at most `max_gap_bars` missing silver bars; beyond that the
+    value stays NaN (detectors treat NaN as no-event). No-op if the cache file
+    is absent or the column already exists.
+    """
+    if "xag_close" in df.columns:
+        return df
+    from pathlib import Path
+    p = Path(path) if path else (
+        Path(__file__).resolve().parents[2] / "data" / "lab_xagusd_cache.csv")
+    if not p.exists():
+        return df
+    xag = pd.read_csv(p, parse_dates=["timestamp"])[["timestamp", "close"]]
+    xag = xag.rename(columns={"close": "xag_close"}).sort_values("timestamp")
+    out = df.merge(xag, on="timestamp", how="left")
+    out["xag_close"] = out["xag_close"].ffill(limit=max_gap_bars)
+    return out
+
+
+def detect_ratio_stretch(df: pd.DataFrame, params: dict = None) -> pd.DataFrame:
+    """Gold/silver ratio z-score beyond +/- z_thr -> FADE hypothesis on gold
+    (ratio rich => short gold, ratio cheap => long gold). Needs `xag_close`
+    (see attach_xag); silently fires nothing without it. Ratio uses bar-i
+    closes of both legs — knowable at bar-i close."""
+    p = _merged(RATIO_STRETCH_DEFAULTS, params)
+    out = _frame(len(df))
+    if "xag_close" not in df.columns:
+        return out
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = df["close"] / df["xag_close"]
+    ratio = ratio.replace([np.inf, -np.inf], np.nan)
+    mean = ratio.rolling(p["window"], min_periods=p["window"]).mean()
+    std = ratio.rolling(p["window"], min_periods=p["window"]).std()
+    z = (ratio - mean) / std
+    fired = (z.abs() >= p["z_thr"]) & z.notna()
+    fired = fired.fillna(False)
+    out.loc[fired, "fired"] = True
+    out.loc[fired, "direction"] = (-np.sign(z[fired])).astype(np.int8)
+    out.loc[fired, "strength"] = z.abs()[fired] - p["z_thr"]
+    return out
+
+
+ASIA_EBREAK_DEFAULTS = {"eu_window_bars_hours": 6}
+
+
+def detect_asia_range_ebreak(df: pd.DataFrame, params: dict = None) -> pd.DataFrame:
+    """First close beyond the completed Asia-session range during the first
+    `eu_window_bars_hours` hours of London. Range is frozen before London
+    opens (Asia 02:00-10:00 broker time ends at the London 10:00 open), so
+    the level is fully causal; one event per day per direction max, first
+    break wins."""
+    p = _merged(ASIA_EBREAK_DEFAULTS, params)
+    out = _frame(len(df))
+    ts = df["timestamp"]
+    day = ts.dt.normalize()
+    asia = session_mask(ts, *SESSIONS["asia"])
+    lo_h, _ = SESSIONS["london"]
+    eu_end = f"{int(lo_h[:2]) + p['eu_window_bars_hours']:02d}{lo_h[2:]}"
+    eu_win = session_mask(ts, lo_h, eu_end)
+
+    asia_hi = df["high"].where(asia).groupby(day).transform("max")
+    asia_lo = df["low"].where(asia).groupby(day).transform("min")
+
+    up = eu_win & (df["close"] > asia_hi)
+    dn = eu_win & (df["close"] < asia_lo)
+    any_evt = (up | dn) & asia_hi.notna() & asia_lo.notna() & df["atr"].notna()
+    first = any_evt & (any_evt.groupby(day).cumsum() == 1)
+
+    buy = first & up
+    sell = first & dn & ~buy
+    out.loc[buy, "fired"] = True
+    out.loc[buy, "direction"] = 1
+    out.loc[buy, "strength"] = ((df["close"] - asia_hi) / df["atr"])[buy]
+    out.loc[sell, "fired"] = True
+    out.loc[sell, "direction"] = -1
+    out.loc[sell, "strength"] = ((asia_lo - df["close"]) / df["atr"])[sell]
+    return out
+
+
 # ---------------------------------------------------------------- registry
 
 EVENT_REGISTRY = {
@@ -1067,6 +1160,10 @@ EVENT_REGISTRY = {
     "pm_fix_window": (detect_pm_fix_window, PM_FIX_DEFAULTS),
     "news_reopen": (detect_news_reopen, NEWS_REOPEN_DEFAULTS),
     "h1_sweep": (detect_h1_sweep, H1_SWEEP_DEFAULTS),
+    # 2026-07-23 expansion: externally-validated geometries (quant-trading-lab
+    # analysis), re-implemented and judged under our own gauntlet
+    "ratio_stretch": (detect_ratio_stretch, RATIO_STRETCH_DEFAULTS),
+    "asia_range_ebreak": (detect_asia_range_ebreak, ASIA_EBREAK_DEFAULTS),
 }
 
 

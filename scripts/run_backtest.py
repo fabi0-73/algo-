@@ -692,6 +692,14 @@ Examples:
                         help="Max bars for LONG trades with active trailing stop (E4 overlay, 0 = off)")
     parser.add_argument("--entry-price-mode", type=str, choices=["RETEST", "OTE"],
                         help="Entry limit placement: RETEST level or OTE deep-pullback band (E3)")
+    parser.add_argument("--min-confluence", type=int, default=None,
+                        help="Override min_confluence_score AND short_min_confluence_score (sweep experiments)")
+    parser.add_argument("--no-bos-required", action="store_true",
+                        help="Drop the hard BOS gate (BOS still counts as confluence)")
+    parser.add_argument("--max-bars-after-dist", type=int, default=None,
+                        help="Override max_bars_after_distribution (stale-retest window)")
+    parser.add_argument("--dist-followthrough", type=int, default=None,
+                        help="Override distribution_follow_through_candles (0 disables)")
     parser.add_argument("--adaptive-confidence", action="store_true",
                         help="Enable rolling confidence-bucket recalibration (E-adaptive)")
 
@@ -701,6 +709,17 @@ Examples:
     if args.min_confidence is not None:
         from config import SIGNAL_CONFIDENCE
         SIGNAL_CONFIDENCE["min_confidence_to_trade"] = args.min_confidence
+
+    # Gate-relaxation sweep overrides (2026-07-23 trade-count expansion)
+    if args.min_confluence is not None:
+        STRATEGY["min_confluence_score"] = args.min_confluence
+        STRATEGY["short_min_confluence_score"] = args.min_confluence
+    if args.no_bos_required:
+        STRATEGY["bos_required"] = False
+    if args.max_bars_after_dist is not None:
+        STRATEGY["max_bars_after_distribution"] = args.max_bars_after_dist
+    if args.dist_followthrough is not None:
+        STRATEGY["distribution_follow_through_candles"] = args.dist_followthrough
 
     # E4 overnight-drift overlay override
     if args.long_runner_duration is not None:
