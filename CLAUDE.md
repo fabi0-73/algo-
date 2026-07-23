@@ -90,9 +90,9 @@ Uses contract size of 100 oz/lot (XAUUSD). Position size = Risk Amount / (Entry 
 1. Consolidation quality score (`score_consolidation_quality`, min 1) — checks range tightness, close%, equal levels, duration
 2. Judas quality (`min_judas_quality`, default 0 = disabled as hard gate) — fast sweep, velocity, London timing
 3. Liquidity sweep / volume spike — can be required or used as confluence bonus
-4. Distribution follow-through — requires 3 candles making new extremes beyond break price
+4. Distribution follow-through — requires 1 candle making a new extreme beyond break price (2->1 adopted 2026-07-23, run 439e2edd)
 5. BOS required — break of structure must confirm direction
-6. Stale retest filter — max 40 bars after distribution (`max_bars_after_distribution`)
+6. Stale retest filter — max 60 bars after distribution (`max_bars_after_distribution`, 40->60 adopted 2026-07-23)
 
 ### Backtest Output
 
@@ -129,7 +129,7 @@ python scripts/mtf_lab.py --strategies <name>
 
 ### Key Research Modules
 
-- `src/research/events.py` — 37 vectorized per-bar event detectors (sweeps, FVGs, BOS, OB retests, Judas, session opens, PDH/PDL, VWAP stretch; 2026-07-10 batch: ORB break/pullback, sweep-reclaim, failed-break fade, wick rejection, round-number rejects, vol dry-up, inside-NR7, settlement gaps, PM-fix window, news-reopen, H1 sweeps). Contract: `detect_<name>(df, params) -> [fired, direction, strength]` aligned to df; event knowable at bar-i close. `HORIZONS = (1,3,6,12,24,48)` is fixed upfront — never add horizons per-event. Pure time-of-day atoms are nulled by construction in the TOD-matched excess; their informative stat is the CI-vs-zero.
+- `src/research/events.py` — 41 vectorized per-bar event detectors (sweeps, FVGs, BOS, OB retests, Judas, session opens, PDH/PDL, VWAP stretch; 2026-07-10 batch: ORB break/pullback, sweep-reclaim, failed-break fade, wick rejection, round-number rejects, vol dry-up, inside-NR7, settlement gaps, PM-fix window, news-reopen, H1 sweeps; 2026-07-23 batch: ratio_stretch gold/silver z-fade, asia_range_ebreak, ema_pullback_reclaim, ribbon_expansion — all four judged NULL on this feed, kept for context mining). Contract: `detect_<name>(df, params) -> [fired, direction, strength]` aligned to df; event knowable at bar-i close. `HORIZONS = (1,3,6,12,24,48)` is fixed upfront — never add horizons per-event. Pure time-of-day atoms are nulled by construction in the TOD-matched excess; their informative stat is the CI-vs-zero.
 - `src/research/forward.py` — forward returns/MFE/MAE from `open[i+1]` in ATR units; `cost_in_atr()` is the effect-size floor (spread+commission+slippage ≈ 0.10–0.17 ATR on real gold M5).
 - `src/research/stats.py` — numpy-only: day-block bootstrap CI, time-of-day-matched permutation p (normal-tail extension beyond permutation resolution), BH-FDR, `decluster()`.
 - `src/research/context.py` — categorical conditioning features (session, dow, ATR regime, H1 trend, PD levels, VWAP side), ≤5 levels each, lookahead-safe.

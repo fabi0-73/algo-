@@ -397,7 +397,11 @@ STRATEGY = {
     # Phase 3: Distribution - strong conviction breakout
     "distribution_break_atr_mult": 0.20,    # Real move must be significant
     "distribution_body_mult": 1.30,         # Slightly lower body expansion bar
-    "distribution_follow_through_candles": 2,  # Reduced follow-through requirement
+    # 2026-07-23 ADOPTED 2->1 (run 439e2edd + gauntlet): paradoxically selects a
+    # BETTER trade set via position exclusivity — 142 tr, PF 2.70, WR 47.9%,
+    # DD 17.8%, severe-cost PF 2.05, walk-forward retention 106% (test PF 2.83),
+    # B2 cross-feed replication PF 2.69. Old value 2 = champion 187cca99 baseline.
+    "distribution_follow_through_candles": 1,
     "distribution_require_extension": False,   # Don't require new extreme
 
     # Phase 4: Entry - quality at entry point
@@ -523,7 +527,10 @@ STRATEGY = {
     "min_consolidation_quality": 0,         # Removed quality gate
 
     # Stale retest filter
-    "max_bars_after_distribution": 40,      # Allow later retests (widened from 30)
+    # 2026-07-23 ADOPTED 40->60 (runs e54a9fd9/439e2edd): late retests of fully
+    # qualified patterns trade as well as early ones (funnel: 12k entry_too_late
+    # kills were the safest untapped lever). Part of the s60d1 combo adoption.
+    "max_bars_after_distribution": 60,
 
     # Disable TP when trailing stop is active — let trail manage the exit
     "disable_tp_when_trailing": True,
