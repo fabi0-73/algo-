@@ -489,3 +489,30 @@ def test_london_sweep_reversal_planted_day():
     assert row["direction"] == -1                  # high sweep -> short
     assert df.loc[row["signal_idx"], "timestamp"].hour >= 10
     assert row["sl"] > 100.15 and row["tp"] == 99.5  # past sweep extreme; box mid
+
+
+def test_htf_trend_pullback_fires_long_on_dip_reclaim_in_uptrend():
+    from src.research.strategies.base import MTFContext
+    from src.research.strategies import htf_trend_pullback as htp
+
+    n = 300
+    ts = pd.date_range("2025-01-06 02:00", periods=n, freq="30min")
+    close = 100 + np.arange(n) * 0.2          # steady uptrend
+    df = pd.DataFrame({"timestamp": ts, "open": close - 0.05,
+                       "high": close + 0.1, "low": close - 0.1,
+                       "close": close, "volume": 100, "atr": 1.0})
+    ema41 = df["close"].ewm(span=41, adjust=False).mean()
+    # planted pullback: bar 200 dips through the EMA, bar 201 closes above
+    df.loc[200, "low"] = ema41[200] - 0.5
+    h1 = pd.DataFrame({"h1_emaf": np.full(n, 2.0), "h1_emas": np.full(n, 1.0)})
+    ctx = MTFContext(tf="M30", df=df, htf={"H1": h1})
+    sig = htp.generate_signals(ctx, dict(htp.DEFAULTS))
+    assert len(sig) >= 1
+    hit = sig[sig["signal_idx"] == 201]
+    assert len(hit) == 1 and hit.iloc[0]["direction"] == 1
+    assert hit.iloc[0]["sl"] < df.loc[201, "close"]
+    # bearish bias frame produces no longs
+    h1_bear = pd.DataFrame({"h1_emaf": np.full(n, 1.0), "h1_emas": np.full(n, 2.0)})
+    sig2 = htp.generate_signals(MTFContext(tf="M30", df=df, htf={"H1": h1_bear}),
+                                dict(htp.DEFAULTS))
+    assert (sig2["direction"] == 1).sum() == 0
